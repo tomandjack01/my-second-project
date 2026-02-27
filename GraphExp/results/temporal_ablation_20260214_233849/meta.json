@@ -1,0 +1,39 @@
+{
+  "args": {
+    "csv_path": "../fMRI_dataset/sim4.csv",
+    "time_points": 200,
+    "epochs": 30,
+    "lr": 0.001,
+    "lambda_l1": 0.1,
+    "num_hidden": 64,
+    "num_layers": 2,
+    "batch_size": 4,
+    "top_k_edges": 50,
+    "seeds": "42,43,44",
+    "device": "cuda",
+    "log_interval": 10
+  },
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "variants": [
+    {
+      "full_encoder": {}
+    },
+    {
+      "no_temporal_stack": {
+        "temporal_num_blocks": 0
+      }
+    },
+    {
+      "reduced_receptive_field": {
+        "temporal_num_blocks": 2
+      }
+    }
+  ],
+  "num_subjects": 50,
+  "num_nodes": 50,
+  "result_dir": "D:\\mockup\\DDM-main\\GraphExp\\results\\temporal_ablation_20260214_233849"
+}

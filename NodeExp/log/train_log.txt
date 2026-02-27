@@ -1,0 +1,102 @@
+[32m[12/17 21:25:57 graph]: [0mRank of current process: 0. World size: 1
+[32m[12/17 21:26:04 graph]: [0mEnvironment info:
+PyTorch version: 2.0.0+cu118
+Is debug build: False
+CUDA used to build PyTorch: 11.8
+ROCM used to build PyTorch: N/A
+
+OS: Could not collect
+GCC version: (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
+Clang version: Could not collect
+CMake version: Could not collect
+Libc version: N/A
+
+Python version: 3.9.23 | packaged by conda-forge | (main, Jun  4 2025, 17:49:16) [MSC v.1929 64 bit (AMD64)] (64-bit runtime)
+Python platform: Windows-10-10.0.26100-SP0
+Is CUDA available: True
+CUDA runtime version: Could not collect
+CUDA_MODULE_LOADING set to: LAZY
+GPU models and configuration: GPU 0: NVIDIA GeForce RTX 4060 Laptop GPU
+Nvidia driver version: 581.42
+cuDNN version: Could not collect
+HIP runtime version: N/A
+MIOpen runtime version: N/A
+Is XNNPACK available: True
+
+CPU:
+'wmic' is not recognized as an internal or external command,
+operable program or batch file.
+
+Versions of relevant libraries:
+[pip3] numpy==1.24.3
+[pip3] torch==2.0.0+cu118
+[pip3] torchdata==0.11.0
+[pip3] torchvision==0.15.0+cu118
+[conda] blas                         2.135               mkl                    conda-forge
+[conda] blas-devel                   3.9.0               35_h85df5b5_mkl        conda-forge
+[conda] cudatoolkit                  11.3.1              hf2f0253_13            conda-forge
+[conda] libblas                      3.9.0               35_h5709861_mkl        conda-forge
+[conda] libcblas                     3.9.0               35_h2a3cdd5_mkl        conda-forge
+[conda] liblapack                    3.9.0               35_hf9ab0e9_mkl        conda-forge
+[conda] liblapacke                   3.9.0               35_h3ae206f_mkl        conda-forge
+[conda] mkl                          2024.2.2            h57928b3_16            conda-forge
+[conda] mkl-devel                    2024.2.2            h57928b3_16            conda-forge
+[conda] mkl-include                  2024.2.2            h57928b3_16            conda-forge
+[conda] numpy                        1.24.3              pypi_0                 pypi
+[conda] pytorch-mutex                1.0                 cuda                   pytorch
+[conda] torch                        2.0.0+cu118         pypi_0                 pypi
+[conda] torchdata                    0.11.0              pypi_0                 pypi
+[conda] torchvision                  0.15.0+cu118        pypi_0                 pypi
+        Pillow (8.4.0)
+[32m[12/17 21:26:04 graph]: [0mCommand line arguments: Namespace(resume=False, local_rank=0, seed=1234, yaml_dir='./yamls/photo.yaml', output_dir=None, checkpoint_dir=None, start_epoch=0)
+[32m[12/17 21:44:44 graph]: [0mRank of current process: 0. World size: 1
+[32m[12/17 21:44:50 graph]: [0mEnvironment info:
+PyTorch version: 2.0.0+cu118
+Is debug build: False
+CUDA used to build PyTorch: 11.8
+ROCM used to build PyTorch: N/A
+
+OS: Could not collect
+GCC version: (x86_64-posix-seh-rev0, Built by MinGW-W64 project) 8.1.0
+Clang version: Could not collect
+CMake version: Could not collect
+Libc version: N/A
+
+Python version: 3.9.23 | packaged by conda-forge | (main, Jun  4 2025, 17:49:16) [MSC v.1929 64 bit (AMD64)] (64-bit runtime)
+Python platform: Windows-10-10.0.26100-SP0
+Is CUDA available: True
+CUDA runtime version: Could not collect
+CUDA_MODULE_LOADING set to: LAZY
+GPU models and configuration: GPU 0: NVIDIA GeForce RTX 4060 Laptop GPU
+Nvidia driver version: 581.42
+cuDNN version: Could not collect
+HIP runtime version: N/A
+MIOpen runtime version: N/A
+Is XNNPACK available: True
+
+CPU:
+'wmic' is not recognized as an internal or external command,
+operable program or batch file.
+
+Versions of relevant libraries:
+[pip3] numpy==1.24.3
+[pip3] torch==2.0.0+cu118
+[pip3] torchdata==0.11.0
+[pip3] torchvision==0.15.0+cu118
+[conda] blas                         2.135               mkl                    conda-forge
+[conda] blas-devel                   3.9.0               35_h85df5b5_mkl        conda-forge
+[conda] cudatoolkit                  11.3.1              hf2f0253_13            conda-forge
+[conda] libblas                      3.9.0               35_h5709861_mkl        conda-forge
+[conda] libcblas                     3.9.0               35_h2a3cdd5_mkl        conda-forge
+[conda] liblapack                    3.9.0               35_hf9ab0e9_mkl        conda-forge
+[conda] liblapacke                   3.9.0               35_h3ae206f_mkl        conda-forge
+[conda] mkl                          2024.2.2            h57928b3_16            conda-forge
+[conda] mkl-devel                    2024.2.2            h57928b3_16            conda-forge
+[conda] mkl-include                  2024.2.2            h57928b3_16            conda-forge
+[conda] numpy                        1.24.3              pypi_0                 pypi
+[conda] pytorch-mutex                1.0                 cuda                   pytorch
+[conda] torch                        2.0.0+cu118         pypi_0                 pypi
+[conda] torchdata                    0.11.0              pypi_0                 pypi
+[conda] torchvision                  0.15.0+cu118        pypi_0                 pypi
+        Pillow (8.4.0)
+[32m[12/17 21:44:50 graph]: [0mCommand line arguments: Namespace(resume=False, local_rank=0, seed=1234, yaml_dir='./yamls/photo.yaml', output_dir=None, checkpoint_dir=None, start_epoch=0)
