@@ -1,104 +1,153 @@
-# Directional Diffusion Models
-## [NeurIPS 2023](https://arxiv.org/abs/2306.13210)
+# Brain Connectivity Structure Learning with Directional Diffusion Models
 
-Run Yang<sup>1</sup>, Yuling Yang<sup>1</sup>, Fan Zhou<sup>1</sup>, Qiang Sun<sup>2</sup> <br>
-<sup>1</sup>Shanghai University of Finance and Economics, <sup>2</sup>University of Toronto
+基于 [Directional Diffusion Models (DDM)](https://arxiv.org/abs/2306.13210) (NeurIPS 2023) 的 fMRI 脑连接结构学习框架。通过方向性扩散过程从 fMRI 时间序列数据中学习稀疏的脑区连接矩阵。
 
-We introduce a novel class of models termed **directional diffusion models (DDM)**, which adopt data-dependent, anisotropic, and directional noises in the forward diffusion process. This code is an implementation of **DDM** on 12 public graph datasets.
-### Graph classification datasets
-- IMDB-B
-- IMDB-M
-- COLLAB
-- REDDIT-B
-- PROTEINS
-- MUTAG
-### Node classification datasets
-- CORA
-- Citeseer
-- PubMed
-- Ogbn-arxiv
-- Amazon-Computer
-- Amazon-Photo
+## 方法概述
 
-## Framework
-![framework](./framework.png)
-## Usage
+本项目将 DDM 的方向性噪声机制应用于脑功能连接分析：
+
+1. **时序编码器 (NodeSpecificTemporalEncoder)**：因果膨胀卷积网络，将每个脑区的 fMRI 时间序列 `[N, T]` 编码为低维表示 `[N, H]`
+2. **编码器预训练 (Anti-Collapse)**：独立预训练编码器后冻结，防止与扩散过程端到端训练时发生表征坍塌
+3. **方向性扩散**：在编码空间中执行前向扩散（数据依赖的各向异性噪声）+ U-Net 去噪
+4. **结构学习**：通过可学习邻接矩阵 + L1 稀疏正则化，从扩散过程中提取脑区间的连接模式
+
+### 编码器预训练流程
+
+`NodeSpecificTemporalEncoder` 在端到端训练时会坍塌（cosine sim → 1.0, Diff Loss → 0.0）。解决方案：三目标预训练后冻结。
+
+**预训练损失函数：**
+- **Reconstruction**：`MSE(decoder(z), x_original)` — 保真性
+- **Forecasting**：`MSE(mlp(encoder(x[:,:P])), x[:,P:])` — 未来预测能力（warmup 10 epochs）
+- **VICReg**：方差项（每维 std ≥ 1.0）+ 协方差项（维度去相关）— 防坍塌
+
+**损失权重：** `total = 1.0*recon + 0.5*forecast + 1.0*variance + 0.04*covariance`
+
+### 坍塌诊断指标
+
+训练过程中自动监控以下健康指标：
+
+| 指标 | 健康范围 | 坍塌信号 |
+|:---|:---|:---|
+| `effective_rank` | > 5（理想 > 10） | < 5 |
+| `mean_cosine_sim` | < 0.5（理想 < 0.3） | > 0.8 |
+| `dead_dims_ratio` | 0% | > 30% |
+| `feature_std_mean` | > 0.1 | → 0.0 |
+
+## 环境配置
+
 ```shell
 conda create -n ddm python=3.8
 conda activate ddm
-cd ddm-nni
 pip install -r requirements.txt
 ```
 
-cd to EXP path(```MUTAG``` for example)
+PyTorch、torchvision 和 DGL (CUDA 11.3) 需单独安装，详见 `requirements.txt` 中的注释行。
+
+## 使用方法
+
+所有命令在 `GraphExp/` 目录下执行：
+
 ```shell
 cd GraphExp
-python main_graph.py --yaml_dir ./yamls/MUTAG.yaml
 ```
-**In view of the sensitivity of diffusion method to hyperparameters, it is recommended to use hyperparameter search methods like NNI to achieve better results**
-**Trust me ! In this way, you can achieve better results than what is presented in the paper**
 
-## Performance
-### Directional noise v.s. white noise
-![noise](./noise_com.png)
-### Graph classification(F1-score)
-|     |IMDB-B|IMDB-M|COLLAB|REDDIT-B|PROTEINS|MUTAG|
-|:---:|:----:|:----:|:----:|:------:|:------:|:---:|
-|GIN[1]     | 75.1±5.1  | 52.3±2.8  | 80.2±1.9 | 92.4±2.5 | 76.2±2.8  | 89.4±5.6    |
-|DiffPool[2]| 72.6±3.9  | -         | 78.9±2.3 | 92.1±2.6 | 75.1±2.3  | 85.0±10.3   |
-|Infograph[3] | 73.03±0.87| 49.69±0.53| 70.65±1.13 | 82.50±1.42 | 74.44±0.31| 89.01±1.13  |
-|GraphCL[4] | 71.14±0.44| 48.58±0.67| 71.36±1.15 | 89.53±0.84 | 74.39±0.45| 86.80±1.34  |
-|JOAO[5]    | 70.21±3.08| 49.20±0.77| 69.50±0.36 | 85.29±1.35 | 74.55±0.41| 87.35±1.02  |
-|GCC[6]     | 72        | 49.4      | 78.9     | 89.8     | -         | -           |
-|MVGRL[7]   | 74.20±0.70| 51.20±0.50| -        | 84.50±0.60 | -         | 89.70±1.10  |
-|GraphMAE[8]| 75.52±0.66| 51.63±0.52| 80.32±0.46 | 88.01±0.19 | 75.30±0.39| 88.19±1.26  |
-|**DDM** |**76.40±0.22**|**52.53±0.31**|**81.72±0.31**|89.15±1.3|**75.74±0.50**|**91.51±1.45**|
-### Node classification(F1-score)
-|Dataset  | Cora     | Citeseer    | PubMed    | Ogbn-arxiv | Computer| Photo |
-|:---:|:----:|:----:|:----:|:------:|:------:|:---:|
-|GAT      | 83.0 ± 0.7 | 72.5 ± 0.7    | 79.0 ± 0.3  | 72.10 ± 0.13 | 86.93 ± 0.29            | 92.56 ± 0.35              |
-|DGI[9]      | 82.3 ± 0.6 | 71.8 ± 0.7    | 76.8 ± 0.6  | 70.34 ± 0.16 | 83.95 ± 0.47          | 91.61 ± 0.22              |
-|MVGRL[7]    | 83.5 ± 0.4 | 73.3 ± 0.5    | 80.1 ± 0.7  | -          | 87.52 ± 0.11          | 91.74 ± 0.07              |
-|BGRL[10]     | 82.7 ± 0.6 | 71.1 ± 0.8    | 79.6 ± 0.5  | 71.64 ± 0.12 | 89.68 ± 0.31          | 92.87 ± 0.27              |
-|InfoGCL[11]  | 83.5 ± 0.3 | 73.5 ± 0.4    | 79.1 ± 0.2  | -          | - | -     |
-|CCA-SSG[12]  | 84.0 ± 0.4 | 73.1 ± 0.3    | 81.0 ± 0.4  | 71.24 ± 0.20 | 88.74 ± 0.28          | 93.14 ± 0.14              |
-|GPT-GNN[13]  | 80.1 ± 1.0 | 68.4 ± 1.6    | 76.3 ± 0.8  | -          | - | -     |
-|GraphMAE[8] | 84.2 ± 0.4 | 73.4 ± 0.4    | 81.1 ± 0.4  | 71.75 ± 0.17 | 88.63 ± 0.17         | 93.63 ± 0.22              |
-|**DDM** |**83.4±0.2**|**74.3±0.3**|**81.7±0.8**|71.29±0.18|**90.56±0.21**|**95.09±0.18**|
+### 完整流程（预训练 + 冻结 + 扩散训练）
 
-## References
+```shell
+python main_structure_learning.py --epochs 100 --pretrain_epochs 50
+```
 
-[1]:Xu, K., Hu, W., Leskovec, J., and Jegelka, S. (2018). How powerful are graph neural networks?
-arXiv preprint arXiv:1810.00826.<br>
-[2]:Ying, Z., You, J., Morris, C., Ren, X., Hamilton, W., and Leskovec, J. (2018). Hierarchical graph
-representation learning with differentiable pooling. Advances in neural information processing
-systems, 31.<br>
-[3]:Sun, F.-Y., Hoffmann, J., Verma, V., and Tang, J. (2019). Infograph: Unsupervised and semi-
-supervised graph-level representation learning via mutual information maximization. arXiv preprint
-arXiv:1908.01000.<br>
-[4]:You, Y., Chen, T., Sui, Y., Chen, T., Wang, Z., and Shen, Y. (2020). Graph contrastive learning with
-augmentations. Advances in neural information processing systems, 33:5812–5823.<br>
-[5]:You, Y., Chen, T., Shen, Y., and Wang, Z. (2021). Graph contrastive learning automated. In
-International Conference on Machine Learning, pages 12121–12132. PMLR.<br>
-[6]:Qiu, J., Chen, Q., Dong, Y., Zhang, J., Yang, H., Ding, M., Wang, K., and Tang, J. (2020). Gcc:
-Graph contrastive coding for graph neural network pre-training. In Proceedings of the 26th ACM
-SIGKDD international conference on knowledge discovery & data mining, pages 1150–1160.<br>
-[7]:Hassani, K. and Khasahmadi, A. H. (2020). Contrastive multi-view representation learning on graphs.
-In International conference on machine learning, pages 4116–4126. PMLR.<br>
-[8]:Hou, Z., Liu, X., Dong, Y., Wang, C., Tang, J., et al. (2022). Graphmae: Self-supervised masked
-graph autoencoders. arXiv preprint arXiv:2205.10803.<br>
-[9]:Velickovic, P., Fedus, W., Hamilton, W. L., Liò, P., Bengio, Y., and Hjelm, R. D. (2019). Deep graph
-infomax. ICLR (Poster), 2(3):4.<br>
-[10]:Thakoor, S., Tallec, C., Azar, M. G., Azabou, M., Dyer, E. L., Munos, R., Veliˇckovi ́c, P., and
-Valko, M. (2021). Large-scale representation learning on graphs via bootstrapping. arXiv preprint
-arXiv:2102.06514.<br>
-[11]:Xu, D., Cheng, W., Luo, D., Chen, H., and Zhang, X. (2021). Infogcl: Information-aware graph
-contrastive learning. Advances in Neural Information Processing Systems, 34:30414–30425.<br>
-[12]:Zhang, H., Wu, Q., Yan, J., Wipf, D., and Yu, P. S. (2021). From canonical correlation analysis
-to self-supervised graph neural networks. Advances in Neural Information Processing Systems,
-34:76–89.<br>
-[13]:Hu, Z., Dong, Y., Wang, K., Chang, K.-W., and Sun, Y. (2020b). Gpt-gnn: Generative pre-training of
-graph neural networks. In Proceedings of the 26th ACM SIGKDD International Conference on
-Knowledge Discovery & Data Mining, pages 1857–1867.
+### 跳过预训练（端到端训练，原始行为）
 
+```shell
+python main_structure_learning.py --epochs 100 --skip_pretrain
+```
 
+### 加载已有预训练权重
+
+```shell
+python main_structure_learning.py --pretrain_checkpoint ./results/run_xxx/pretrained_encoder.pt
+```
+
+### 单独预训练编码器
+
+```shell
+python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder.pt
+```
+
+## 主要参数
+
+| 参数 | 默认值 | 说明 |
+|:---|:---|:---|
+| `--csv_path` | `../fMRI_dataset/sim4.csv` | fMRI 数据路径（无表头 CSV） |
+| `--time_points` | 200 | 每个被试的时间点数 |
+| `--epochs` | 100 | 扩散训练轮数 |
+| `--lr` | 1e-3 | 学习率 |
+| `--lambda_l1` | 0.1 | L1 稀疏正则系数（按 N² 归一化） |
+| `--num_hidden` | 64 | 隐藏层维度 |
+| `--num_layers` | 2 | GNN 层数 |
+| `--batch_size` | 4 | 被试批大小 |
+| `--pretrain_epochs` | 50 | 编码器预训练轮数 |
+| `--pretrain_lr` | 1e-3 | 预训练学习率 |
+| `--pretrain_split_ratio` | 0.75 | 输入/预测分割比（如 T=200 时为 150/50） |
+| `--skip_pretrain` | False | 跳过预训练 |
+| `--pretrain_checkpoint` | None | 已有预训练权重路径 |
+| `--debug_checks` | False | 启用首步调试检查 |
+
+## 训练流程
+
+```
+fMRI CSV [Total_Rows, N]
+    │
+    ├─ reshape → data_3d [Num_Subjects, N, T]
+    ├─ Pearson 相关矩阵 → init_features (邻接矩阵初始化)
+    └─ Patel 连接矩阵 → noise_guide_adj (邻居噪声引导)
+         │
+         ▼
+┌─────────────────────────────────┐
+│  1. 编码器预训练 (可选)           │
+│     Recon + Forecast + VICReg   │
+│     → 冻结 temporal_encoder     │
+├─────────────────────────────────┤
+│  2. 扩散训练                     │
+│     temporal_encoder(x) → z     │
+│     sample_q(t, z) → z_t        │
+│     Denoising_Unet(z_t) → ẑ    │
+│     Loss: cosine_sim + L1_adj   │
+└─────────────────────────────────┘
+         │
+         ▼
+   learned_adjacency [N, N]
+```
+
+## 输出文件
+
+训练结果保存在 `./results/run_<timestamp>/` 下：
+
+- `learned_adjacency.csv` — 学习到的脑区连接矩阵
+- `loss_curve.png` — 训练收敛曲线
+- `collapse_diagnostics.png` — 编码器坍塌诊断图
+- `collapse_diagnostics.csv` — 坍塌指标原始数据
+- `pearson_matrix.csv` — Pearson 相关矩阵（参考基线）
+- `loss_history.csv` — 逐 epoch 损失记录
+- `pretrained_encoder.pt` — 预训练编码器权重
+- `config.npy` — 运行配置
+
+## 核心依赖
+
+- PyTorch
+- DGL (Deep Graph Library)
+- NumPy / Pandas
+- scikit-learn
+- Matplotlib
+
+## 引用
+
+```bibtex
+@inproceedings{yang2023directional,
+  title={Directional Diffusion Models for Graph Representation Learning},
+  author={Yang, Run and Yang, Yuling and Zhou, Fan and Sun, Qiang},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+```
