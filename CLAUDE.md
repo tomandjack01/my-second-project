@@ -52,9 +52,10 @@ The NNI web UI runs on port 6006. Hyperparameter search is recommended for best 
 - `sample_q()`: Forward diffusion process with directional noise (noise aligned with data distribution via mean/std matching and sign preservation)
 - `embed()`: Extract representations at specified timestep T for downstream evaluation
 - `Denoising_Unet`: U-Net style denoising network using GAT layers with skip connections
-- `NodeSpecificTemporalEncoder`: Causal dilated temporal encoder for fMRI time series
+- `NodeSpecificTemporalEncoder`: **Optional** causal dilated temporal encoder for fMRI time series (can be disabled with `use_temporal_encoder=False`)
   - `forward()`: Returns `[N, output_dim]` encoding
   - `encode_features()`: Returns both pre-GAP `[B*N, C, T]` feature map and post-GAP `[N, H]` encoding (used by pretrain decoder)
+  - When disabled: Model works directly on raw time series without dimensionality reduction
 
 **Encoder Pretraining** (`GraphExp/pretrain_temporal_encoder.py`):
 - `TemporalDecoder`: Lightweight decoder (2 blocks) for reconstruction loss
@@ -103,6 +104,9 @@ python main_structure_learning.py --epochs 100 --skip_pretrain
 # Load existing pretrained weights
 python main_structure_learning.py --pretrain_checkpoint ./results/run_xxx/pretrained_encoder.pt
 
+# Disable temporal encoder (work directly on raw time series)
+python main_structure_learning.py --epochs 100 --disable_temporal_encoder
+
 # Standalone pretrain
 python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder.pt
 ```
@@ -112,6 +116,52 @@ python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder
 - `mean_cosine_sim` < 0.5 (ideally < 0.3)
 - `dead_dims_ratio` = 0%
 - `feature_std_mean` > 0.1
+
+### Temporal Encoder Control (NEW)
+
+The DDM model now supports **optional temporal encoding**. You can choose to work directly on raw time series data instead of encoded features.
+
+**Two Operating Modes:**
+
+1. **With Temporal Encoder (Default):**
+   - Raw data `[N, 200]` → `temporal_encoder` → Encoded features `[N, 64]` → Diffusion
+   - Faster computation (64-dim vs 200-dim)
+   - Requires pretraining to avoid encoder collapse
+   - May lose some temporal information
+
+2. **Without Temporal Encoder (NEW):**
+   - Raw data `[N, 200]` → Directly to Diffusion → Output `[N, 200]`
+   - Preserves full temporal information
+   - No pretraining needed
+   - Higher computational cost
+
+**Usage:**
+
+```shell
+# Disable temporal encoder (direct diffusion on raw time series)
+python main_structure_learning.py \
+    --csv_path ../fMRI_dataset/sim4.csv \
+    --epochs 100 \
+    --disable_temporal_encoder
+
+# Enable temporal encoder with pretraining (default)
+python main_structure_learning.py \
+    --csv_path ../fMRI_dataset/sim4.csv \
+    --epochs 100 \
+    --pretrain_epochs 50
+```
+
+**Implementation Details:**
+- `DDM.__init__()`: Added `use_temporal_encoder` parameter (default: `True`)
+- When disabled: `temporal_encoder = None`, denoising network input/output dim = `in_dim` (200)
+- When enabled: `temporal_encoder` active, denoising network input/output dim = `num_hidden` (64)
+- Pretraining, freezing, and collapse diagnostics only run when encoder is enabled
+
+**Testing:**
+```shell
+cd GraphExp
+python test_disable_encoder.py  # Validates both modes work correctly
+```
 
 ### Evaluation
 
@@ -142,6 +192,7 @@ Pretrain CLI parameters (`main_structure_learning.py`):
 - `--pretrain_split_ratio`: Input/forecast split ratio (default: 0.75, i.e. 150/50 for T=200)
 - `--skip_pretrain`: Skip pretraining entirely (end-to-end training, original behavior)
 - `--pretrain_checkpoint`: Path to load existing pretrained encoder weights
+- `--disable_temporal_encoder`: **NEW** - Disable temporal encoder and work directly on raw time series (skips all pretraining)
 
 ### Key Dependencies
 - DGL (Deep Graph Library) for graph neural networks

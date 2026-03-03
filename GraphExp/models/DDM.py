@@ -284,6 +284,7 @@ class DDM(nn.Module):
             temporal_hidden_channels: int = 32,
             temporal_num_blocks: int = 4,
             temporal_kernel_size: int = 3,
+            use_temporal_encoder: bool = True,
             **kwargs
 
          ):
@@ -306,26 +307,33 @@ class DDM(nn.Module):
         self.alpha_l = alpha_l
         self.in_dim = in_dim  # Store original time series length
         self.num_hidden = num_hidden
-        
+        self.use_temporal_encoder = use_temporal_encoder
+
         # Temporal Encoder: Convert raw time series to hidden features
         # Input: [N, in_dim] or [B, N, in_dim] → Output: [N, num_hidden] or [B, N, num_hidden]
-        self.temporal_encoder = NodeSpecificTemporalEncoder(
-            time_points=in_dim,
-            hidden_channels=temporal_hidden_channels,
-            output_dim=num_hidden,
-            num_blocks=temporal_num_blocks,
-            kernel_size=temporal_kernel_size,
-            activation=activation
-        )
-        print(f"Temporal Encoder: {in_dim} time points → {num_hidden} features")
-        print(f"  Receptive field: {self.temporal_encoder.receptive_field} time points")
-        
+        if self.use_temporal_encoder:
+            self.temporal_encoder = NodeSpecificTemporalEncoder(
+                time_points=in_dim,
+                hidden_channels=temporal_hidden_channels,
+                output_dim=num_hidden,
+                num_blocks=temporal_num_blocks,
+                kernel_size=temporal_kernel_size,
+                activation=activation
+            )
+            print(f"Temporal Encoder: {in_dim} time points → {num_hidden} features")
+            print(f"  Receptive field: {self.temporal_encoder.receptive_field} time points")
+            denoising_in_dim = num_hidden
+        else:
+            self.temporal_encoder = None
+            print(f"Temporal Encoder: DISABLED - Using raw time series directly")
+            denoising_in_dim = in_dim
+
         assert num_hidden % nhead == 0
-        # Denoising UNet now works in encoded feature space
-        # Input/Output: num_hidden (encoded features, not raw time points)
-        self.net = Denoising_Unet(in_dim=num_hidden,
+        # Denoising UNet works in either encoded feature space or raw time series space
+        # Input/Output: denoising_in_dim (encoded features if encoder enabled, raw time points otherwise)
+        self.net = Denoising_Unet(in_dim=denoising_in_dim,
                                   num_hidden=num_hidden,
-                                  out_dim=num_hidden,
+                                  out_dim=denoising_in_dim,
                                   num_layers=num_layers,
                                   nhead=nhead,
                                   activation=activation,
@@ -372,38 +380,42 @@ class DDM(nn.Module):
 
     def forward(self, g, x):
         """
-        Forward pass with temporal encoding.
-        
+        Forward pass with optional temporal encoding.
+
         Args:
             g: DGL graph (can be None if using structure learning mode)
             x: Raw time series input [N, T] or [B, N, T]
                where T = in_dim (time points, e.g., 200)
-        
+
         Returns:
             loss: Diffusion loss
             loss_item: Dictionary with loss value
         """
-        # Step 1: Encode raw time series to feature space
-        # [N, T] → [N, H] or [B, N, T] → [B, N, H]
-        x_encoded = self.temporal_encoder(x)
-        
-        # Step 2: Apply layer normalization to encoded features
-        x_encoded = F.layer_norm(x_encoded, (x_encoded.shape[-1], ))
+        # Step 1: Optionally encode raw time series to feature space
+        if self.use_temporal_encoder:
+            # [N, T] → [N, H] or [B, N, T] → [B, N, H]
+            x_processed = self.temporal_encoder(x)
+        else:
+            # Use raw time series directly
+            x_processed = x
+
+        # Step 2: Apply layer normalization
+        x_processed = F.layer_norm(x_processed, (x_processed.shape[-1], ))
 
         # Step 3: Sample random timestep for diffusion
-        t = torch.randint(self.T, size=(x_encoded.shape[0], ), device=x_encoded.device)
-        
+        t = torch.randint(self.T, size=(x_processed.shape[0], ), device=x_processed.device)
+
         # Step 4: Get graph structure
         if self.structure_learning_mode:
-            g, edge_weight = self._get_structure_graph(x_encoded.device)
+            g, edge_weight = self._get_structure_graph(x_processed.device)
         else:
             edge_weight = None
-            
-        # Step 5: Diffusion forward process (add noise)
-        x_t, time_embed, g = self.sample_q(t, x_encoded, g)
 
-        # Step 6: Denoise and compute loss (reconstruct encoded features)
-        loss = self.node_denoising(x_encoded, x_t, time_embed, g, edge_weight=edge_weight)
+        # Step 5: Diffusion forward process (add noise)
+        x_t, time_embed, g = self.sample_q(t, x_processed, g)
+
+        # Step 6: Denoise and compute loss
+        loss = self.node_denoising(x_processed, x_t, time_embed, g, edge_weight=edge_weight)
         loss_item = {"loss": loss.item()}
         return loss, loss_item
 
@@ -489,29 +501,32 @@ class DDM(nn.Module):
     def embed(self, g, x, T):
         """
         Generate embeddings from raw time series.
-        
+
         Args:
             g: DGL graph (can be None if using structure learning mode)
             x: Raw time series input [N, T] or [B, N, T]
             T: Diffusion timestep for embedding
-        
+
         Returns:
             hidden: Encoded hidden representations
         """
-        # Encode raw time series first
-        x_encoded = self.temporal_encoder(x)
-        
-        t = torch.full((1, ), T, device=x_encoded.device)
+        # Optionally encode raw time series first
+        if self.use_temporal_encoder:
+            x_processed = self.temporal_encoder(x)
+        else:
+            x_processed = x
+
+        t = torch.full((1, ), T, device=x_processed.device)
         with torch.no_grad():
-            x_encoded = F.layer_norm(x_encoded, (x_encoded.shape[-1], ))
-        
+            x_processed = F.layer_norm(x_processed, (x_processed.shape[-1], ))
+
         # Use learned structure if in structure learning mode
         if self.structure_learning_mode:
-            g, edge_weight = self._get_structure_graph(x_encoded.device)
+            g, edge_weight = self._get_structure_graph(x_processed.device)
         else:
             edge_weight = None
-            
-        x_t, time_embed, g = self.sample_q(t, x_encoded, g)
+
+        x_t, time_embed, g = self.sample_q(t, x_processed, g)
         _, hidden = self.net(g, x_t=x_t, time_embed=time_embed, edge_weight=edge_weight)
         return hidden
 

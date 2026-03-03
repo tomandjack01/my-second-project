@@ -415,7 +415,10 @@ def train_brain_connectivity(
 
     ddm_kwargs = {} if ddm_kwargs is None else dict(ddm_kwargs)
 
-    
+    # Extract use_temporal_encoder from ddm_kwargs to avoid duplicate argument
+    use_temporal_encoder = ddm_kwargs.pop('use_temporal_encoder', True)
+
+
 
     # Initialize DDM with Pearson matrix for structure learning
 
@@ -453,6 +456,8 @@ def train_brain_connectivity(
 
         noise_guide_adj=noise_guide_adj,  # Row-normalized adj for neighbor-based noise
 
+        use_temporal_encoder=use_temporal_encoder,
+
         **ddm_kwargs,
 
     )
@@ -460,7 +465,7 @@ def train_brain_connectivity(
     model = model.to(device)
 
     # ---- Encoder Pretraining / Loading ----
-    if not skip_pretrain:
+    if model.use_temporal_encoder and not skip_pretrain:
         if pretrain_checkpoint and os.path.exists(pretrain_checkpoint):
             print(f"\n[Pretrain] Loading encoder weights from: {pretrain_checkpoint}")
             state = torch.load(pretrain_checkpoint, map_location=device)
@@ -487,7 +492,7 @@ def train_brain_connectivity(
         print_collapse_diagnostics(pt_metrics, 0, 1)
 
     # ---- Freeze encoder ----
-    if not skip_pretrain:
+    if model.use_temporal_encoder and not skip_pretrain:
         print("\n[Freeze] Freezing temporal_encoder parameters")
         for param in model.temporal_encoder.parameters():
             param.requires_grad = False
@@ -564,9 +569,11 @@ def train_brain_connectivity(
 
                     with torch.no_grad():
 
-                        x_encoded = model.temporal_encoder(x)
-
-                        x_encoded = F.layer_norm(x_encoded, (x_encoded.shape[-1],))
+                        if model.use_temporal_encoder:
+                            x_encoded = model.temporal_encoder(x)
+                            x_encoded = F.layer_norm(x_encoded, (x_encoded.shape[-1],))
+                        else:
+                            x_encoded = F.layer_norm(x, (x.shape[-1],))
 
                         t = torch.randint(model.T, size=(x_encoded.shape[0],), device=x_encoded.device)
 
@@ -647,12 +654,14 @@ def train_brain_connectivity(
 
                 if debug_checks and epoch == 0 and i == 0 and subj_idx == 0:
 
-                    grad = model.temporal_encoder.input_proj.weight.grad
-
-                    if grad is None:
-                        print("[Debug] temporal_encoder grad is None")
+                    if model.use_temporal_encoder:
+                        grad = model.temporal_encoder.input_proj.weight.grad
+                        if grad is None:
+                            print("[Debug] temporal_encoder grad is None")
+                        else:
+                            print(f"[Debug] temporal_encoder grad norm: {grad.norm().item():.6e}")
                     else:
-                        print(f"[Debug] temporal_encoder grad norm: {grad.norm().item():.6e}")
+                        print("[Debug] Temporal encoder disabled - skipping grad check")
 
                 optimizer.step()
 
@@ -697,9 +706,10 @@ def train_brain_connectivity(
                   f"Sparsity: {sparsity_ratio:.2%}")
 
             # --- Encoder collapse diagnostics ---
-            collapse_metrics = diagnose_encoder_collapse(model, data_3d, device)
-            print_collapse_diagnostics(collapse_metrics, epoch, num_epochs)
-            collapse_history.append(collapse_metrics)
+            if model.use_temporal_encoder:
+                collapse_metrics = diagnose_encoder_collapse(model, data_3d, device)
+                print_collapse_diagnostics(collapse_metrics, epoch, num_epochs)
+                collapse_history.append(collapse_metrics)
 
 
 
@@ -799,7 +809,10 @@ def main():
     parser.add_argument('--pretrain_checkpoint', type=str, default=None,
                         help='Path to existing pretrained encoder weights to load')
 
-    
+    parser.add_argument('--disable_temporal_encoder', action='store_true', default=False,
+                        help='Disable temporal encoder and work directly on raw time series')
+
+
 
     args = parser.parse_args()
 
@@ -973,6 +986,7 @@ def main():
         pretrain_lr=args.pretrain_lr,
         pretrain_split_ratio=args.pretrain_split_ratio,
         result_dir=result_dir,
+        ddm_kwargs={'use_temporal_encoder': not args.disable_temporal_encoder},
 
     )
 
