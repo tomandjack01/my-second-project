@@ -40,8 +40,6 @@ from models import DDM
 
 from utils.patel_util import compute_patel_matrix
 
-from pretrain_temporal_encoder import pretrain_temporal_encoder
-
 import matplotlib.pyplot as plt
 
 
@@ -358,7 +356,6 @@ def train_brain_connectivity(
     pretrain_checkpoint: Optional[str] = None,
     pretrain_epochs: int = 50,
     pretrain_lr: float = 1e-3,
-    pretrain_split_ratio: float = 0.75,
     result_dir: Optional[str] = None,
 
 ):
@@ -464,22 +461,33 @@ def train_brain_connectivity(
 
     model = model.to(device)
 
-    # ---- Encoder Pretraining / Loading ----
-    if model.use_temporal_encoder and not skip_pretrain:
+    # ---- Autoregressive Causal Pretraining ----
+    if model.use_temporal_encoder and not skip_pretrain and pretrain_epochs > 0:
         if pretrain_checkpoint and os.path.exists(pretrain_checkpoint):
             print(f"\n[Pretrain] Loading encoder weights from: {pretrain_checkpoint}")
             state = torch.load(pretrain_checkpoint, map_location=device)
             model.temporal_encoder.load_state_dict(state)
         else:
-            print(f"\n[Pretrain] Starting encoder pretraining for {pretrain_epochs} epochs...")
-            pretrain_history = pretrain_temporal_encoder(
-                encoder=model.temporal_encoder,
-                data_3d=data_3d,
-                device=device,
-                num_epochs=pretrain_epochs,
-                learning_rate=pretrain_lr,
-                split_ratio=pretrain_split_ratio,
-            )
+            print(f"\n=== 开始时间因果编码器的自回归预训练 ({pretrain_epochs} Epochs) ===")
+            enc_optimizer = torch.optim.Adam(model.temporal_encoder.parameters(), lr=pretrain_lr)
+            model.temporal_encoder.train()
+
+            for pre_epoch in range(pretrain_epochs):
+                enc_optimizer.zero_grad()
+                # 遍历所有被试，累积梯度后更新
+                total_pre_loss = 0.0
+                for s_idx in range(num_subjects):
+                    x_subj = data_3d[s_idx]  # [N, T]
+                    pre_loss = model.temporal_encoder.pretrain_forward(x_subj)
+                    pre_loss.backward()
+                    total_pre_loss += pre_loss.item()
+                enc_optimizer.step()
+                avg_pre_loss = total_pre_loss / num_subjects
+
+                if (pre_epoch + 1) % 10 == 0 or pre_epoch == 0:
+                    print(f"Pretrain Epoch [{pre_epoch+1}/{pretrain_epochs}] | "
+                          f"Autoregressive MSE Loss: {avg_pre_loss:.4f}")
+
             # Save pretrained weights
             if result_dir:
                 save_path = os.path.join(result_dir, 'pretrained_encoder.pt')
@@ -491,11 +499,12 @@ def train_brain_connectivity(
         pt_metrics = diagnose_encoder_collapse(model, data_3d, device)
         print_collapse_diagnostics(pt_metrics, 0, 1)
 
-    # ---- Freeze encoder ----
-    if model.use_temporal_encoder and not skip_pretrain:
-        print("\n[Freeze] Freezing temporal_encoder parameters")
+        # [极其关键] 冻结参数，防止扩散过程导致表征坍缩
+        print("\n=== 预训练完成！开始冻结编码器参数 ===")
         for param in model.temporal_encoder.parameters():
             param.requires_grad = False
+        model.temporal_encoder.eval()
+        print("=== 进入正式的扩散图学习阶段 ===")
 
     total_params = sum(p.numel() for p in model.parameters())
 
@@ -639,8 +648,6 @@ def train_brain_connectivity(
                 else:
 
                     sparsity_loss = torch.tensor(0.0, device=device)
-
-                
 
                 # Total loss
 
@@ -802,10 +809,12 @@ def main():
                         help='Number of encoder pretrain epochs')
     parser.add_argument('--pretrain_lr', type=float, default=1e-3,
                         help='Learning rate for encoder pretraining')
-    parser.add_argument('--pretrain_split_ratio', type=float, default=0.75,
-                        help='Fraction of time points as input (rest = forecast target)')
+    # --pretrain_split_ratio 已废弃（新因果编码器使用自回归预训练，不需要 split）
+    # parser.add_argument('--pretrain_split_ratio', type=float, default=0.75)
+    # --skip_pretrain 已废弃（使用 --pretrain_epochs 0 代替）
+    # parser.add_argument('--skip_pretrain', action='store_true', default=False)
     parser.add_argument('--skip_pretrain', action='store_true', default=False,
-                        help='Skip encoder pretraining entirely')
+                        help='Skip encoder pretraining entirely (equivalent to --pretrain_epochs 0)')
     parser.add_argument('--pretrain_checkpoint', type=str, default=None,
                         help='Path to existing pretrained encoder weights to load')
 
@@ -984,7 +993,6 @@ def main():
         pretrain_checkpoint=args.pretrain_checkpoint,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_lr=args.pretrain_lr,
-        pretrain_split_ratio=args.pretrain_split_ratio,
         result_dir=result_dir,
         ddm_kwargs={'use_temporal_encoder': not args.disable_temporal_encoder},
 
@@ -1118,6 +1126,15 @@ def main():
 
     )
 
+    # Save Patel connectivity weights for reference (both npy and csv)
+    np.save(os.path.join(result_dir, 'patel_weights.npy'), patel_matrix.numpy())
+    pd.DataFrame(patel_matrix.numpy()).to_csv(
+        os.path.join(result_dir, 'patel_weights.csv'),
+        index=False,
+        header=False,
+        float_format='%.6f'
+    )
+
     
 
     print("=" * 60)
@@ -1135,6 +1152,8 @@ def main():
     print(f"  - loss_history.csv")
 
     print(f"  - pearson_matrix.csv")
+
+    print(f"  - patel_weights.csv      <- Patel(Petal)算法权重")
 
     print(f"  - config.npy")
 

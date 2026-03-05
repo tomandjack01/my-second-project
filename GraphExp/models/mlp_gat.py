@@ -53,12 +53,12 @@ class Denoising_Unet(nn.Module):
         self.mlp_out = MlpBlock(num_hidden, out_dim, out_dim, norm=norm, activation=activation)
 
         # Use GraphConv instead of GATConv for explicit edge weight control
-        self.down_layers.append(GraphConv(num_hidden, num_hidden, norm='both', activation=create_activation(activation)))
-        self.up_layers.append(GraphConv(num_hidden, num_hidden, norm='both', activation=create_activation(activation)))
+        self.down_layers.append(GraphConv(num_hidden, num_hidden, norm='none', activation=create_activation(activation)))
+        self.up_layers.append(GraphConv(num_hidden, num_hidden, norm='none', activation=create_activation(activation)))
 
         for _ in range(1, num_layers):
-            self.down_layers.append(GraphConv(num_hidden, num_hidden, norm='both', activation=create_activation(activation)))
-            self.up_layers.append(GraphConv(num_hidden, num_hidden, norm='both', activation=create_activation(activation)))
+            self.down_layers.append(GraphConv(num_hidden, num_hidden, norm='none', activation=create_activation(activation)))
+            self.up_layers.append(GraphConv(num_hidden, num_hidden, norm='none', activation=create_activation(activation)))
         self.up_layers = nn.ModuleList(list(self.up_layers)[::-1])
 
     def forward(self, g, x_t, time_embed, edge_weight=None):

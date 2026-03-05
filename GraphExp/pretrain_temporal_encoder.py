@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-from models.DDM import TemporalResidualBlock, NodeSpecificTemporalEncoder
+from models.DDM import NodeSpecificTemporalEncoder
 
 
 # ============================================================================

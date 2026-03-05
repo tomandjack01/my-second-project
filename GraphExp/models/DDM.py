@@ -35,230 +35,66 @@ def extract(v, t, x_shape):
 # ============================================================================
 
 class CausalConv1d(nn.Module):
-    """
-    Causal 1D Convolution with left-side padding only.
-    
-    Ensures no information leakage from future time steps.
-    Padding size = (kernel_size - 1) * dilation
-    """
+    """单层因果一维卷积算子"""
     def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
         super(CausalConv1d, self).__init__()
         self.padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            padding=0,  # We apply causal padding manually
-            dilation=dilation
-        )
-    
-    def forward(self, x):
-        # x: [B, C, T]
-        # Causal padding: pad only on the left side
-        x = F.pad(x, (self.padding, 0))
-        return self.conv(x)
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                              padding=self.padding, dilation=dilation)
 
-
-class TemporalResidualBlock(nn.Module):
-    """
-    Residual block with two causal dilated convolutions.
-    
-    Structure:
-        x → CausalConv → LayerNorm → Activation → CausalConv → LayerNorm → + → Activation
-        └─────────────────────── Residual Connection ──────────────────────┘
-    """
-    def __init__(self, channels, kernel_size, dilation, activation='prelu'):
-        super(TemporalResidualBlock, self).__init__()
-        
-        self.conv1 = CausalConv1d(channels, channels, kernel_size, dilation)
-        self.conv2 = CausalConv1d(channels, channels, kernel_size, dilation)
-        
-        # LayerNorm for temporal dimension (applied per-channel)
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(channels)
-        
-        # Activation
-        if activation == 'prelu':
-            self.act1 = nn.PReLU()
-            self.act2 = nn.PReLU()
-        elif activation == 'relu':
-            self.act1 = nn.ReLU()
-            self.act2 = nn.ReLU()
-        else:
-            self.act1 = nn.GELU()
-            self.act2 = nn.GELU()
-    
     def forward(self, x):
-        # x: [B, C, T]
-        residual = x
-        
-        # First conv block
-        out = self.conv1(x)  # [B, C, T]
-        out = out.transpose(1, 2)  # [B, T, C] for LayerNorm
-        out = self.norm1(out)
-        out = out.transpose(1, 2)  # [B, C, T]
-        out = self.act1(out)
-        
-        # Second conv block
-        out = self.conv2(out)
-        out = out.transpose(1, 2)
-        out = self.norm2(out)
-        out = out.transpose(1, 2)
-        
-        # Residual connection
-        out = out + residual
-        out = self.act2(out)
-        
-        return out
+        x = self.conv(x)
+        if self.padding != 0:
+            x = x[:, :, :-self.padding]  # 严格截断未来信息
+        return x
 
 
 class NodeSpecificTemporalEncoder(nn.Module):
-    """
-    Node-Specific Causal Dilated Temporal Encoder.
-    
-    Extracts deep temporal features from each brain region's time series
-    using a stack of causal dilated residual blocks with exponentially
-    increasing dilation rates.
-    
-    Each brain region is processed independently to learn region-specific
-    temporal patterns.
-    
-    Architecture:
-        Input: [B, N, T] or [N, T]
-        → Reshape to [B*N, 1, T]
-        → Input projection: 1 → hidden_channels
-        → Stack of TemporalResidualBlocks (dilation: 1, 2, 4, 8, ...)
-        → Global Average Pooling over time
-        → Output projection: hidden_channels → output_dim
-        → Reshape to [B, N, output_dim]
-    
-    Args:
-        time_points: Number of input time points (e.g., 200)
-        hidden_channels: Internal channel dimension for convolutions (e.g., 32)
-        output_dim: Output feature dimension per node (e.g., 64)
-        num_blocks: Number of residual blocks (default: 4)
-        kernel_size: Convolution kernel size (default: 3)
-        activation: Activation function name (default: 'prelu')
-    """
-    def __init__(
-        self,
-        time_points: int,
-        hidden_channels: int = 32,
-        output_dim: int = 64,
-        num_blocks: int = 4,
-        kernel_size: int = 3,
-        activation: str = 'prelu'
-    ):
+    """1-2-4 膨胀策略的时间因果编码器，带自回归预训练头"""
+    def __init__(self, time_points=200, hidden_channels=32, output_dim=64, **kwargs):
+        # 兼容旧代码的入参，但内部使用新逻辑
         super(NodeSpecificTemporalEncoder, self).__init__()
-        
         self.time_points = time_points
         self.hidden_channels = hidden_channels
-        self.output_dim = output_dim
-        
-        # Input projection: 1 channel → hidden_channels
-        self.input_proj = nn.Conv1d(1, hidden_channels, kernel_size=1)
-        
-        # Stack of residual blocks with exponential dilation
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            dilation = 2 ** i  # 1, 2, 4, 8, ...
-            self.blocks.append(
-                TemporalResidualBlock(
-                    channels=hidden_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    activation=activation
-                )
-            )
-        
-        # Output projection: hidden_channels → output_dim
-        self.output_proj = nn.Linear(hidden_channels, output_dim)
-        
-        # Calculate and store receptive field for reference
-        self.receptive_field = self._calculate_receptive_field(num_blocks, kernel_size)
-    
-    def _calculate_receptive_field(self, num_blocks, kernel_size):
-        """Calculate the total receptive field of the encoder."""
-        rf = 1
-        for i in range(num_blocks):
-            dilation = 2 ** i
-            # Each block has 2 conv layers
-            rf += 2 * (kernel_size - 1) * dilation
-        return rf
-    
-    def encode_features(self, x):
-        """
-        Encode and return both pre-GAP feature map and post-GAP encoding.
+        self.output_dim = time_points  # 输出维度 = 时间点数，保持 [N, T] → [N, T]
 
-        Args:
-            x: Input tensor of shape [N, T] or [B, N, T]
+        self.conv1 = CausalConv1d(1, hidden_channels, kernel_size=3, dilation=1)
+        self.conv2 = CausalConv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=2)
+        self.conv3 = CausalConv1d(hidden_channels, hidden_channels, kernel_size=3, dilation=4)
 
-        Returns:
-            feature_map: Pre-GAP features [B*N, hidden_channels, T]
-            encoding: Post-projection encoding [N, output_dim] or [B, N, output_dim]
-        """
-        is_batched = x.dim() == 3
-        if not is_batched:
-            x = x.unsqueeze(0)
+        # 将多通道特征压扁回单通道
+        self.projector = nn.Conv1d(hidden_channels, 1, kernel_size=1)
+        # 预测头适配器：用于将特征还原到原始信号的尺度
+        self.pred_head = nn.Linear(time_points, time_points)
+        self.norm = nn.LayerNorm(time_points)
 
-        B, N, T = x.shape
-        x = x.view(B * N, 1, T)
-        x = self.input_proj(x)
-        for block in self.blocks:
-            x = block(x)
+        # 兼容旧代码中对 input_proj 的引用（如 diagnose_encoder_collapse）
+        self.input_proj = self.conv1.conv
 
-        feature_map = x  # [B*N, hidden_channels, T]
+    def forward(self, x, return_unnormalized=False):
+        # x: [N, T]
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # [N, 1, T]
 
-        pooled = x.mean(dim=2)  # [B*N, hidden_channels]
-        encoding = self.output_proj(pooled)  # [B*N, output_dim]
-        encoding = encoding.view(B, N, self.output_dim)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        unnormalized_x = self.projector(x).squeeze(1)  # [N, T]
 
-        if not is_batched:
-            encoding = encoding.squeeze(0)
+        norm_x = self.norm(unnormalized_x)
+        if return_unnormalized:
+            return norm_x, unnormalized_x
+        return norm_x
 
-        return feature_map, encoding
+    def pretrain_forward(self, x):
+        """自回归预训练：用 t 时刻预测 t+1 时刻，避开 LayerNorm 的尺度破坏"""
+        _, unnormalized_x = self.forward(x, return_unnormalized=True)
+        # 通过预测头映射尺度
+        pred_x = self.pred_head(unnormalized_x)
 
-    def forward(self, x):
-        """
-        Forward pass.
-
-        Args:
-            x: Input tensor of shape [N, T] or [B, N, T]
-               where N = num_nodes, T = time_points
-
-        Returns:
-            Encoded features of shape [N, output_dim] or [B, N, output_dim]
-        """
-        # Handle input dimensions
-        is_batched = x.dim() == 3
-        if not is_batched:
-            x = x.unsqueeze(0)  # [1, N, T]
-
-        B, N, T = x.shape
-
-        # Reshape: [B, N, T] → [B*N, 1, T]
-        # Each node becomes an independent sample with 1 channel
-        x = x.view(B * N, 1, T)
-
-        # Input projection: [B*N, 1, T] → [B*N, hidden_channels, T]
-        x = self.input_proj(x)
-
-        # Apply residual blocks
-        for block in self.blocks:
-            x = block(x)
-
-        # Global Average Pooling over time: [B*N, hidden_channels, T] → [B*N, hidden_channels]
-        x = x.mean(dim=2)
-
-        # Output projection: [B*N, hidden_channels] → [B*N, output_dim]
-        x = self.output_proj(x)
-
-        # Reshape back: [B*N, output_dim] → [B, N, output_dim]
-        x = x.view(B, N, self.output_dim)
-
-        # Remove batch dimension if input was unbatched
-        if not is_batched:
-            x = x.squeeze(0)  # [N, output_dim]
-
-        return x
+        predictions = pred_x[:, :-1]  # 前 T-1 个时间点
+        targets = x[:, 1:]            # 后 T-1 个时间点真实信号
+        return F.mse_loss(predictions, targets)
 
 
 class DDM(nn.Module):
@@ -282,8 +118,6 @@ class DDM(nn.Module):
             preserve_noise_sign: bool = False,
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
-            temporal_num_blocks: int = 4,
-            temporal_kernel_size: int = 3,
             use_temporal_encoder: bool = True,
             **kwargs
 
@@ -309,24 +143,21 @@ class DDM(nn.Module):
         self.num_hidden = num_hidden
         self.use_temporal_encoder = use_temporal_encoder
 
-        # Temporal Encoder: Convert raw time series to hidden features
-        # Input: [N, in_dim] or [B, N, in_dim] → Output: [N, num_hidden] or [B, N, num_hidden]
+        # Temporal Encoder: Causal dilated conv, output stays [N, in_dim]
+        # Input: [N, in_dim] → Output: [N, in_dim] (same time dimension)
         if self.use_temporal_encoder:
             self.temporal_encoder = NodeSpecificTemporalEncoder(
                 time_points=in_dim,
                 hidden_channels=temporal_hidden_channels,
-                output_dim=num_hidden,
-                num_blocks=temporal_num_blocks,
-                kernel_size=temporal_kernel_size,
-                activation=activation
+                output_dim=in_dim,  # 输出维度 = 时间点数，不再压缩
             )
-            print(f"Temporal Encoder: {in_dim} time points → {num_hidden} features")
-            print(f"  Receptive field: {self.temporal_encoder.receptive_field} time points")
-            denoising_in_dim = num_hidden
+            print(f"Temporal Encoder: {in_dim} time points → {in_dim} causal features")
         else:
             self.temporal_encoder = None
             print(f"Temporal Encoder: DISABLED - Using raw time series directly")
-            denoising_in_dim = in_dim
+
+        # 扩散过程始终在原始时间维度空间中进行
+        denoising_in_dim = in_dim
 
         assert num_hidden % nhead == 0
         # Denoising UNet works in either encoded feature space or raw time series space
@@ -391,9 +222,9 @@ class DDM(nn.Module):
             loss: Diffusion loss
             loss_item: Dictionary with loss value
         """
-        # Step 1: Optionally encode raw time series to feature space
+        # Step 1: Optionally encode raw time series via causal conv
         if self.use_temporal_encoder:
-            # [N, T] → [N, H] or [B, N, T] → [B, N, H]
+            # [N, T] → [N, T] (causal features, same dimension)
             x_processed = self.temporal_encoder(x)
         else:
             # Use raw time series directly
