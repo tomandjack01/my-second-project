@@ -52,17 +52,17 @@ The NNI web UI runs on port 6006. Hyperparameter search is recommended for best 
 - `sample_q()`: Forward diffusion process with directional noise (noise aligned with data distribution via mean/std matching and sign preservation)
 - `embed()`: Extract representations at specified timestep T for downstream evaluation
 - `Denoising_Unet`: U-Net style denoising network using GAT layers with skip connections
-- `NodeSpecificTemporalEncoder`: **Optional** causal dilated temporal encoder for fMRI time series (can be disabled with `use_temporal_encoder=False`)
-  - `forward()`: Returns `[N, output_dim]` encoding
-  - `encode_features()`: Returns both pre-GAP `[B*N, C, T]` feature map and post-GAP `[N, H]` encoding (used by pretrain decoder)
-  - When disabled: Model works directly on raw time series without dimensionality reduction
+- `CausalConv1d`: Causal 1D convolution with left-padding + truncation, ensures no future information leakage
+- `NodeSpecificTemporalEncoder`: **Causal dilated temporal encoder** with autoregressive pretrain head (can be disabled with `use_temporal_encoder=False`)
+  - Architecture: 3-layer causal dilated conv (dilation 1-2-4) → projector (Conv1d H→1) → LayerNorm
+  - `forward()`: `[N, T]` → `[N, T]` (same dimension, no compression)
+  - `pretrain_forward()`: Autoregressive self-supervised loss (predict t+1 from t), uses unnormalized features + `pred_head` to avoid LayerNorm scale destruction
+  - When disabled: Model works directly on raw time series without encoding
 
 **Encoder Pretraining** (`GraphExp/pretrain_temporal_encoder.py`):
-- `TemporalDecoder`: Lightweight decoder (2 blocks) for reconstruction loss
-- `ForecastingHead`: 3-layer MLP for future prediction loss
-- `vicreg_loss()`: Variance + Covariance regularization (anti-collapse)
-- `pretrain_temporal_encoder()`: Main pretrain loop with three-objective loss
-- Supports standalone execution via `__main__`
+- Legacy three-objective pretrain module (reconstruction + forecasting + VICReg)
+- No longer imported by `main_structure_learning.py` — replaced by native autoregressive pretrain
+- Kept for reference / standalone use
 
 **Denoising Network** (`models/mlp_gat.py`):
 - `Denoising_Unet`: Encoder-decoder architecture with down/up GAT layers
@@ -75,23 +75,21 @@ The NNI web UI runs on port 6006. Hyperparameter search is recommended for best 
 2. Denoising: Predict original features from noisy features using U-Net
 3. Loss: Cosine similarity loss with configurable alpha power
 
-### Encoder Pretraining Pipeline (Anti-Collapse)
+### Encoder Pretraining Pipeline (Autoregressive Causal)
 
-The `NodeSpecificTemporalEncoder` collapses when trained end-to-end with diffusion (cosine sim→1.0, Diff Loss→0.0). Solution: pretrain encoder independently, then freeze.
+The `NodeSpecificTemporalEncoder` collapses when trained end-to-end with diffusion (cosine sim→1.0, Diff Loss→0.0). Solution: pretrain encoder with autoregressive objective, then freeze.
 
-**Three-objective pretrain loss:**
-1. Reconstruction: `MSE(decoder(z), x_original)` — faithfulness
-2. Forecasting: `MSE(mlp(encoder(x[:,:P])), x[:,P:])` — future information (warmup 10 epochs)
-3. VICReg: variance term (std≥1.0 per dim) + covariance term (decorrelate dims) — anti-collapse
-
-**Loss weights:** `total = 1.0*recon + 0.5*forecast + 1.0*variance + 0.04*covariance`
+**Autoregressive pretrain loss:**
+- Uses `pretrain_forward()`: predict time step t+1 from t via MSE on unnormalized features
+- Bypasses LayerNorm to preserve signal scale for the prediction target
+- `pred_head` (Linear) maps encoder output to prediction space
 
 **Integration flow (`main_structure_learning.py`):**
-1. Create DDM model
-2. Pretrain or load encoder (skip with `--skip_pretrain`)
-3. Freeze `model.temporal_encoder` (requires_grad=False)
+1. Create DDM model (encoder output dim = `in_dim`, i.e. `time_points`)
+2. Autoregressive pretrain: iterate all subjects, call `pretrain_forward()`, accumulate gradients
+3. Freeze `model.temporal_encoder` (requires_grad=False, eval mode)
 4. Rebuild optimizer with only unfrozen parameters
-5. Normal diffusion training
+5. Normal diffusion training (diffusion operates in original time dimension space)
 
 **Brain Connectivity Structure Learning** (`GraphExp/main_structure_learning.py`):
 ```shell
@@ -117,51 +115,45 @@ python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder
 - `dead_dims_ratio` = 0%
 - `feature_std_mean` > 0.1
 
-### Temporal Encoder Control (NEW)
+### Temporal Encoder Control
 
-The DDM model now supports **optional temporal encoding**. You can choose to work directly on raw time series data instead of encoded features.
+The DDM model supports **optional temporal encoding** via causal dilated convolutions.
 
 **Two Operating Modes:**
 
 1. **With Temporal Encoder (Default):**
-   - Raw data `[N, 200]` → `temporal_encoder` → Encoded features `[N, 64]` → Diffusion
-   - Faster computation (64-dim vs 200-dim)
-   - Requires pretraining to avoid encoder collapse
-   - May lose some temporal information
+   - Raw data `[N, T]` → `temporal_encoder` → Causal features `[N, T]` → Diffusion
+   - Output dimension = input dimension (no compression, preserves full temporal info)
+   - Requires autoregressive pretraining to avoid encoder collapse
+   - Causal convolutions enforce physical time ordering (no future leakage)
 
-2. **Without Temporal Encoder (NEW):**
-   - Raw data `[N, 200]` → Directly to Diffusion → Output `[N, 200]`
-   - Preserves full temporal information
+2. **Without Temporal Encoder:**
+   - Raw data `[N, T]` → Directly to Diffusion → Output `[N, T]`
    - No pretraining needed
-   - Higher computational cost
+   - No causal inductive bias
 
 **Usage:**
 
 ```shell
+# Default: causal encoder with autoregressive pretrain + freeze + diffusion
+python main_structure_learning.py \
+    --csv_path ../fMRI_dataset/sim4.csv \
+    --epochs 100 \
+    --pretrain_epochs 50
+
 # Disable temporal encoder (direct diffusion on raw time series)
 python main_structure_learning.py \
     --csv_path ../fMRI_dataset/sim4.csv \
     --epochs 100 \
     --disable_temporal_encoder
-
-# Enable temporal encoder with pretraining (default)
-python main_structure_learning.py \
-    --csv_path ../fMRI_dataset/sim4.csv \
-    --epochs 100 \
-    --pretrain_epochs 50
 ```
 
 **Implementation Details:**
-- `DDM.__init__()`: Added `use_temporal_encoder` parameter (default: `True`)
-- When disabled: `temporal_encoder = None`, denoising network input/output dim = `in_dim` (200)
-- When enabled: `temporal_encoder` active, denoising network input/output dim = `num_hidden` (64)
+- `DDM.__init__()`: `use_temporal_encoder` parameter (default: `True`)
+- When disabled: `temporal_encoder = None`, denoising network input/output dim = `in_dim`
+- When enabled: `temporal_encoder` active, denoising network input/output dim = `in_dim` (same — no dimension reduction)
+- Diffusion always operates in original time dimension space (`denoising_in_dim = in_dim`)
 - Pretraining, freezing, and collapse diagnostics only run when encoder is enabled
-
-**Testing:**
-```shell
-cd GraphExp
-python test_disable_encoder.py  # Validates both modes work correctly
-```
 
 ### Evaluation
 
@@ -187,12 +179,12 @@ Key hyperparameters in yaml configs:
 - `seeds`: Random seeds for multiple runs
 
 Pretrain CLI parameters (`main_structure_learning.py`):
-- `--pretrain_epochs`: Number of encoder pretrain epochs (default: 50)
+- `--pretrain_epochs`: Number of autoregressive pretrain epochs (default: 50)
 - `--pretrain_lr`: Pretrain learning rate (default: 1e-3)
-- `--pretrain_split_ratio`: Input/forecast split ratio (default: 0.75, i.e. 150/50 for T=200)
-- `--skip_pretrain`: Skip pretraining entirely (end-to-end training, original behavior)
+- `--skip_pretrain`: Skip pretraining entirely (equivalent to `--pretrain_epochs 0`)
 - `--pretrain_checkpoint`: Path to load existing pretrained encoder weights
-- `--disable_temporal_encoder`: **NEW** - Disable temporal encoder and work directly on raw time series (skips all pretraining)
+- `--disable_temporal_encoder`: Disable temporal encoder and work directly on raw time series (skips all pretraining)
+- ~~`--pretrain_split_ratio`~~: Deprecated (autoregressive pretrain does not need split)
 
 ### Key Dependencies
 - DGL (Deep Graph Library) for graph neural networks
