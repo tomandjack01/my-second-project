@@ -48,9 +48,9 @@ def find_latest_pred(results_dir: Path) -> Path:
 
 def load_adjacency(pred_path: Path):
     adj = np.loadtxt(pred_path, delimiter=",")
-    # ========== 加入这极其关键的一行 ==========
-    adj = adj.T  # 将 GNN 视角的矩阵转置为 标准因果图视角
-    # ==========================================
+    # GNN denoising learns adj[effect, cause] high (effect helps denoise cause),
+    # which is the reverse of causal direction. Transpose to get causal convention.
+    adj = adj.T
     if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
         raise ValueError(f"Adjacency must be square, got shape={adj.shape}")
     return adj

@@ -6,21 +6,19 @@
 
 本项目将 DDM 的方向性噪声机制应用于脑功能连接分析：
 
-1. **时序编码器 (NodeSpecificTemporalEncoder)**：因果膨胀卷积网络，将每个脑区的 fMRI 时间序列 `[N, T]` 编码为低维表示 `[N, H]`
-2. **编码器预训练 (Anti-Collapse)**：独立预训练编码器后冻结，防止与扩散过程端到端训练时发生表征坍塌
-3. **方向性扩散**：在编码空间中执行前向扩散（数据依赖的各向异性噪声）+ U-Net 去噪
+1. **时序编码器 (NodeSpecificTemporalEncoder)**：因果膨胀卷积网络（dilation 1-2-4），将每个脑区的 fMRI 时间序列 `[N, T]` 编码为因果特征 `[N, T]`（同维度，无压缩）
+2. **编码器自回归预训练 (Anti-Collapse)**：用 t 时刻预测 t+1 时刻的自回归目标独立预训练编码器后冻结，防止与扩散过程端到端训练时发生表征坍塌
+3. **方向性扩散**：在原始时间维度空间中执行前向扩散（数据依赖的各向异性噪声）+ U-Net 去噪
 4. **结构学习**：通过可学习邻接矩阵 + L1 稀疏正则化，从扩散过程中提取脑区间的连接模式
 
 ### 编码器预训练流程
 
-`NodeSpecificTemporalEncoder` 在端到端训练时会坍塌（cosine sim → 1.0, Diff Loss → 0.0）。解决方案：三目标预训练后冻结。
+`NodeSpecificTemporalEncoder` 在端到端训练时会坍塌（cosine sim → 1.0, Diff Loss → 0.0）。解决方案：自回归预训练后冻结。
 
-**预训练损失函数：**
-- **Reconstruction**：`MSE(decoder(z), x_original)` — 保真性
-- **Forecasting**：`MSE(mlp(encoder(x[:,:P])), x[:,P:])` — 未来预测能力（warmup 10 epochs）
-- **VICReg**：方差项（每维 std ≥ 1.0）+ 协方差项（维度去相关）— 防坍塌
-
-**损失权重：** `total = 1.0*recon + 0.5*forecast + 1.0*variance + 0.04*covariance`
+**自回归预训练损失：**
+- 使用 `pretrain_forward()`：通过 MSE 在未归一化特征上预测 t+1 时刻
+- 绕过 LayerNorm 以保留信号尺度
+- `pred_head`（Linear）将编码器输出映射到预测空间
 
 ### 坍塌诊断指标
 
@@ -57,7 +55,7 @@ cd GraphExp
 python main_structure_learning.py --epochs 100 --pretrain_epochs 50
 ```
 
-### 跳过预训练（端到端训练，原始行为）
+### 跳过预训练
 
 ```shell
 python main_structure_learning.py --epochs 100 --skip_pretrain
@@ -69,10 +67,10 @@ python main_structure_learning.py --epochs 100 --skip_pretrain
 python main_structure_learning.py --pretrain_checkpoint ./results/run_xxx/pretrained_encoder.pt
 ```
 
-### 单独预训练编码器
+### 禁用时序编码器（直接在原始时序上扩散）
 
 ```shell
-python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder.pt
+python main_structure_learning.py --epochs 100 --disable_temporal_encoder
 ```
 
 ## 主要参数
@@ -87,11 +85,11 @@ python pretrain_temporal_encoder.py --epochs 50 --save_path ./pretrained_encoder
 | `--num_hidden` | 64 | 隐藏层维度 |
 | `--num_layers` | 2 | GNN 层数 |
 | `--batch_size` | 4 | 被试批大小 |
-| `--pretrain_epochs` | 50 | 编码器预训练轮数 |
+| `--pretrain_epochs` | 50 | 自回归预训练轮数 |
 | `--pretrain_lr` | 1e-3 | 预训练学习率 |
-| `--pretrain_split_ratio` | 0.75 | 输入/预测分割比（如 T=200 时为 150/50） |
-| `--skip_pretrain` | False | 跳过预训练 |
+| `--skip_pretrain` | False | 跳过预训练（等价于 `--pretrain_epochs 0`） |
 | `--pretrain_checkpoint` | None | 已有预训练权重路径 |
+| `--disable_temporal_encoder` | False | 禁用时序编码器，直接在原始时序上扩散 |
 | `--debug_checks` | False | 启用首步调试检查 |
 
 ## 训练流程
@@ -105,12 +103,13 @@ fMRI CSV [Total_Rows, N]
          │
          ▼
 ┌─────────────────────────────────┐
-│  1. 编码器预训练 (可选)           │
-│     Recon + Forecast + VICReg   │
+│  1. 编码器自回归预训练 (可选)     │
+│     predict t+1 from t (MSE)   │
 │     → 冻结 temporal_encoder     │
 ├─────────────────────────────────┤
 │  2. 扩散训练                     │
 │     temporal_encoder(x) → z     │
+│     [N, T] → [N, T] (同维度)    │
 │     sample_q(t, z) → z_t        │
 │     Denoising_Unet(z_t) → ẑ    │
 │     Loss: cosine_sim + L1_adj   │

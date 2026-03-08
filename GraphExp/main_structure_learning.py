@@ -167,6 +167,8 @@ def set_seed(seed: int):
 
     """Set random seeds for reproducibility."""
 
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+
     np.random.seed(seed)
 
     torch.manual_seed(seed)
@@ -174,6 +176,13 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
 
         torch.cuda.manual_seed_all(seed)
+
+        torch.backends.cudnn.deterministic = True
+
+        torch.backends.cudnn.benchmark = False
+
+    # Force all PyTorch ops (including CUDA scatter/gather used by DGL) to be deterministic
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 
@@ -331,6 +340,8 @@ def train_brain_connectivity(
 
     noise_guide_adj: Optional[torch.Tensor] = None,
 
+    patel_matrix: Optional[torch.Tensor] = None,
+
     num_epochs: int = 100,
 
     learning_rate: float = 1e-3,
@@ -417,9 +428,15 @@ def train_brain_connectivity(
 
 
 
-    # Initialize DDM with Pearson matrix for structure learning
-
+    # Initialize DDM with Patel matrix for structure learning
+    # Patel matrix is asymmetric (Tau encodes directionality), giving SVD init
+    # a directional bias: sender ≠ receiver, which is critical for learning edge direction.
     # in_dim = TIME_POINTS (features per node)
+
+    # Compute sparsity bias: logit(target_density) so initial sigmoid mean ≈ target_density
+    import math
+    target_density = 61.0 / (num_nodes * (num_nodes - 1))  # GT-like sparsity ≈ 2.5%
+    adj_bias_init = math.log(target_density / (1.0 - target_density))
 
     model = DDM(
 
@@ -449,9 +466,11 @@ def train_brain_connectivity(
 
         T=1000,
 
-        init_features=pearson_matrix,  # [N, N] for structure learning
+        init_features=patel_matrix,  # [N, N] Patel is asymmetric (Tau gives direction) → better SVD init for directed edges
 
         noise_guide_adj=noise_guide_adj,  # Row-normalized adj for neighbor-based noise
+
+        adj_bias_init=adj_bias_init,
 
         use_temporal_encoder=use_temporal_encoder,
 
@@ -616,42 +635,25 @@ def train_brain_connectivity(
                 
 
                 # L1 sparsity regularization on learned adjacency
+                # model.learned_adj_weights is cached by _get_structure_graph (already sigmoid + diag masked)
+                adj_weights = model.learned_adj_weights  # [N, N], diag already zeroed
 
-                # We exclude self-loops (diagonal) from sparsity penalty to allow for auto-regression
-
-                # NORMALIZED by the number of off-diagonal elements
-
-                adj_sigmoid = torch.sigmoid(model.learned_adj)
-
-                
-
-                # Mask out diagonal (keep only off-diagonal for penalty)
-
-                mask_off_diag = 1.0 - torch.eye(num_nodes, device=device)
-
-                adj_off_diag = adj_sigmoid * mask_off_diag
-
-                
-
-                l1_norm = torch.norm(adj_off_diag, p=1)
-
-                n_off_diag = num_nodes * num_nodes - num_nodes  # Total elements - Diagonal elements
-
-                
-
-                # Avoid division by zero (though N is typically > 1)
+                n_off_diag = num_nodes * num_nodes - num_nodes
+                l1_norm = torch.norm(adj_weights, p=1)
 
                 if n_off_diag > 0:
-
                     sparsity_loss = lambda_l1 * (l1_norm / n_off_diag)
-
                 else:
-
                     sparsity_loss = torch.tensor(0.0, device=device)
 
-                # Total loss
+                # Hub regularization: penalize variance of embedding norms
+                # to prevent a few nodes from dominating all edges
+                sender_norms = torch.norm(model.node_emb_sender, dim=1)
+                receiver_norms = torch.norm(model.node_emb_receiver, dim=1)
+                hub_loss = 0.01 * (sender_norms.var() + receiver_norms.var())
 
-                total_loss = loss + sparsity_loss
+                # Total loss
+                total_loss = loss + sparsity_loss + hub_loss
 
                 
 
@@ -694,7 +696,9 @@ def train_brain_connectivity(
 
             with torch.no_grad():
 
-                adj_sigmoid = torch.sigmoid(model.learned_adj)
+                _, adj_sigmoid_flat = model._get_structure_graph(device)
+
+                adj_sigmoid = adj_sigmoid_flat.view(num_nodes, num_nodes)
 
                 adj_mean = adj_sigmoid.mean().item()
 
@@ -729,8 +733,8 @@ def train_brain_connectivity(
     # Extract final adjacency matrix
 
     with torch.no_grad():
-
-        adj_matrix = torch.sigmoid(model.learned_adj).cpu().numpy()
+        _, edge_weights_flat = model._get_structure_graph(device)
+        adj_matrix = edge_weights_flat.view(num_nodes, num_nodes).cpu().numpy()
 
     
 
@@ -955,7 +959,7 @@ def main():
 
     # Step 6: Train model
 
-    # - pearson_matrix: Used as init_features (starting point for learned_adj)
+    # - patel_matrix: Raw Patel matrix for SVD-based sender/receiver init (continuous, directional)
 
     # - noise_guide_adj: Row-normalized adjacency for neighbor-based noise
 
@@ -963,13 +967,15 @@ def main():
 
         data_3d=data_3d,
 
-        pearson_matrix=pearson_matrix,  # Pearson for initialization
+        pearson_matrix=pearson_matrix,  # Pearson for reference/saving
 
         num_nodes=num_nodes,
 
         time_points=args.time_points,
 
         noise_guide_adj=noise_guide_adj,  # For neighbor-based noise
+
+        patel_matrix=patel_matrix,  # Asymmetric Patel for SVD init (direction info)
 
         num_epochs=args.epochs,
 

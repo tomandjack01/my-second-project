@@ -116,6 +116,8 @@ class DDM(nn.Module):
             init_features: Optional[torch.Tensor] = None,
             noise_guide_adj: Optional[torch.Tensor] = None,
             preserve_noise_sign: bool = False,
+            emb_dim: Optional[int] = None,  # None = full rank (N)
+            adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
             use_temporal_encoder: bool = True,
@@ -185,28 +187,57 @@ class DDM(nn.Module):
 
         self.preserve_noise_sign = preserve_noise_sign
 
-        # Graph Structure Learning: Initialize learnable adjacency matrix
+        # Graph Structure Learning: Sender/Receiver embedding with SVD initialization
         self.structure_learning_mode = init_features is not None
         if self.structure_learning_mode:
-            N, D = init_features.shape
-            # Compute Pearson correlation matrix
-            feat_norm = (init_features - init_features.mean(dim=0)) / (init_features.std(dim=0) + 1e-8)
-            pearson_corr = feat_norm @ feat_norm.T / D
-            # Initialize learnable adjacency parameter
-            self.learned_adj = nn.Parameter(pearson_corr.clone())
+            N = init_features.shape[0]
+            # Full rank by default: emb_dim=N gives same expressiveness as [N,N] parameter
+            self.emb_dim = min(emb_dim if emb_dim is not None else N, N)
+            # SVD decomposition of init_features (Patel matrix) for asymmetric init
+            U, S, V = torch.svd(init_features.float())
+            U_trunc = U[:, :self.emb_dim]        # [N, emb_dim]
+            S_trunc = S[:self.emb_dim]            # [emb_dim]
+            V_trunc = V[:, :self.emb_dim]         # [N, emb_dim]
+            sqrt_S = torch.sqrt(S_trunc).unsqueeze(0)  # [1, emb_dim]
+            raw_sender = U_trunc * sqrt_S
+            raw_receiver = V_trunc * sqrt_S
+            # Rescale so logit std ≈ 1.0 (sigmoid linear region)
+            with torch.no_grad():
+                logits_est = raw_sender @ raw_receiver.T
+                logit_std = logits_est.std()
+                scale = (1.0 / (logit_std + 1e-8)).sqrt().item()
+            self.node_emb_sender = nn.Parameter(raw_sender * scale)    # [N, emb_dim]
+            self.node_emb_receiver = nn.Parameter(raw_receiver * scale)  # [N, emb_dim]
+            # Learnable sparsity bias: shifts all logits to encourage sparse output
+            if adj_bias_init is not None:
+                self.adj_bias = nn.Parameter(torch.tensor(float(adj_bias_init)))
+            else:
+                self.adj_bias = nn.Parameter(torch.tensor(0.0))
+            # Cached adj weights for external loss computation
+            self.learned_adj_weights = None
             # Create fully connected DGL graph (N x N edges)
             src = torch.arange(N).repeat_interleave(N)
             dst = torch.arange(N).repeat(N)
             self.register_buffer('full_g_src', src)
             self.register_buffer('full_g_dst', dst)
+            self.register_buffer('diag_mask', 1.0 - torch.eye(N))
             self.num_nodes = N
 
     def _get_structure_graph(self, device):
-        """Create fully connected graph and compute edge weights from learned_adj."""
+        """Create fully connected graph and compute edge weights from sender/receiver embeddings."""
         g = dgl.graph((self.full_g_src, self.full_g_dst), num_nodes=self.num_nodes)
         g = g.to(device)
-        # Apply sigmoid to get edge weights in [0, 1]
-        edge_weights = torch.sigmoid(self.learned_adj).flatten()
+        # Asymmetric adjacency: sender @ receiver^T + learnable sparsity bias
+        adj_logits = self.node_emb_sender @ self.node_emb_receiver.T + self.adj_bias  # [N, N]
+        # Clamp logits to [-6, 6] to prevent sigmoid saturation while allowing
+        # near-binary outputs. sigmoid(±6) ≈ 0.0025 / 0.9975, gradient ≈ 0.0025.
+        adj_logits = torch.clamp(adj_logits, -6.0, 6.0)
+        adj_weights = torch.sigmoid(adj_logits)
+        # Zero out self-loops
+        adj_weights = adj_weights * self.diag_mask.to(device)
+        # Cache for external loss computation
+        self.learned_adj_weights = adj_weights
+        edge_weights = adj_weights.flatten()
         return g, edge_weights
 
     def forward(self, g, x):
