@@ -17,30 +17,19 @@ using DDM (Directional Diffusion Models) with L1 sparsity regularization.
 
 
 import argparse
-
+import math
 import os
-
-import numpy as np
-
-import pandas as pd
-
-import torch
-
-import torch.nn.functional as F
-
+from datetime import datetime
 from typing import Any, Dict, Optional
 
-from datetime import datetime
-
-from collections import defaultdict
-
-
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 
 from models import DDM
-
-from utils.patel_util import compute_patel_matrix
-
-import matplotlib.pyplot as plt
+from utils.patel_util import compute_patel_components
 
 
 # ============================================================================
@@ -325,7 +314,272 @@ def compute_global_pearson(data_2d: torch.Tensor):
     return pearson_matrix
 
 
+def compute_target_density(num_nodes: int, target_edge_count: int, eps: float = 1e-4) -> float:
+    """Map a target edge count to a safe directed-edge density for logit init."""
+    max_directed_edges = max(num_nodes * (num_nodes - 1), 1)
+    raw_density = float(target_edge_count) / float(max_directed_edges)
+    return min(max(raw_density, eps), 0.95)
 
+
+def build_noise_guide_adjacency(patel_strength_matrix: torch.Tensor, top_k_pairs: int):
+    """
+    Build a symmetric row-normalized adjacency for neighbor-based noise.
+
+    `patel_strength_matrix` should encode undirected skeleton strength. In practice
+    we pass positive Patel kappa so skeleton selection is decoupled from direction.
+    """
+    num_nodes = patel_strength_matrix.shape[0]
+    device = patel_strength_matrix.device
+    dtype = patel_strength_matrix.dtype
+
+    eye = torch.eye(num_nodes, device=device, dtype=dtype)
+    pair_strength = torch.maximum(patel_strength_matrix, patel_strength_matrix.t())
+    pair_strength = torch.clamp(pair_strength, min=0.0) * (1.0 - eye)
+
+    triu_i, triu_j = torch.triu_indices(num_nodes, num_nodes, offset=1, device=device)
+    flat_strength = pair_strength[triu_i, triu_j]
+    num_pairs = flat_strength.numel()
+    k_pairs = min(max(int(top_k_pairs), 0), num_pairs)
+
+    adj_binary = torch.zeros_like(pair_strength)
+    threshold = 0.0
+    if k_pairs > 0 and num_pairs > 0:
+        top_idx = torch.topk(flat_strength, k_pairs).indices
+        src = triu_i[top_idx]
+        dst = triu_j[top_idx]
+        adj_binary[src, dst] = 1.0
+        adj_binary[dst, src] = 1.0
+        threshold = float(flat_strength[top_idx].min().item())
+
+    adj_with_self = adj_binary + eye
+    degree = adj_with_self.sum(dim=1, keepdim=True)
+    noise_guide_adj = adj_with_self / (degree + 1e-9)
+    return noise_guide_adj, adj_binary, k_pairs, threshold
+
+
+@torch.no_grad()
+def get_current_structure_adj(model: DDM) -> torch.Tensor:
+    """Fetch the current adjacency using the exact export-time structure logic."""
+    return model.get_structure_adj().detach()
+
+
+def compute_auxiliary_lambdas(
+    epoch: int,
+    num_epochs: int,
+    loss_ddm_main: torch.Tensor,
+    raw_loss_dir: torch.Tensor,
+    raw_loss_ortho: torch.Tensor,
+    prev_lambda_dir: float,
+    prev_lambda_ortho: float,
+    warmup_epochs: int = 5,
+):
+    """Warmup + ratio-adaptive scaling + cosine anneal + EMA smoothing."""
+    if epoch < warmup_epochs:
+        return 0.0, 0.0
+
+    post_warmup_epochs = max(num_epochs - warmup_epochs, 1)
+    ramp_epochs = max(1, min(10, post_warmup_epochs))
+    ramp = min(1.0, float(epoch - warmup_epochs + 1) / float(ramp_epochs))
+    anneal_progress = float(epoch - warmup_epochs) / float(max(post_warmup_epochs - 1, 1))
+    anneal = 0.5 * (1.0 + math.cos(math.pi * anneal_progress))
+    epoch_factor = ramp * anneal
+
+    scale_dir = (loss_ddm_main.detach() * 0.01) / (raw_loss_dir.detach() + 1e-6)
+    scale_ortho = (loss_ddm_main.detach() * 0.005) / (raw_loss_ortho.detach() + 1e-6)
+
+    lambda_dir_raw = min(scale_dir.item() * epoch_factor, 0.5)
+    lambda_ortho_raw = min(scale_ortho.item() * epoch_factor, 0.5)
+
+    ema_alpha = 0.1
+    lambda_dir = ema_alpha * lambda_dir_raw + (1 - ema_alpha) * prev_lambda_dir
+    lambda_ortho = ema_alpha * lambda_ortho_raw + (1 - ema_alpha) * prev_lambda_ortho
+
+    max_change = 0.1
+    if prev_lambda_dir > 0:
+        lambda_dir = max(prev_lambda_dir * (1 - max_change),
+                         min(prev_lambda_dir * (1 + max_change), lambda_dir))
+    if prev_lambda_ortho > 0:
+        lambda_ortho = max(prev_lambda_ortho * (1 - max_change),
+                           min(prev_lambda_ortho * (1 + max_change), lambda_ortho))
+
+    return lambda_dir, lambda_ortho
+
+
+
+# ============================================================================
+# AUXILIARY LOSSES: Directional Prior & Feature Decoupling
+# ============================================================================
+
+def compute_directional_margin_loss(logits, direction_prior_matrix, margin=1.0):
+    """
+    基于 Patel 算法的高置信度先验，在 Logit 空间计算带 Margin 的方向引导损失。
+
+    q_threshold 自适应：取 |delta_P| 非零值的中位数，确保约 50% 的边参与约束。
+    margin 自适应：在有效边（w>0）上对 sign(delta_P)*D 取 25 分位数，
+                  严格保证约 25% 的有效边违反约束、持续提供梯度。
+    """
+    delta_prior = direction_prior_matrix - direction_prior_matrix.t()
+    abs_delta_prior = torch.abs(delta_prior)
+
+    # 自适应 q_threshold：非零 |delta_P| 的中位数
+    nonzero_vals = abs_delta_prior[abs_delta_prior > 0]
+    if nonzero_vals.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    q_threshold = nonzero_vals.median().item()
+
+    # 只对高置信度（差值大于自适应阈值）的边施加先验
+    active_mask = abs_delta_prior > q_threshold
+    if active_mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    w = active_mask.float() * abs_delta_prior
+
+    D = logits - logits.t()
+    signed_D = torch.sign(delta_prior) * D  # 正值=方向正确，负值=方向错误
+
+    # 自适应 margin：有效边上 signed_D 的 25 分位数（detach，不参与梯度）
+    # quantile(0.25) 意味着 25% 的有效边 signed_D ≤ margin，即 25% 违反约束
+    active_signed_D = signed_D[active_mask].detach()
+    if active_signed_D.numel() > 0:
+        adaptive_margin = active_signed_D.quantile(0.25).item()
+    else:
+        adaptive_margin = margin
+
+    # Margin Loss
+    wrong_dir_penalty = F.relu(adaptive_margin - signed_D)
+    loss_dir = torch.sum(w * wrong_dir_penalty) / (torch.sum(w) + 1e-8)
+    return loss_dir
+
+
+def compute_feature_ortho_loss(S, R):
+    """
+    对发送端和接收端的特征空间进行解耦，计算互协方差矩阵的 Frobenius 范数。
+    先 L2 归一化，防止嵌入范数膨胀导致 loss 爆炸。
+    """
+    N = S.shape[0]
+    # L2 归一化：消除范数量级影响，只关注方向相关性
+    S_n = F.normalize(S, p=2, dim=1)
+    R_n = F.normalize(R, p=2, dim=1)
+    # 沿节点维度去中心化
+    S_c = S_n - S_n.mean(dim=0, keepdim=True)
+    R_c = R_n - R_n.mean(dim=0, keepdim=True)
+
+    # 计算特征维度的互协方差矩阵 [H, H]
+    C = torch.mm(S_c.t(), R_c) / N
+    return torch.sum(C ** 2)
+
+
+@torch.no_grad()
+def compute_epoch_quality(adj_np, patel_direction_cpu, patel_strength_cpu, top_k=61):
+    """
+    不依赖 GT 的 epoch 质量评分，用于 best-epoch 选择。
+
+    评分 = agreement_strict * dir_margin * density_factor
+
+    - agreement_strict: top-k 边中，仅在 Patel 高置信方向边上计算方向一致率
+      （排除 Patel 平局，避免乐观偏差）
+    - dir_margin: top-k 边的平均 |adj[i,j] - adj[j,i]|（衡量方向强度，
+      不受饱和高分假边误导）
+    - density_factor: 惩罚实际密度偏离目标密度过远的情况（抑制过稀疏/过饱和）
+
+    Args:
+        adj_np: 邻接矩阵 [N, N] numpy array (sigmoid 后)
+        patel_direction_cpu: Patel tau 方向先验 [N, N] numpy array
+        patel_strength_cpu: Patel kappa/score 强度先验 [N, N] numpy array
+        top_k: 取 top-k 条边评估（应按数据集配置）
+    Returns:
+        score: float, 越高越好
+        details: dict with sub-metrics
+    """
+    n = adj_np.shape[0]
+    patel_direction = patel_direction_cpu
+    patel_strength = np.maximum(patel_strength_cpu, 0.0)
+
+    # --- Patel 高置信阈值：|p_ij - p_ji| 的中位数 ---
+    patel_delta = np.abs(patel_direction - patel_direction.T)
+    off_diag_mask = ~np.eye(n, dtype=bool)
+    patel_nonzero = patel_delta[off_diag_mask]
+    patel_nonzero = patel_nonzero[patel_nonzero > 0]
+    patel_thresh = float(np.median(patel_nonzero)) if len(patel_nonzero) > 0 else 0.0
+
+    # --- 收集所有无向边对 ---
+    candidates = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            w_ij, w_ji = float(adj_np[i, j]), float(adj_np[j, i])
+            margin = abs(w_ij - w_ji)
+            if w_ij > w_ji:
+                src, dst = i, j
+            elif w_ji > w_ij:
+                src, dst = j, i
+            else:
+                src, dst = i, j  # tie: 方向不确定
+            max_w = max(w_ij, w_ji)
+            candidates.append((src, dst, max_w, margin))
+
+    # 按最大方向权重降序，取 top-k
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    k = min(top_k, len(candidates))
+    if k == 0:
+        return 0.0, {"agreement": 0.0, "dir_margin": 0.0,
+                      "density_factor": 0.0, "skeleton_overlap": 0.0,
+                      "high_conf_edges": 0, "k": 0}
+
+    top_edges = candidates[:k]
+    top_edge_set = {(e[0], e[1]) for e in top_edges}
+    # Also store as undirected for skeleton comparison
+    top_edge_undirected = {(min(e[0], e[1]), max(e[0], e[1])) for e in top_edges}
+
+    # --- 0) skeleton_overlap: Patel top-k 骨架一致性 ---
+    patel_candidates = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_strength = max(float(patel_strength[i, j]), float(patel_strength[j, i]))
+            patel_candidates.append((i, j, pair_strength))
+    patel_candidates.sort(key=lambda x: x[2], reverse=True)
+    patel_top_k_set = {(e[0], e[1]) for e in patel_candidates[:k]}
+    skeleton_overlap = len(top_edge_undirected & patel_top_k_set) / k
+
+    # --- 1) agreement_strict: 仅在 Patel 高置信边上算 ---
+    agree_count = 0
+    high_conf_count = 0
+    for src, dst, _, _ in top_edges:
+        p_delta = abs(patel_direction[src, dst] - patel_direction[dst, src])
+        if p_delta <= patel_thresh:
+            continue  # Patel 低置信 / 平局，跳过
+        high_conf_count += 1
+        # Patel 认为 src→dst 当 patel[src,dst] > patel[dst,src]
+        if patel_direction[src, dst] > patel_direction[dst, src]:
+            agree_count += 1
+
+    agreement = agree_count / high_conf_count if high_conf_count > 0 else 0.0
+
+    # --- 2) dir_margin: 平均方向强度 |adj[i,j] - adj[j,i]| ---
+    dir_margin = float(np.mean([e[3] for e in top_edges]))
+
+    # --- 3) density_factor: 惩罚密度偏离 ---
+    total_pairs = n * (n - 1) // 2
+    target_density = k / max(total_pairs, 1)
+    actual_positive_pairs = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if max(float(adj_np[i, j]), float(adj_np[j, i])) > 0.5:
+                actual_positive_pairs += 1
+    actual_density = actual_positive_pairs / max(total_pairs, 1)
+    density_ratio = actual_density / (target_density + 1e-8)
+    # Gaussian-style penalty: ratio=1 → factor=1, 宽容到 ~10x 偏离仍有 ~0.1 分
+    density_factor = float(np.exp(-0.5 * (np.log(density_ratio + 1e-8)) ** 2))
+
+    score = agreement * dir_margin * density_factor * skeleton_overlap
+    return score, {
+        "agreement": agreement,
+        "dir_margin": dir_margin,
+        "density_factor": density_factor,
+        "skeleton_overlap": skeleton_overlap,
+        "actual_pair_density": actual_density,
+        "target_pair_density": target_density,
+        "high_conf_edges": high_conf_count,
+        "k": k,
+    }
 
 
 def train_brain_connectivity(
@@ -338,9 +592,10 @@ def train_brain_connectivity(
 
     time_points: int,
 
+    patel_matrix: torch.Tensor,
+    patel_direction_matrix: Optional[torch.Tensor] = None,
+    patel_strength_matrix: Optional[torch.Tensor] = None,
     noise_guide_adj: Optional[torch.Tensor] = None,
-
-    patel_matrix: Optional[torch.Tensor] = None,
 
     num_epochs: int = 100,
 
@@ -368,6 +623,7 @@ def train_brain_connectivity(
     pretrain_epochs: int = 50,
     pretrain_lr: float = 1e-3,
     result_dir: Optional[str] = None,
+    target_edge_count: int = 61,
 
 ):
 
@@ -403,6 +659,12 @@ def train_brain_connectivity(
 
         batch_size: Batch size for subjects
 
+        patel_matrix: Patel score matrix (-kappa * tau), used for asymmetric init
+
+        patel_direction_matrix: Patel tau matrix used as weak directional prior
+
+        patel_strength_matrix: Patel kappa-like skeleton strength used for proxy scoring
+
         noise_guide_adj: Row-normalized adjacency matrix for neighbor-based noise
 
         ddm_kwargs: Optional extra keyword arguments forwarded to DDM
@@ -421,6 +683,16 @@ def train_brain_connectivity(
 
     data_3d = data_3d.to(device)
 
+    patel_score_matrix = patel_matrix.to(device)
+    if patel_direction_matrix is None:
+        patel_direction_matrix = patel_score_matrix
+    else:
+        patel_direction_matrix = patel_direction_matrix.to(device)
+    if patel_strength_matrix is None:
+        patel_strength_matrix = torch.clamp(0.5 * (patel_score_matrix + patel_score_matrix.t()), min=0.0)
+    else:
+        patel_strength_matrix = patel_strength_matrix.to(device)
+
     ddm_kwargs = {} if ddm_kwargs is None else dict(ddm_kwargs)
 
     # Extract use_temporal_encoder from ddm_kwargs to avoid duplicate argument
@@ -428,14 +700,13 @@ def train_brain_connectivity(
 
 
 
-    # Initialize DDM with Patel matrix for structure learning
-    # Patel matrix is asymmetric (Tau encodes directionality), giving SVD init
-    # a directional bias: sender ≠ receiver, which is critical for learning edge direction.
+    # Initialize DDM with Patel score matrix for structure learning.
+    # The score matrix carries asymmetric strength for SVD init, while tau is
+    # reserved for the weak directional guidance loss.
     # in_dim = TIME_POINTS (features per node)
 
     # Compute sparsity bias: logit(target_density) so initial sigmoid mean ≈ target_density
-    import math
-    target_density = 61.0 / (num_nodes * (num_nodes - 1))  # GT-like sparsity ≈ 2.5%
+    target_density = compute_target_density(num_nodes, target_edge_count)
     adj_bias_init = math.log(target_density / (1.0 - target_density))
 
     model = DDM(
@@ -466,7 +737,7 @@ def train_brain_connectivity(
 
         T=1000,
 
-        init_features=patel_matrix,  # [N, N] Patel is asymmetric (Tau gives direction) → better SVD init for directed edges
+        init_features=patel_score_matrix,  # [N, N] asymmetric Patel score -> directional SVD init
 
         noise_guide_adj=noise_guide_adj,  # Row-normalized adj for neighbor-based noise
 
@@ -548,6 +819,20 @@ def train_brain_connectivity(
     loss_history = []
 
     collapse_history = []
+    quality_history = []
+
+    # Best-epoch tracking (Patel-based proxy, no GT needed)
+    best_adj = None
+    best_score = -1.0
+    best_epoch = -1
+    best_quality_details = None
+    patel_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
+    patel_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
+    quality_top_k = min(max(int(target_edge_count), 1), max(num_nodes * (num_nodes - 1) // 2, 1))
+
+    # Lambda smoothing state (EMA + step-change cap)
+    prev_lambda_dir = 0.0
+    prev_lambda_ortho = 0.0
 
     
 
@@ -560,6 +845,10 @@ def train_brain_connectivity(
         epoch_loss = 0.0
 
         epoch_sparsity = 0.0
+
+        epoch_dir_loss = 0.0
+
+        epoch_ortho_loss = 0.0
 
         num_batches = 0
 
@@ -634,9 +923,9 @@ def train_brain_connectivity(
 
                 
 
-                # L1 sparsity regularization on learned adjacency
-                # model.learned_adj_weights is cached by _get_structure_graph (already sigmoid + diag masked)
-                adj_weights = model.learned_adj_weights  # [N, N], diag already zeroed
+                # L1 sparsity regularization on learned adjacency.
+                # Reuse the exact same clamped logits/sigmoid path used for export.
+                adj_weights = model.get_structure_adj()  # [N, N], diag already zeroed
 
                 n_off_diag = num_nodes * num_nodes - num_nodes
                 l1_norm = torch.norm(adj_weights, p=1)
@@ -652,8 +941,33 @@ def train_brain_connectivity(
                 receiver_norms = torch.norm(model.node_emb_receiver, dim=1)
                 hub_loss = 0.01 * (sender_norms.var() + receiver_norms.var())
 
-                # Total loss
-                total_loss = loss + sparsity_loss + hub_loss
+                # DDM main loss (diffusion + sparsity + hub)
+                loss_ddm_main = loss + sparsity_loss + hub_loss
+
+                # --- Directional margin loss & feature orthogonality loss ---
+                logits = model.get_structure_logits()
+                raw_loss_dir = compute_directional_margin_loss(logits, patel_direction_matrix)
+                raw_loss_ortho = compute_feature_ortho_loss(
+                    model.node_emb_sender, model.node_emb_receiver,
+                )
+
+                lambda_dir, lambda_ortho = compute_auxiliary_lambdas(
+                    epoch=epoch,
+                    num_epochs=num_epochs,
+                    loss_ddm_main=loss_ddm_main,
+                    raw_loss_dir=raw_loss_dir,
+                    raw_loss_ortho=raw_loss_ortho,
+                    prev_lambda_dir=prev_lambda_dir,
+                    prev_lambda_ortho=prev_lambda_ortho,
+                )
+
+                prev_lambda_dir = lambda_dir
+                prev_lambda_ortho = lambda_ortho
+
+                weighted_dir = lambda_dir * raw_loss_dir
+                weighted_ortho = lambda_ortho * raw_loss_ortho
+
+                total_loss = loss_ddm_main + weighted_dir + weighted_ortho
 
                 
 
@@ -680,49 +994,72 @@ def train_brain_connectivity(
 
                 epoch_sparsity += sparsity_loss.item()
 
+                epoch_dir_loss += weighted_dir.item()
+
+                epoch_ortho_loss += weighted_ortho.item()
+
                 num_batches += 1
 
         
 
+        avg_loss = epoch_loss / num_batches
+        avg_sparsity = epoch_sparsity / num_batches
+        avg_dir_loss = epoch_dir_loss / num_batches
+        avg_ortho_loss = epoch_ortho_loss / num_batches
+
+        with torch.no_grad():
+            diag_logits = model.get_structure_logits()
+            raw_dir_snap = compute_directional_margin_loss(diag_logits, patel_direction_matrix).item()
+            raw_ortho_snap = compute_feature_ortho_loss(
+                model.node_emb_sender, model.node_emb_receiver,
+            ).item()
+            adj_sigmoid = get_current_structure_adj(model)
+            adj_mean = adj_sigmoid.mean().item()
+            sparsity_ratio = (adj_sigmoid < 0.5).float().mean().item()
+
+        curr_adj = adj_sigmoid.cpu().numpy()
+        epoch_score, epoch_details = compute_epoch_quality(
+            curr_adj,
+            patel_direction_cpu,
+            patel_strength_cpu,
+            top_k=quality_top_k,
+        )
+        quality_history.append({
+            "epoch": epoch + 1,
+            "score": epoch_score,
+            **epoch_details,
+        })
+        if epoch_score > best_score:
+            best_score = epoch_score
+            best_adj = curr_adj.copy()
+            best_epoch = epoch + 1
+            best_quality_details = dict(epoch_details)
+            marker = " ★ NEW BEST"
+        else:
+            marker = ""
+
         # Log progress
-
-        if (epoch + 1) % log_interval == 0:
-
-            avg_loss = epoch_loss / num_batches
-
-            avg_sparsity = epoch_sparsity / num_batches
-
-            
-
-            with torch.no_grad():
-
-                _, adj_sigmoid_flat = model._get_structure_graph(device)
-
-                adj_sigmoid = adj_sigmoid_flat.view(num_nodes, num_nodes)
-
-                adj_mean = adj_sigmoid.mean().item()
-
-                sparsity_ratio = (adj_sigmoid < 0.5).float().mean().item()
-
-            
-
+        if (epoch + 1) % log_interval == 0 or epoch == num_epochs - 1:
             print(f"Epoch [{epoch+1:3d}/{num_epochs}] | "
-
                   f"Diff Loss: {avg_loss:.4f} | "
-
                   f"Sparsity Loss: {avg_sparsity:.4f} | "
-
+                  f"Dir Loss(raw/w): {raw_dir_snap:.4f}/{avg_dir_loss:.4f} | "
+                  f"Ortho Loss(raw/w): {raw_ortho_snap:.4f}/{avg_ortho_loss:.4f} | "
                   f"Adj Mean: {adj_mean:.3f} | "
-
                   f"Sparsity: {sparsity_ratio:.2%}")
 
-            # --- Encoder collapse diagnostics ---
             if model.use_temporal_encoder:
                 collapse_metrics = diagnose_encoder_collapse(model, data_3d, device)
                 print_collapse_diagnostics(collapse_metrics, epoch, num_epochs)
-                collapse_history.append(collapse_metrics)
+                collapse_history.append({"epoch": epoch + 1, **collapse_metrics})
 
-
+            print(f"  [Quality] score={epoch_score:.4f} "
+                  f"(agree={epoch_details['agreement']:.2%}[{epoch_details['high_conf_edges']}], "
+                  f"margin={epoch_details['dir_margin']:.4f}, "
+                  f"skel={epoch_details['skeleton_overlap']:.2%}, "
+                  f"dens={epoch_details['density_factor']:.3f}, "
+                  f"pair_dens={epoch_details['actual_pair_density']:.2%}/{epoch_details['target_pair_density']:.2%}) | "
+                  f"Best: epoch {best_epoch} score={best_score:.4f}{marker}")
 
         # Record loss for every epoch
 
@@ -731,14 +1068,26 @@ def train_brain_connectivity(
     
 
     # Extract final adjacency matrix
-
     with torch.no_grad():
-        _, edge_weights_flat = model._get_structure_graph(device)
-        adj_matrix = edge_weights_flat.view(num_nodes, num_nodes).cpu().numpy()
+        last_adj = get_current_structure_adj(model).cpu().numpy()
 
-    
+    # Use best-epoch adjacency if available, otherwise fall back to last epoch
+    if best_adj is not None:
+        adj_matrix = best_adj
+        print(f"\n[Best-Epoch] Using epoch {best_epoch} (score={best_score:.4f}) "
+              f"instead of final epoch {num_epochs}")
+    else:
+        adj_matrix = last_adj
+        best_epoch = num_epochs
 
-    return model, adj_matrix, loss_history, collapse_history
+    model.last_epoch_adj_matrix = last_adj
+    model.best_epoch_adj_matrix = adj_matrix
+    model.best_epoch_score = best_score
+    model.best_epoch = best_epoch
+    model.best_epoch_quality = best_quality_details
+    model.quality_history = quality_history
+
+    return model, adj_matrix, loss_history, collapse_history, best_epoch
 
 
 
@@ -768,7 +1117,7 @@ def main():
 
     # The actual L1 penalty = lambda_l1 * mean(|adj|). Typical range: 0.05 - 0.5
 
-    parser.add_argument('--lambda_l1', type=float, default=0.1,
+    parser.add_argument('--lambda_l1', type=float, default=0.02,
 
                         help='L1 regularization coefficient for sparsity (normalized by N^2)')
 
@@ -802,7 +1151,7 @@ def main():
 
     parser.add_argument('--top_k_edges', type=int, default=50,
 
-                        help='Number of top edges for Patel functional module detection')
+                        help='Number of top undirected pairs for Patel skeleton/noise guidance')
 
     parser.add_argument('--debug_checks', action='store_true', default=False,
 
@@ -881,67 +1230,27 @@ def main():
 
     
 
-    # Step 2: Compute Patel connectivity matrix for noise guidance
+    # Step 2: Compute Patel score / kappa / tau with separated semantics
 
-    print("\nComputing Patel connectivity matrix for neighbor-based noise...")
+    print("\nComputing Patel score/kappa/tau matrices...")
 
-    patel_matrix = compute_patel_matrix(data_2d.numpy())  # [N, N]
+    patel_score_np, patel_kappa_np, patel_tau_np = compute_patel_components(data_2d.numpy())
+    patel_score_matrix = torch.from_numpy(patel_score_np).float()
+    patel_kappa_matrix = torch.from_numpy(patel_kappa_np).float()
+    patel_tau_matrix = torch.from_numpy(patel_tau_np).float()
 
-    patel_matrix = torch.from_numpy(patel_matrix).float()
+    print(f"Patel score range: [{patel_score_matrix.min():.4f}, {patel_score_matrix.max():.4f}]")
+    print(f"Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
+    print(f"Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
 
-    print(f"Patel matrix range: [{patel_matrix.min():.4f}, {patel_matrix.max():.4f}]")
+    # Step 3: Build an undirected noise-guide skeleton from positive Patel kappa
+    noise_guide_adj, adj_binary, k_pairs, threshold = build_noise_guide_adjacency(
+        patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),
+        top_k_pairs=args.top_k_edges,
+    )
 
-    
-
-    # Step 3: Threshold to keep top edges (create sparse structure)
-
-    total_edges = num_nodes * (num_nodes - 1)
-
-    k_edges = min(args.top_k_edges, total_edges)
-
-    
-
-    mask_off_diag = 1.0 - torch.eye(num_nodes)
-
-    patel_off_diag = patel_matrix * mask_off_diag
-
-    flat_values = patel_off_diag.flatten()
-
-    flat_values = flat_values[flat_values > 0]
-
-    
-
-    if len(flat_values) >= k_edges:
-
-        threshold = torch.topk(flat_values, k_edges).values[-1]
-
-    else:
-
-        threshold = 0.0
-
-    
-
-    print(f"Keeping top {k_edges} edges (threshold: {threshold:.4f})")
-
-    
-
-    # Step 4: Binarize and add self-loops
-
-    adj_binary = (patel_matrix >= threshold).float() * mask_off_diag
-
-    adj_with_self = adj_binary + torch.eye(num_nodes)
-
-    
-
-    # Step 5: Row-normalize
-
-    degree = adj_with_self.sum(dim=1, keepdim=True)
-
-    noise_guide_adj = adj_with_self / (degree + 1e-9)
-
-    
-
-    print(f"Noise guide adj: {adj_binary.sum().item():.0f} edges + {num_nodes} self-loops")
+    print(f"Keeping top {k_pairs} undirected pairs (threshold: {threshold:.4f})")
+    print(f"Noise guide adj: {adj_binary.sum().item() / 2:.0f} undirected pairs + {num_nodes} self-loops")
 
     
 
@@ -959,11 +1268,11 @@ def main():
 
     # Step 6: Train model
 
-    # - patel_matrix: Raw Patel matrix for SVD-based sender/receiver init (continuous, directional)
+    # - patel_score_matrix: asymmetric init for sender/receiver embeddings
+    # - patel_tau_matrix: weak directional prior only
+    # - patel_kappa_matrix: skeleton prior for proxy scoring / noise guidance
 
-    # - noise_guide_adj: Row-normalized adjacency for neighbor-based noise
-
-    model, adj_matrix, loss_history, collapse_history = train_brain_connectivity(
+    model, adj_matrix, loss_history, collapse_history, best_epoch = train_brain_connectivity(
 
         data_3d=data_3d,
 
@@ -975,7 +1284,10 @@ def main():
 
         noise_guide_adj=noise_guide_adj,  # For neighbor-based noise
 
-        patel_matrix=patel_matrix,  # Asymmetric Patel for SVD init (direction info)
+        patel_matrix=patel_score_matrix,  # Asymmetric Patel score for SVD init
+        patel_direction_matrix=patel_tau_matrix,  # Pure direction prior for margin loss
+        patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),  # Skeleton prior
+        target_edge_count=k_pairs,
 
         num_epochs=args.epochs,
 
@@ -1044,7 +1356,7 @@ def main():
     if collapse_history:
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         fig.suptitle('Encoder Collapse Diagnostics', fontsize=16, fontweight='bold')
-        log_epochs = [i * args.log_interval for i in range(len(collapse_history))]
+        log_epochs = [m['epoch'] for m in collapse_history]
 
         metric_configs = [
             ("effective_rank", "Effective Rank", "tab:blue", None, "higher = healthier"),
@@ -1073,12 +1385,14 @@ def main():
 
         # Save raw metrics as CSV
         collapse_df = pd.DataFrame(collapse_history)
-        collapse_df.insert(0, 'epoch', [(i + 1) * args.log_interval for i in range(len(collapse_history))])
         collapse_csv_path = os.path.join(result_dir, 'collapse_diagnostics.csv')
         collapse_df.to_csv(collapse_csv_path, index=False, float_format='%.6f')
         print(f"Saved collapse metrics to: {collapse_csv_path}")
 
     
+
+    quality_history = getattr(model, 'quality_history', [])
+    final_epoch_adj = getattr(model, 'last_epoch_adj_matrix', None)
 
     # Save adjacency matrix to results folder (both npy and csv)
 
@@ -1093,6 +1407,14 @@ def main():
     adj_csv_path = os.path.join(result_dir, 'learned_adjacency.csv')
 
     pd.DataFrame(adj_matrix).to_csv(adj_csv_path, index=False, header=False, float_format='%.4f')
+
+    if final_epoch_adj is not None:
+        final_adj_save_path = os.path.join(result_dir, 'final_epoch_adjacency.npy')
+        final_adj_csv_path = os.path.join(result_dir, 'final_epoch_adjacency.csv')
+        np.save(final_adj_save_path, final_epoch_adj)
+        pd.DataFrame(final_epoch_adj).to_csv(
+            final_adj_csv_path, index=False, header=False, float_format='%.4f'
+        )
 
     
 
@@ -1110,13 +1432,16 @@ def main():
 
     # Save config
 
-    config = vars(args)
+    config = dict(vars(args))
 
     config['num_neighbors_avg'] = float(adj_binary.sum() / num_nodes) if 'adj_binary' in dir() else 0
 
     config['num_subjects'] = int(data_3d.shape[0])
 
     config['num_nodes'] = int(num_nodes)
+    config['noise_guide_pairs'] = int(k_pairs)
+    config['exported_epoch'] = int(best_epoch)
+    config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
 
     np.save(os.path.join(result_dir, 'config.npy'), config, allow_pickle=True)
 
@@ -1132,9 +1457,38 @@ def main():
 
     )
 
-    # Save Patel connectivity weights for reference (both npy and csv)
-    np.save(os.path.join(result_dir, 'patel_weights.npy'), patel_matrix.numpy())
-    pd.DataFrame(patel_matrix.numpy()).to_csv(
+    if quality_history:
+        quality_df = pd.DataFrame(quality_history)
+        quality_csv_path = os.path.join(result_dir, 'quality_history.csv')
+        quality_df.to_csv(quality_csv_path, index=False, float_format='%.6f')
+        print(f"Saved quality history to: {quality_csv_path}")
+
+    # Save Patel matrices for reference (both npy and csv)
+    np.save(os.path.join(result_dir, 'patel_score.npy'), patel_score_matrix.numpy())
+    pd.DataFrame(patel_score_matrix.numpy()).to_csv(
+        os.path.join(result_dir, 'patel_score.csv'),
+        index=False,
+        header=False,
+        float_format='%.6f'
+    )
+    np.save(os.path.join(result_dir, 'patel_kappa.npy'), patel_kappa_matrix.numpy())
+    pd.DataFrame(patel_kappa_matrix.numpy()).to_csv(
+        os.path.join(result_dir, 'patel_kappa.csv'),
+        index=False,
+        header=False,
+        float_format='%.6f'
+    )
+    np.save(os.path.join(result_dir, 'patel_tau.npy'), patel_tau_matrix.numpy())
+    pd.DataFrame(patel_tau_matrix.numpy()).to_csv(
+        os.path.join(result_dir, 'patel_tau.csv'),
+        index=False,
+        header=False,
+        float_format='%.6f'
+    )
+
+    # Backward-compatible legacy name: Patel score matrix
+    np.save(os.path.join(result_dir, 'patel_weights.npy'), patel_score_matrix.numpy())
+    pd.DataFrame(patel_score_matrix.numpy()).to_csv(
         os.path.join(result_dir, 'patel_weights.csv'),
         index=False,
         header=False,
@@ -1151,15 +1505,21 @@ def main():
 
     print(f"Results saved to: {result_dir}")
 
+    print(f"  [Best Epoch: {best_epoch}/{args.epochs}]")
+
     print(f"  - loss_curve.png          <- 查看此图判断收敛")
 
-    print(f"  - learned_adjacency.csv   <- 学习到的邻接矩阵")
+    print(f"  - learned_adjacency.csv   <- best-epoch 导出的邻接矩阵")
+
+    print(f"  - final_epoch_adjacency.csv <- 最后一轮邻接矩阵（用于对照）")
 
     print(f"  - loss_history.csv")
 
+    print(f"  - quality_history.csv")
+
     print(f"  - pearson_matrix.csv")
 
-    print(f"  - patel_weights.csv      <- Patel(Petal)算法权重")
+    print(f"  - patel_score.csv / patel_kappa.csv / patel_tau.csv")
 
     print(f"  - config.npy")
 

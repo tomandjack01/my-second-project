@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: u     tf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Minimal ablation for temporal encoder contribution in structure learning.
 
@@ -42,8 +42,12 @@ def parse_seeds(seeds_text: str) -> List[int]:
     return seeds
 
 
-def build_noise_guide_adj(data_2d: torch.Tensor, num_nodes: int, top_k_edges: int) -> torch.Tensor:
-    """Build row-normalized adjacency used for neighbor-based noise guidance."""
+def build_noise_guide_adj(data_2d: torch.Tensor, num_nodes: int, top_k_edges: int) -> tuple:
+    """Build row-normalized adjacency used for neighbor-based noise guidance.
+
+    Returns:
+        (noise_guide_adj, patel_matrix) — both [N, N] tensors.
+    """
     patel_matrix = compute_patel_matrix(data_2d.numpy())
     patel_matrix = torch.from_numpy(patel_matrix).float()
 
@@ -64,7 +68,7 @@ def build_noise_guide_adj(data_2d: torch.Tensor, num_nodes: int, top_k_edges: in
     adj_with_self = adj_binary + torch.eye(num_nodes)
     degree = adj_with_self.sum(dim=1, keepdim=True)
     noise_guide_adj = adj_with_self / (degree + 1e-9)
-    return noise_guide_adj
+    return noise_guide_adj, patel_matrix
 
 
 def compute_metrics(adj_matrix: np.ndarray, loss_history: List[float]) -> Dict[str, float]:
@@ -127,7 +131,7 @@ def main() -> None:
         time_points_per_subject=args.time_points,
     )
     pearson_matrix = compute_global_pearson(data_2d)
-    noise_guide_adj = build_noise_guide_adj(data_2d, num_nodes=num_nodes, top_k_edges=args.top_k_edges)
+    noise_guide_adj, patel_matrix = build_noise_guide_adj(data_2d, num_nodes=num_nodes, top_k_edges=args.top_k_edges)
 
     variants = [
         ('full_encoder', {}),
@@ -150,11 +154,12 @@ def main() -> None:
             set_seed(seed)
             run_start = time.time()
 
-            _, adj_matrix, loss_history = train_brain_connectivity(
+            _, adj_matrix, loss_history, _, _ = train_brain_connectivity(
                 data_3d=data_3d,
                 pearson_matrix=pearson_matrix,
                 num_nodes=num_nodes,
                 time_points=args.time_points,
+                patel_matrix=patel_matrix,
                 noise_guide_adj=noise_guide_adj,
                 num_epochs=args.epochs,
                 learning_rate=args.lr,

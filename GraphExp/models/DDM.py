@@ -223,20 +223,26 @@ class DDM(nn.Module):
             self.register_buffer('diag_mask', 1.0 - torch.eye(N))
             self.num_nodes = N
 
+    def get_structure_logits(self):
+        """Return the clamped structure logits used everywhere downstream."""
+        if not self.structure_learning_mode:
+            raise RuntimeError("Structure logits requested when structure learning mode is disabled.")
+        adj_logits = self.node_emb_sender @ self.node_emb_receiver.T + self.adj_bias
+        return torch.clamp(adj_logits, -6.0, 6.0)
+
+    def get_structure_adj(self):
+        """Return the masked adjacency matrix used for graph weights and export."""
+        adj_logits = self.get_structure_logits()
+        adj_weights = torch.sigmoid(adj_logits)
+        adj_weights = adj_weights * self.diag_mask.to(adj_weights.device)
+        self.learned_adj_weights = adj_weights
+        return adj_weights
+
     def _get_structure_graph(self, device):
         """Create fully connected graph and compute edge weights from sender/receiver embeddings."""
         g = dgl.graph((self.full_g_src, self.full_g_dst), num_nodes=self.num_nodes)
         g = g.to(device)
-        # Asymmetric adjacency: sender @ receiver^T + learnable sparsity bias
-        adj_logits = self.node_emb_sender @ self.node_emb_receiver.T + self.adj_bias  # [N, N]
-        # Clamp logits to [-6, 6] to prevent sigmoid saturation while allowing
-        # near-binary outputs. sigmoid(±6) ≈ 0.0025 / 0.9975, gradient ≈ 0.0025.
-        adj_logits = torch.clamp(adj_logits, -6.0, 6.0)
-        adj_weights = torch.sigmoid(adj_logits)
-        # Zero out self-loops
-        adj_weights = adj_weights * self.diag_mask.to(device)
-        # Cache for external loss computation
-        self.learned_adj_weights = adj_weights
+        adj_weights = self.get_structure_adj()
         edge_weights = adj_weights.flatten()
         return g, edge_weights
 

@@ -178,6 +178,45 @@ def _compute_tau(theta1: np.ndarray, theta2: np.ndarray,
     return -tau
 
 
+def compute_patel_components(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute Patel score, kappa, and tau matrices from time-series data.
+
+    Args:
+        data: fMRI time-series of shape [Time_Points, Num_Nodes]
+
+    Returns:
+        Tuple of three [N, N] matrices in the order:
+            score_matrix: -Kappa * Tau (direction-weighted connectivity score)
+            kappa_matrix: symmetric association-strength matrix
+            tau_matrix: directional prior matrix (Pate.m-compatible sign)
+    """
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D array [Time, Nodes], got shape {data.shape}")
+
+    T, N = data.shape
+    if T < N:
+        warnings.warn(f"Data has more nodes ({N}) than time points ({T}). "
+                      "Ensure data is [Time, Nodes] format.")
+
+    data_binary = _preprocess_timeseries(data)
+    theta1, theta2, theta3, theta4 = _compute_joint_probabilities(data_binary)
+
+    kappa = _compute_kappa(theta1, theta2, theta3, theta4)
+    tau = _compute_tau(theta1, theta2, theta3)
+    score_matrix = -kappa * tau
+
+    kappa = np.nan_to_num(kappa, nan=0.0, posinf=0.0, neginf=0.0)
+    tau = np.nan_to_num(tau, nan=0.0, posinf=0.0, neginf=0.0)
+    score_matrix = np.nan_to_num(score_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+    np.fill_diagonal(kappa, 0.0)
+    np.fill_diagonal(tau, 0.0)
+    np.fill_diagonal(score_matrix, 0.0)
+
+    return score_matrix, kappa, tau
+
+
 def compute_patel_matrix(data: np.ndarray) -> np.ndarray:
     """
     Compute the Patel connectivity score matrix.
@@ -198,31 +237,7 @@ def compute_patel_matrix(data: np.ndarray) -> np.ndarray:
         >>> print(score_matrix.shape)
         (50, 50)
     """
-    if data.ndim != 2:
-        raise ValueError(f"Expected 2D array [Time, Nodes], got shape {data.shape}")
-    
-    T, N = data.shape
-    if T < N:
-        warnings.warn(f"Data has more nodes ({N}) than time points ({T}). "
-                      "Ensure data is [Time, Nodes] format.")
-    
-    # Step 1: Preprocess (percentile scaling + binarization)
-    data_binary = _preprocess_timeseries(data)
-    
-    # Step 2: Compute joint probabilities
-    theta1, theta2, theta3, theta4 = _compute_joint_probabilities(data_binary)
-    
-    # Step 3: Compute Kappa and Tau
-    kappa = _compute_kappa(theta1, theta2, theta3, theta4)
-    tau = _compute_tau(theta1, theta2, theta3)
-    
-    # Step 4: Compute final score = -Kappa * Tau (as per Pate.m out(3))
-    score_matrix = -kappa * tau
-    
-    # Handle NaNs and set diagonal to 0
-    score_matrix = np.nan_to_num(score_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-    np.fill_diagonal(score_matrix, 0)
-    
+    score_matrix, _, _ = compute_patel_components(data)
     return score_matrix
 
 

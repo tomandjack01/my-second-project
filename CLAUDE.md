@@ -75,6 +75,49 @@ The NNI web UI runs on port 6006. Hyperparameter search is recommended for best 
 2. Denoising: Predict original features from noisy features using U-Net
 3. Loss: Cosine similarity loss with configurable alpha power
 
+#### Auxiliary Losses (Directional Prior & Feature Decoupling)
+
+`main_structure_learning.py` adds two auxiliary losses on top of the base diffusion loss:
+
+**`compute_directional_margin_loss(logits, patel_matrix)`**:
+- Encourages learned edge directions to agree with Patel's Tau prior
+- Both `q_threshold` and `margin` are fully adaptive (no hardcoded constants):
+  - `q_threshold` = median of nonzero `|delta_P|` → ~50% of edges participate
+  - `margin` = 25th percentile of `sign(delta_P) * D` on active edges → strictly 25% violation rate
+- Weighted by Patel confidence: `w = (|delta_P| > q_threshold) * |delta_P|`
+
+**`compute_feature_ortho_loss(S, R)`**:
+- Decouples sender/receiver embedding spaces via cross-covariance Frobenius norm
+- Prevents sender ≈ receiver collapse that would produce symmetric adjacency
+
+**Ratio-adaptive lambda with stability controls (no warmup):**
+- No warmup delay: Patel SVD init already provides directional structure, auxiliary losses protect it from epoch 0
+- Target ratios: Dir loss = 1% of main loss, Ortho loss = 0.5%
+- EMA smoothing (alpha=0.1) + ±10% step-change cap on lambda values to prevent ratio-adaptive jitter
+
+#### Structure Learning Initialization
+
+- `init_features` uses **Patel matrix** (asymmetric) instead of Pearson (symmetric) for SVD-based sender/receiver embedding init. This gives directional bias from the start (U ≠ V).
+- `adj_bias_init` = `logit(target_density)` with safety clamp: `min(61/N(N-1), 0.95)` to prevent math domain error on small graphs (N < 8).
+
+#### Training/Export Consistency
+
+Log printing and final adjacency export both call `model._get_structure_graph(device)`, ensuring `adj_bias`, `clamp(-6, 6)`, and diagonal masking are applied identically to training. Previously, export used raw `sigmoid(sender @ receiver.T)` without bias/clamp, causing systematic weight mismatch.
+
+#### Best-Epoch Selection
+
+Training no longer blindly returns the last epoch's adjacency. Instead:
+
+**`compute_epoch_quality(adj_np, patel_matrix_cpu, top_k)`** scores each checkpoint:
+- `score = agreement × dir_margin × density_factor × skeleton_overlap`
+- `agreement`: direction match rate on HIGH-CONFIDENCE Patel edges only (excludes ties)
+- `dir_margin`: mean `|adj[i,j] - adj[j,i]|` of top-k edges (asymmetry strength)
+- `density_factor`: Gaussian penalty `exp(-0.5 * log(ratio)²)` on density deviation
+- `skeleton_overlap`: fraction of model's top-k edges that also appear in Patel's top-k
+- `top_k` auto-computed: `max(10, int(N*(N-1)*0.05/2))`
+
+The best-scoring epoch's adjacency is returned. `train_brain_connectivity` returns 5 values: `(model, adj_matrix, loss_history, collapse_history, best_epoch)`.
+
 ### Encoder Pretraining Pipeline (Autoregressive Causal)
 
 The `NodeSpecificTemporalEncoder` collapses when trained end-to-end with diffusion (cosine sim→1.0, Diff Loss→0.0). Solution: pretrain encoder with autoregressive objective, then freeze.
@@ -85,11 +128,12 @@ The `NodeSpecificTemporalEncoder` collapses when trained end-to-end with diffusi
 - `pred_head` (Linear) maps encoder output to prediction space
 
 **Integration flow (`main_structure_learning.py`):**
-1. Create DDM model (encoder output dim = `in_dim`, i.e. `time_points`)
+1. Create DDM model with Patel matrix as `init_features` (asymmetric SVD init for directed edges)
 2. Autoregressive pretrain: iterate all subjects, call `pretrain_forward()`, accumulate gradients
 3. Freeze `model.temporal_encoder` (requires_grad=False, eval mode)
 4. Rebuild optimizer with only unfrozen parameters
-5. Normal diffusion training (diffusion operates in original time dimension space)
+5. Diffusion training with auxiliary losses (directional margin + feature orthogonality)
+6. Best-epoch selection via `compute_epoch_quality()` (Patel-based proxy, no GT needed)
 
 **Brain Connectivity Structure Learning** (`GraphExp/main_structure_learning.py`):
 ```shell
@@ -157,6 +201,14 @@ python main_structure_learning.py \
 
 ### Evaluation
 
+**Directional Edge Evaluation** (`GraphExp/test_eval.py`):
+- Loads learned adjacency and transposes it (GNN denoising convention: `adj[effect, cause]` → causal convention: `adj[cause, effect]`)
+- For each undirected pair (i,j), picks direction by comparing `adj[i,j]` vs `adj[j,i]`
+- Ranks edges by absolute weight (stronger direction), truncates to top-k or sparsity %
+- Reports directed Precision/Recall/F1 against ground truth DAG
+- Usage: `python test_eval.py --gt ../fMRI_dataset/h4.txt --top_k 61`
+- Output fields: `weight` = `max(adj[i,j], adj[j,i])`, `margin` = `|adj[i,j] - adj[j,i]|`
+
 **Graph Classification** (`GraphExp/evaluator.py`):
 - Extract embeddings at multiple timesteps (eval_T)
 - Pool graph representations (mean/sum/max pooling)
@@ -184,7 +236,15 @@ Pretrain CLI parameters (`main_structure_learning.py`):
 - `--skip_pretrain`: Skip pretraining entirely (equivalent to `--pretrain_epochs 0`)
 - `--pretrain_checkpoint`: Path to load existing pretrained encoder weights
 - `--disable_temporal_encoder`: Disable temporal encoder and work directly on raw time series (skips all pretraining)
+- `--lambda_l1`: L1 sparsity coefficient (default: 0.02, normalized by N²)
 - ~~`--pretrain_split_ratio`~~: Deprecated (autoregressive pretrain does not need split)
+
+### Ablation Script (`GraphExp/run_temporal_encoder_ablation.py`)
+
+Compares temporal encoder variants (full / no_temporal_stack / reduced_receptive_field) across multiple seeds.
+- `build_noise_guide_adj()` returns `(noise_guide_adj, patel_matrix)` tuple
+- Calls `train_brain_connectivity` with `patel_matrix` (required param) and unpacks 5 return values
+- Outputs: `raw_runs.csv`, `summary.csv`, `meta.json`
 
 ### Key Dependencies
 - DGL (Deep Graph Library) for graph neural networks
