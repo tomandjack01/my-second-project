@@ -147,6 +147,8 @@ def print_collapse_diagnostics(metrics, epoch, num_epochs):
 # ============================================================================
 
 TIME_POINTS_PER_SUBJECT = 200  # Number of time points per subject
+RAW_ADJ_CONVENTION = "effect_to_cause"
+CAUSAL_ADJ_CONVENTION = "cause_to_effect"
 
 
 
@@ -321,6 +323,58 @@ def compute_target_density(num_nodes: int, target_edge_count: int, eps: float = 
     return min(max(raw_density, eps), 0.95)
 
 
+def build_structure_init_matrix(
+    mode: str,
+    patel_score_matrix: torch.Tensor,
+    patel_kappa_matrix: torch.Tensor,
+    pearson_matrix: torch.Tensor,
+    seed: int,
+) -> torch.Tensor:
+    """Build the matrix used only for structure-embedding initialization."""
+    if mode == 'patel_score':
+        init_matrix = patel_score_matrix.clone()
+    elif mode == 'patel_score_t':
+        init_matrix = patel_score_matrix.t().clone()
+    elif mode == 'neg_patel_score':
+        init_matrix = (-patel_score_matrix).clone()
+    elif mode == 'neg_patel_score_t':
+        init_matrix = (-patel_score_matrix).t().clone()
+    elif mode == 'patel_kappa':
+        init_matrix = torch.clamp(patel_kappa_matrix, min=0.0).clone()
+    elif mode == 'pearson':
+        init_matrix = pearson_matrix.clone()
+    elif mode == 'random':
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(seed)
+        init_matrix = torch.randn(
+            pearson_matrix.shape,
+            generator=generator,
+            dtype=pearson_matrix.dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported structure init mode: {mode}")
+
+    init_matrix.fill_diagonal_(0.0)
+    return init_matrix
+
+
+def to_causal_matrix_torch(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Convert model-internal adjacency/logit convention to causal convention.
+
+    Internal/raw convention:
+        A_raw[effect, cause] is high when the source node helps denoise the target.
+    Causal convention:
+        A_causal[cause, effect] is high for cause -> effect.
+    """
+    return matrix.transpose(-1, -2)
+
+
+def to_causal_matrix_np(matrix: np.ndarray) -> np.ndarray:
+    """NumPy version of `to_causal_matrix_torch`."""
+    return np.asarray(matrix).T.copy()
+
+
 def build_noise_guide_adjacency(patel_strength_matrix: torch.Tensor, top_k_pairs: int):
     """
     Build a symmetric row-normalized adjacency for neighbor-based noise.
@@ -357,10 +411,71 @@ def build_noise_guide_adjacency(patel_strength_matrix: torch.Tensor, top_k_pairs
     return noise_guide_adj, adj_binary, k_pairs, threshold
 
 
+def build_directed_noise_guide_adjacency(
+    patel_kappa: torch.Tensor,
+    patel_tau: torch.Tensor,
+    top_k_pairs: int,
+    direction_alpha: float = 0.5,
+):
+    """
+    Build a direction-biased row-normalized adjacency for neighbor-based noise.
+
+    Unlike `build_noise_guide_adjacency` which symmetrizes, this version uses
+    Patel tau to assign asymmetric weights: the causal direction gets higher weight.
+
+    Args:
+        patel_kappa: Symmetric association strength [N, N]
+        patel_tau: Directional prior [N, N] (Pate.m convention: -tau returned)
+        top_k_pairs: Number of undirected pairs to keep
+        direction_alpha: Bias strength (0=symmetric, 1=max asymmetry)
+    """
+    num_nodes = patel_kappa.shape[0]
+    device = patel_kappa.device
+    dtype = patel_kappa.dtype
+
+    eye = torch.eye(num_nodes, device=device, dtype=dtype)
+    # Skeleton selection: symmetric kappa, same as undirected version
+    sym_kappa = torch.maximum(patel_kappa, patel_kappa.t())
+    sym_kappa = torch.clamp(sym_kappa, min=0.0) * (1.0 - eye)
+
+    triu_i, triu_j = torch.triu_indices(num_nodes, num_nodes, offset=1, device=device)
+    flat_strength = sym_kappa[triu_i, triu_j]
+    num_pairs = flat_strength.numel()
+    k_pairs = min(max(int(top_k_pairs), 0), num_pairs)
+
+    adj = eye.clone()  # Start with self-loops
+    if k_pairs > 0 and num_pairs > 0:
+        top_idx = torch.topk(flat_strength, k_pairs).indices
+        for idx_t in top_idx:
+            idx_val = idx_t.item()
+            i = triu_i[idx_val].item()
+            j = triu_j[idx_val].item()
+            tau_val = patel_tau[i, j].item()
+            bias = direction_alpha * abs(tau_val)
+            # tau_val > 0 → i→j stronger; tau_val < 0 → j→i stronger
+            adj[i, j] += 1.0 + bias * (1.0 if tau_val > 0 else -1.0)
+            adj[j, i] += 1.0 + bias * (1.0 if tau_val < 0 else -1.0)
+
+    # Clamp to non-negative before row normalization
+    adj = torch.clamp(adj, min=0.0)
+    row_sum = adj.sum(dim=1, keepdim=True)
+    noise_guide_adj = adj / (row_sum + 1e-9)
+    return noise_guide_adj
+
+
+def get_current_structure_logits(model: DDM, causal: bool = False, detach: bool = False) -> torch.Tensor:
+    """Fetch the current structure logits under raw or causal convention."""
+    logits = model.get_structure_logits()
+    if causal:
+        logits = to_causal_matrix_torch(logits)
+    return logits.detach() if detach else logits
+
+
 @torch.no_grad()
-def get_current_structure_adj(model: DDM) -> torch.Tensor:
-    """Fetch the current adjacency using the exact export-time structure logic."""
-    return model.get_structure_adj().detach()
+def get_current_structure_adj(model: DDM, causal: bool = False) -> torch.Tensor:
+    """Fetch the current adjacency under raw or causal convention."""
+    adj = model.get_structure_adj().detach()
+    return to_causal_matrix_torch(adj) if causal else adj
 
 
 def compute_auxiliary_lambdas(
@@ -412,7 +527,7 @@ def compute_auxiliary_lambdas(
 
 def compute_directional_margin_loss(logits, direction_prior_matrix, margin=1.0):
     """
-    基于 Patel 算法的高置信度先验，在 Logit 空间计算带 Margin 的方向引导损失。
+    基于 Patel 算法的高置信度先验，在 causal Logit 空间计算带 Margin 的方向引导损失。
 
     q_threshold 自适应：取 |delta_P| 非零值的中位数，确保约 50% 的边参与约束。
     margin 自适应：在有效边（w>0）上对 sign(delta_P)*D 取 25 分位数，
@@ -469,23 +584,31 @@ def compute_feature_ortho_loss(S, R):
 
 
 @torch.no_grad()
-def compute_epoch_quality(adj_np, patel_direction_cpu, patel_strength_cpu, top_k=61):
+def compute_epoch_quality(
+    adj_np,
+    patel_direction_cpu,
+    patel_strength_cpu,
+    top_k=61,
+    agreement_weight: float = 0.25,
+):
     """
     不依赖 GT 的 epoch 质量评分，用于 best-epoch 选择。
 
-    评分 = agreement_strict * dir_margin * density_factor
+    评分使用稳定加权和，而不是脆弱的纯乘法。
 
-    - agreement_strict: top-k 边中，仅在 Patel 高置信方向边上计算方向一致率
-      （排除 Patel 平局，避免乐观偏差）
+    - agreement_score: Patel 高置信方向边上的一致率，但在覆盖不足时回缩到中性分 0.5，
+      避免短训或语义不稳时整轮清零
     - dir_margin: top-k 边的平均 |adj[i,j] - adj[j,i]|（衡量方向强度，
       不受饱和高分假边误导）
     - density_factor: 惩罚实际密度偏离目标密度过远的情况（抑制过稀疏/过饱和）
+    - skeleton_overlap: 骨架与 Patel 强度先验的重叠度
 
     Args:
-        adj_np: 邻接矩阵 [N, N] numpy array (sigmoid 后)
-        patel_direction_cpu: Patel tau 方向先验 [N, N] numpy array
+        adj_np: causal 邻接矩阵 [N, N] numpy array (sigmoid 后)
+        patel_direction_cpu: Patel tau 方向先验 [N, N] numpy array，按 causal convention 解读
         patel_strength_cpu: Patel kappa/score 强度先验 [N, N] numpy array
         top_k: 取 top-k 条边评估（应按数据集配置）
+
     Returns:
         score: float, 越高越好
         details: dict with sub-metrics
@@ -520,12 +643,21 @@ def compute_epoch_quality(adj_np, patel_direction_cpu, patel_strength_cpu, top_k
     candidates.sort(key=lambda x: x[2], reverse=True)
     k = min(top_k, len(candidates))
     if k == 0:
-        return 0.0, {"agreement": 0.0, "dir_margin": 0.0,
-                      "density_factor": 0.0, "skeleton_overlap": 0.0,
-                      "high_conf_edges": 0, "k": 0}
+        return 0.0, {
+            "agreement": 0.0,
+            "agreement_score": 0.5,
+            "agreement_coverage": 0.0,
+            "dir_margin": 0.0,
+            "margin_score": 0.0,
+            "density_factor": 0.0,
+            "skeleton_overlap": 0.0,
+            "global_asymmetry": 0.0,
+            "asymmetry_score": 0.0,
+            "high_conf_edges": 0,
+            "k": 0,
+        }
 
     top_edges = candidates[:k]
-    top_edge_set = {(e[0], e[1]) for e in top_edges}
     # Also store as undirected for skeleton comparison
     top_edge_undirected = {(min(e[0], e[1]), max(e[0], e[1])) for e in top_edges}
 
@@ -552,9 +684,12 @@ def compute_epoch_quality(adj_np, patel_direction_cpu, patel_strength_cpu, top_k
             agree_count += 1
 
     agreement = agree_count / high_conf_count if high_conf_count > 0 else 0.0
+    agreement_coverage = high_conf_count / k if k > 0 else 0.0
+    agreement_score = 0.5 + (agreement - 0.5) * agreement_coverage
 
     # --- 2) dir_margin: 平均方向强度 |adj[i,j] - adj[j,i]| ---
     dir_margin = float(np.mean([e[3] for e in top_edges]))
+    margin_score = float(np.tanh(dir_margin / 0.25))
 
     # --- 3) density_factor: 惩罚密度偏离 ---
     total_pairs = n * (n - 1) // 2
@@ -569,16 +704,66 @@ def compute_epoch_quality(adj_np, patel_direction_cpu, patel_strength_cpu, top_k
     # Gaussian-style penalty: ratio=1 → factor=1, 宽容到 ~10x 偏离仍有 ~0.1 分
     density_factor = float(np.exp(-0.5 * (np.log(density_ratio + 1e-8)) ** 2))
 
-    score = agreement * dir_margin * density_factor * skeleton_overlap
+    global_asymmetry = float(np.mean(np.abs(adj_np - adj_np.T)[off_diag_mask]))
+    asymmetry_score = float(np.tanh(global_asymmetry / 0.15))
+
+    score = (
+        0.35 * skeleton_overlap +
+        agreement_weight * agreement_score +
+        0.20 * density_factor +
+        0.15 * margin_score +
+        0.05 * asymmetry_score
+    )
     return score, {
         "agreement": agreement,
+        "agreement_score": agreement_score,
+        "agreement_weight": agreement_weight,
+        "agreement_coverage": agreement_coverage,
         "dir_margin": dir_margin,
+        "margin_score": margin_score,
         "density_factor": density_factor,
         "skeleton_overlap": skeleton_overlap,
         "actual_pair_density": actual_density,
         "target_pair_density": target_density,
+        "global_asymmetry": global_asymmetry,
+        "asymmetry_score": asymmetry_score,
         "high_conf_edges": high_conf_count,
         "k": k,
+    }
+
+
+def evaluate_selection_guardrails(
+    epoch_details: Dict[str, float],
+    peak_skeleton_overlap: float,
+    min_skeleton_overlap: float = 0.50,
+    min_skeleton_retention: float = 0.85,
+    min_density_factor: float = 0.65,
+    max_density_ratio: float = 2.50,
+) -> Dict[str, Any]:
+    """Conservative best-epoch eligibility checks on top of the proxy score."""
+    target_density = max(float(epoch_details.get("target_pair_density", 0.0)), 1e-8)
+    actual_density = max(float(epoch_details.get("actual_pair_density", 0.0)), 0.0)
+    density_ratio = max(actual_density / target_density, 1e-8)
+
+    required_skeleton_overlap = max(
+        float(min_skeleton_overlap),
+        float(peak_skeleton_overlap) * float(min_skeleton_retention),
+    )
+
+    reasons = []
+    if float(epoch_details.get("skeleton_overlap", 0.0)) < required_skeleton_overlap:
+        reasons.append("low_skeleton")
+    if float(epoch_details.get("density_factor", 0.0)) < float(min_density_factor):
+        reasons.append("low_density_factor")
+    if density_ratio > float(max_density_ratio) or density_ratio < (1.0 / float(max_density_ratio)):
+        reasons.append("density_ratio_out_of_range")
+
+    return {
+        "guardrail_pass": int(len(reasons) == 0),
+        "guardrail_reason": "pass" if not reasons else "|".join(reasons),
+        "guardrail_density_ratio": density_ratio,
+        "guardrail_required_skeleton_overlap": required_skeleton_overlap,
+        "guardrail_peak_skeleton_overlap": float(peak_skeleton_overlap),
     }
 
 
@@ -624,6 +809,14 @@ def train_brain_connectivity(
     pretrain_lr: float = 1e-3,
     result_dir: Optional[str] = None,
     target_edge_count: int = 61,
+    selection_top_k: Optional[int] = None,
+    selection_start_epoch: int = 6,
+    selection_min_skeleton_overlap: float = 0.50,
+    selection_min_skeleton_retention: float = 0.85,
+    selection_min_density_factor: float = 0.65,
+    selection_max_density_ratio: float = 2.50,
+    enable_directional_loss: bool = True,
+    selection_agreement_weight: float = 0.25,
 
 ):
 
@@ -822,13 +1015,21 @@ def train_brain_connectivity(
     quality_history = []
 
     # Best-epoch tracking (Patel-based proxy, no GT needed)
-    best_adj = None
-    best_score = -1.0
-    best_epoch = -1
-    best_quality_details = None
+    best_guarded_adj = None
+    best_guarded_adj_causal = None
+    best_guarded_score = -1.0
+    best_guarded_epoch = -1
+    best_guarded_quality_details = None
+    fallback_best_adj = None
+    fallback_best_adj_causal = None
+    fallback_best_score = -1.0
+    fallback_best_epoch = -1
+    fallback_best_quality_details = None
     patel_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
     patel_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
-    quality_top_k = min(max(int(target_edge_count), 1), max(num_nodes * (num_nodes - 1) // 2, 1))
+    selection_top_k = target_edge_count if selection_top_k is None else int(selection_top_k)
+    quality_top_k = min(max(selection_top_k, 1), max(num_nodes * (num_nodes - 1) // 2, 1))
+    peak_eligible_skeleton_overlap = 0.0
 
     # Lambda smoothing state (EMA + step-change cap)
     prev_lambda_dir = 0.0
@@ -886,11 +1087,7 @@ def train_brain_connectivity(
 
                     with torch.no_grad():
 
-                        if model.use_temporal_encoder:
-                            x_encoded = model.temporal_encoder(x)
-                            x_encoded = F.layer_norm(x_encoded, (x_encoded.shape[-1],))
-                        else:
-                            x_encoded = F.layer_norm(x, (x.shape[-1],))
+                        x_encoded = model.prepare_clean_target(x)
 
                         t = torch.randint(model.T, size=(x_encoded.shape[0],), device=x_encoded.device)
 
@@ -945,8 +1142,11 @@ def train_brain_connectivity(
                 loss_ddm_main = loss + sparsity_loss + hub_loss
 
                 # --- Directional margin loss & feature orthogonality loss ---
-                logits = model.get_structure_logits()
-                raw_loss_dir = compute_directional_margin_loss(logits, patel_direction_matrix)
+                causal_logits = get_current_structure_logits(model, causal=True)
+                if enable_directional_loss:
+                    raw_loss_dir = compute_directional_margin_loss(causal_logits, patel_direction_matrix)
+                else:
+                    raw_loss_dir = torch.tensor(0.0, device=device)
                 raw_loss_ortho = compute_feature_ortho_loss(
                     model.node_emb_sender, model.node_emb_receiver,
                 )
@@ -961,7 +1161,11 @@ def train_brain_connectivity(
                     prev_lambda_ortho=prev_lambda_ortho,
                 )
 
-                prev_lambda_dir = lambda_dir
+                if enable_directional_loss:
+                    prev_lambda_dir = lambda_dir
+                else:
+                    lambda_dir = 0.0
+                    prev_lambda_dir = 0.0
                 prev_lambda_ortho = lambda_ortho
 
                 weighted_dir = lambda_dir * raw_loss_dir
@@ -1008,38 +1212,86 @@ def train_brain_connectivity(
         avg_ortho_loss = epoch_ortho_loss / num_batches
 
         with torch.no_grad():
-            diag_logits = model.get_structure_logits()
-            raw_dir_snap = compute_directional_margin_loss(diag_logits, patel_direction_matrix).item()
+            causal_logits = get_current_structure_logits(model, causal=True)
+            if enable_directional_loss:
+                raw_dir_snap = compute_directional_margin_loss(causal_logits, patel_direction_matrix).item()
+            else:
+                raw_dir_snap = 0.0
             raw_ortho_snap = compute_feature_ortho_loss(
                 model.node_emb_sender, model.node_emb_receiver,
             ).item()
-            adj_sigmoid = get_current_structure_adj(model)
-            adj_mean = adj_sigmoid.mean().item()
-            sparsity_ratio = (adj_sigmoid < 0.5).float().mean().item()
+            adj_sigmoid_raw = get_current_structure_adj(model, causal=False)
+            adj_sigmoid_causal = get_current_structure_adj(model, causal=True)
+            adj_mean = adj_sigmoid_raw.mean().item()
+            sparsity_ratio = (adj_sigmoid_raw < 0.5).float().mean().item()
 
-        curr_adj = adj_sigmoid.cpu().numpy()
+        curr_adj_raw = adj_sigmoid_raw.cpu().numpy()
+        curr_adj_causal = adj_sigmoid_causal.cpu().numpy()
         epoch_score, epoch_details = compute_epoch_quality(
-            curr_adj,
+            curr_adj_causal,
             patel_direction_cpu,
             patel_strength_cpu,
             top_k=quality_top_k,
+            agreement_weight=selection_agreement_weight,
         )
+        selection_eligible = int((epoch + 1) >= selection_start_epoch)
+        if selection_eligible:
+            guardrail_details = evaluate_selection_guardrails(
+                epoch_details,
+                peak_skeleton_overlap=peak_eligible_skeleton_overlap,
+                min_skeleton_overlap=selection_min_skeleton_overlap,
+                min_skeleton_retention=selection_min_skeleton_retention,
+                min_density_factor=selection_min_density_factor,
+                max_density_ratio=selection_max_density_ratio,
+            )
+            peak_eligible_skeleton_overlap = max(
+                peak_eligible_skeleton_overlap,
+                float(epoch_details["skeleton_overlap"]),
+            )
+        else:
+            guardrail_details = {
+                "guardrail_pass": 0,
+                "guardrail_reason": "before_selection_start",
+                "guardrail_density_ratio": (
+                    float(epoch_details["actual_pair_density"]) /
+                    max(float(epoch_details["target_pair_density"]), 1e-8)
+                ),
+                "guardrail_required_skeleton_overlap": float(selection_min_skeleton_overlap),
+                "guardrail_peak_skeleton_overlap": peak_eligible_skeleton_overlap,
+            }
         quality_history.append({
             "epoch": epoch + 1,
             "score": epoch_score,
+            "selection_eligible": selection_eligible,
             **epoch_details,
+            **guardrail_details,
         })
-        if epoch_score > best_score:
-            best_score = epoch_score
-            best_adj = curr_adj.copy()
-            best_epoch = epoch + 1
-            best_quality_details = dict(epoch_details)
-            marker = " ★ NEW BEST"
-        else:
-            marker = ""
+        marker_parts = []
+        if selection_eligible and epoch_score > fallback_best_score:
+            fallback_best_score = epoch_score
+            fallback_best_adj = curr_adj_raw.copy()
+            fallback_best_adj_causal = curr_adj_causal.copy()
+            fallback_best_epoch = epoch + 1
+            fallback_best_quality_details = dict(epoch_details)
+            marker_parts.append("score-best")
+        if (
+            selection_eligible and
+            guardrail_details["guardrail_pass"] and
+            epoch_score > best_guarded_score
+        ):
+            best_guarded_score = epoch_score
+            best_guarded_adj = curr_adj_raw.copy()
+            best_guarded_adj_causal = curr_adj_causal.copy()
+            best_guarded_epoch = epoch + 1
+            best_guarded_quality_details = dict(epoch_details)
+            marker_parts.append("guarded-best")
+        marker = "" if not marker_parts else f" ★ {'/'.join(marker_parts)}"
 
         # Log progress
         if (epoch + 1) % log_interval == 0 or epoch == num_epochs - 1:
+            current_best_epoch = best_guarded_epoch if best_guarded_epoch >= 0 else fallback_best_epoch
+            current_best_score = best_guarded_score if best_guarded_epoch >= 0 else fallback_best_score
+            current_best_mode = "guarded" if best_guarded_epoch >= 0 else "score-only"
             print(f"Epoch [{epoch+1:3d}/{num_epochs}] | "
                   f"Diff Loss: {avg_loss:.4f} | "
                   f"Sparsity Loss: {avg_sparsity:.4f} | "
@@ -1054,12 +1306,18 @@ def train_brain_connectivity(
                 collapse_history.append({"epoch": epoch + 1, **collapse_metrics})
 
             print(f"  [Quality] score={epoch_score:.4f} "
-                  f"(agree={epoch_details['agreement']:.2%}[{epoch_details['high_conf_edges']}], "
-                  f"margin={epoch_details['dir_margin']:.4f}, "
+                  f"(agree={epoch_details['agreement']:.2%}/{epoch_details['agreement_score']:.2%}"
+                  f"[{epoch_details['high_conf_edges']}], "
+                  f"margin={epoch_details['dir_margin']:.4f}/{epoch_details['margin_score']:.3f}, "
                   f"skel={epoch_details['skeleton_overlap']:.2%}, "
                   f"dens={epoch_details['density_factor']:.3f}, "
+                  f"asym={epoch_details['global_asymmetry']:.4f}, "
                   f"pair_dens={epoch_details['actual_pair_density']:.2%}/{epoch_details['target_pair_density']:.2%}) | "
-                  f"Best: epoch {best_epoch} score={best_score:.4f}{marker}")
+                  f"Guard={guardrail_details['guardrail_reason']} "
+                  f"(req_skel={guardrail_details['guardrail_required_skeleton_overlap']:.2%}, "
+                  f"ratio={guardrail_details['guardrail_density_ratio']:.2f}) | "
+                  f"Best[{current_best_mode}]: epoch {current_best_epoch} score={current_best_score:.4f} | "
+                  f"Eligible from epoch {selection_start_epoch}{marker}")
 
         # Record loss for every epoch
 
@@ -1069,22 +1327,50 @@ def train_brain_connectivity(
 
     # Extract final adjacency matrix
     with torch.no_grad():
-        last_adj = get_current_structure_adj(model).cpu().numpy()
+        last_adj = get_current_structure_adj(model, causal=False).cpu().numpy()
 
-    # Use best-epoch adjacency if available, otherwise fall back to last epoch
-    if best_adj is not None:
-        adj_matrix = best_adj
-        print(f"\n[Best-Epoch] Using epoch {best_epoch} (score={best_score:.4f}) "
+    # Prefer guarded best-epoch selection, but fall back to score-only selection if
+    # all epochs fail the guardrails.
+    if best_guarded_adj is not None:
+        adj_matrix = best_guarded_adj
+        best_epoch = best_guarded_epoch
+        best_score = best_guarded_score
+        best_quality_details = best_guarded_quality_details
+        best_adj_causal = best_guarded_adj_causal
+        best_selection_mode = "guarded"
+        print(f"\n[Best-Epoch] Using guarded epoch {best_epoch} (score={best_score:.4f}) "
               f"instead of final epoch {num_epochs}")
+    elif fallback_best_adj is not None:
+        adj_matrix = fallback_best_adj
+        best_epoch = fallback_best_epoch
+        best_score = fallback_best_score
+        best_quality_details = fallback_best_quality_details
+        best_adj_causal = fallback_best_adj_causal
+        best_selection_mode = "score_only_fallback"
+        print(f"\n[Best-Epoch] No epoch passed guardrails; falling back to score-only epoch "
+              f"{best_epoch} (score={best_score:.4f}) instead of final epoch {num_epochs}")
     else:
         adj_matrix = last_adj
+        best_score = -1.0
         best_epoch = num_epochs
+        best_quality_details = None
+        best_adj_causal = to_causal_matrix_np(adj_matrix)
+        best_selection_mode = "final_epoch_fallback"
 
     model.last_epoch_adj_matrix = last_adj
     model.best_epoch_adj_matrix = adj_matrix
+    model.last_epoch_adj_matrix_causal = to_causal_matrix_np(last_adj)
+    model.best_epoch_adj_matrix_causal = (
+        best_adj_causal if best_adj_causal is not None else to_causal_matrix_np(adj_matrix)
+    )
     model.best_epoch_score = best_score
     model.best_epoch = best_epoch
     model.best_epoch_quality = best_quality_details
+    model.best_epoch_selection_mode = best_selection_mode
+    model.best_epoch_guarded = best_guarded_epoch
+    model.best_epoch_guarded_score = best_guarded_score
+    model.best_epoch_score_only = fallback_best_epoch
+    model.best_epoch_score_only_score = fallback_best_score
     model.quality_history = quality_history
 
     return model, adj_matrix, loss_history, collapse_history, best_epoch
@@ -1153,6 +1439,39 @@ def main():
 
                         help='Number of top undirected pairs for Patel skeleton/noise guidance')
 
+    parser.add_argument('--structure_init_mode', type=str, default='patel_score',
+                        choices=[
+                            'patel_score',
+                            'patel_score_t',
+                            'neg_patel_score',
+                            'neg_patel_score_t',
+                            'patel_kappa',
+                            'pearson',
+                            'random',
+                        ],
+                        help='Matrix used only for structure embedding initialization')
+
+    parser.add_argument('--selection_start_epoch', type=int, default=6,
+                        help='First epoch eligible for best-epoch export selection')
+
+    parser.add_argument('--selection_top_k', type=int, default=None,
+                        help='Top-k undirected pairs used only for best-epoch proxy selection')
+
+    parser.add_argument('--selection_min_skeleton_overlap', type=float, default=0.50,
+                        help='Absolute minimum skeleton overlap required by guarded selection')
+
+    parser.add_argument('--selection_min_skeleton_retention', type=float, default=0.85,
+                        help='Keep at least this fraction of the best eligible skeleton overlap so far')
+
+    parser.add_argument('--selection_min_density_factor', type=float, default=0.65,
+                        help='Minimum density_factor required by guarded selection')
+
+    parser.add_argument('--selection_max_density_ratio', type=float, default=2.50,
+                        help='Maximum allowed actual/target pair-density ratio for guarded selection')
+
+    parser.add_argument('--selection_agreement_weight', type=float, default=0.25,
+                        help='Weight of Patel tau agreement term in best-epoch proxy score; set 0 to disable')
+
     parser.add_argument('--debug_checks', action='store_true', default=False,
 
                         help='Run one-step debug checks (cos(x_t,x_encoded) and temporal encoder grad)')
@@ -1173,6 +1492,43 @@ def main():
 
     parser.add_argument('--disable_temporal_encoder', action='store_true', default=False,
                         help='Disable temporal encoder and work directly on raw time series')
+
+    # === Fix 4: Uniform timestep ===
+    parser.add_argument('--uniform_timestep', action='store_true', default=True,
+                        help='All nodes share the same timestep per forward pass (default)')
+    parser.add_argument('--per_node_timestep', action='store_true', default=False,
+                        help='Each node samples an independent timestep (legacy behavior)')
+
+    # === Fix 2: Noise normalization mode ===
+    parser.add_argument('--noise_norm_mode', type=str, default='global',
+                        choices=['global', 'layernorm', 'none'],
+                        help='Noise normalization: global (preserve node differences), '
+                             'layernorm (legacy), none')
+
+    # === Fix 3: Zero-mean noise ===
+    parser.add_argument('--noise_zero_mean', action='store_true', default=True,
+                        help='Drop neighbor mean from noise (reduce signal correlation, default)')
+    parser.add_argument('--noise_with_mean', action='store_true', default=False,
+                        help='Include neighbor mean in noise (legacy behavior)')
+
+    # === Fix 1: Directed noise guidance ===
+    parser.add_argument('--directed_noise', action='store_true', default=False,
+                        help='Use direction-biased noise guide adjacency from Patel tau')
+    parser.add_argument('--direction_alpha', type=float, default=0.5,
+                        help='Direction bias strength for directed noise (0=symmetric, 1=max)')
+
+    parser.add_argument('--disable_directional_loss', action='store_true', default=False,
+                        help='Disable Patel tau directional margin loss during training')
+
+    # === Fix 6: Loss function ===
+    parser.add_argument('--loss_type', type=str, default='denoise_hybrid',
+                        choices=['cosine', 'denoise_hybrid', 'hybrid', 'smooth_l1', 'mse'],
+                        help='Denoising loss: denoise_hybrid (SmoothL1 + small cosine, default), '
+                             'hybrid (legacy cosine+MSE), smooth_l1, cosine, mse')
+    parser.add_argument('--cosine_weight', type=float, default=0.1,
+                        help='Cosine weight used by denoise_hybrid (default: 0.1)')
+    parser.add_argument('--mse_weight', type=float, default=0.1,
+                        help='MSE weight in legacy hybrid loss (default: 0.1)')
 
 
 
@@ -1243,14 +1599,36 @@ def main():
     print(f"Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
     print(f"Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
 
-    # Step 3: Build an undirected noise-guide skeleton from positive Patel kappa
-    noise_guide_adj, adj_binary, k_pairs, threshold = build_noise_guide_adjacency(
-        patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),
-        top_k_pairs=args.top_k_edges,
+    structure_init_matrix = build_structure_init_matrix(
+        mode=args.structure_init_mode,
+        patel_score_matrix=patel_score_matrix,
+        patel_kappa_matrix=patel_kappa_matrix,
+        pearson_matrix=pearson_matrix.float(),
+        seed=args.seed,
     )
+    print(f"Structure init mode: {args.structure_init_mode} | "
+          f"range=[{structure_init_matrix.min():.4f}, {structure_init_matrix.max():.4f}]")
 
-    print(f"Keeping top {k_pairs} undirected pairs (threshold: {threshold:.4f})")
-    print(f"Noise guide adj: {adj_binary.sum().item() / 2:.0f} undirected pairs + {num_nodes} self-loops")
+    # Step 3: Build noise-guide skeleton
+    if args.directed_noise:
+        noise_guide_adj = build_directed_noise_guide_adjacency(
+            patel_kappa=torch.clamp(patel_kappa_matrix, min=0.0),
+            patel_tau=patel_tau_matrix,
+            top_k_pairs=args.top_k_edges,
+            direction_alpha=args.direction_alpha,
+        )
+        asym_norm = torch.norm(noise_guide_adj - noise_guide_adj.t()).item()
+        print(f"Directed noise guide adj: top {args.top_k_edges} pairs, "
+              f"alpha={args.direction_alpha}, ||A-A^T||_F={asym_norm:.4f}")
+        # For compatibility: estimate k_pairs from non-self-loop entries
+        k_pairs = args.top_k_edges
+    else:
+        noise_guide_adj, adj_binary, k_pairs, threshold = build_noise_guide_adjacency(
+            patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),
+            top_k_pairs=args.top_k_edges,
+        )
+        print(f"Keeping top {k_pairs} undirected pairs (threshold: {threshold:.4f})")
+        print(f"Noise guide adj: {adj_binary.sum().item() / 2:.0f} undirected pairs + {num_nodes} self-loops")
 
     
 
@@ -1268,7 +1646,7 @@ def main():
 
     # Step 6: Train model
 
-    # - patel_score_matrix: asymmetric init for sender/receiver embeddings
+    # - structure_init_matrix: chosen matrix for sender/receiver initialization
     # - patel_tau_matrix: weak directional prior only
     # - patel_kappa_matrix: skeleton prior for proxy scoring / noise guidance
 
@@ -1284,7 +1662,7 @@ def main():
 
         noise_guide_adj=noise_guide_adj,  # For neighbor-based noise
 
-        patel_matrix=patel_score_matrix,  # Asymmetric Patel score for SVD init
+        patel_matrix=structure_init_matrix,  # Chosen matrix for SVD init
         patel_direction_matrix=patel_tau_matrix,  # Pure direction prior for margin loss
         patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),  # Skeleton prior
         target_edge_count=k_pairs,
@@ -1312,7 +1690,23 @@ def main():
         pretrain_epochs=args.pretrain_epochs,
         pretrain_lr=args.pretrain_lr,
         result_dir=result_dir,
-        ddm_kwargs={'use_temporal_encoder': not args.disable_temporal_encoder},
+        selection_top_k=args.selection_top_k,
+        selection_start_epoch=args.selection_start_epoch,
+        selection_min_skeleton_overlap=args.selection_min_skeleton_overlap,
+        selection_min_skeleton_retention=args.selection_min_skeleton_retention,
+        selection_min_density_factor=args.selection_min_density_factor,
+        selection_max_density_ratio=args.selection_max_density_ratio,
+        enable_directional_loss=not args.disable_directional_loss,
+        selection_agreement_weight=args.selection_agreement_weight,
+        ddm_kwargs={
+            'use_temporal_encoder': not args.disable_temporal_encoder,
+            'uniform_timestep': not args.per_node_timestep,
+            'noise_norm_mode': args.noise_norm_mode,
+            'noise_zero_mean': not args.noise_with_mean,
+            'loss_type': args.loss_type,
+            'cosine_weight': args.cosine_weight,
+            'mse_weight': args.mse_weight,
+        },
 
     )
 
@@ -1393,6 +1787,8 @@ def main():
 
     quality_history = getattr(model, 'quality_history', [])
     final_epoch_adj = getattr(model, 'last_epoch_adj_matrix', None)
+    best_epoch_adj_causal = getattr(model, 'best_epoch_adj_matrix_causal', to_causal_matrix_np(adj_matrix))
+    final_epoch_adj_causal = getattr(model, 'last_epoch_adj_matrix_causal', None)
 
     # Save adjacency matrix to results folder (both npy and csv)
 
@@ -1406,14 +1802,28 @@ def main():
 
     adj_csv_path = os.path.join(result_dir, 'learned_adjacency.csv')
 
-    pd.DataFrame(adj_matrix).to_csv(adj_csv_path, index=False, header=False, float_format='%.4f')
+    pd.DataFrame(adj_matrix).to_csv(adj_csv_path, index=False, header=False, float_format='%.8f')
+
+    adj_causal_save_path = os.path.join(result_dir, 'learned_adjacency_causal.npy')
+    adj_causal_csv_path = os.path.join(result_dir, 'learned_adjacency_causal.csv')
+    np.save(adj_causal_save_path, best_epoch_adj_causal)
+    pd.DataFrame(best_epoch_adj_causal).to_csv(
+        adj_causal_csv_path, index=False, header=False, float_format='%.8f'
+    )
 
     if final_epoch_adj is not None:
         final_adj_save_path = os.path.join(result_dir, 'final_epoch_adjacency.npy')
         final_adj_csv_path = os.path.join(result_dir, 'final_epoch_adjacency.csv')
         np.save(final_adj_save_path, final_epoch_adj)
         pd.DataFrame(final_epoch_adj).to_csv(
-            final_adj_csv_path, index=False, header=False, float_format='%.4f'
+            final_adj_csv_path, index=False, header=False, float_format='%.8f'
+        )
+    if final_epoch_adj_causal is not None:
+        final_adj_causal_save_path = os.path.join(result_dir, 'final_epoch_adjacency_causal.npy')
+        final_adj_causal_csv_path = os.path.join(result_dir, 'final_epoch_adjacency_causal.csv')
+        np.save(final_adj_causal_save_path, final_epoch_adj_causal)
+        pd.DataFrame(final_epoch_adj_causal).to_csv(
+            final_adj_causal_csv_path, index=False, header=False, float_format='%.8f'
         )
 
     
@@ -1440,8 +1850,18 @@ def main():
 
     config['num_nodes'] = int(num_nodes)
     config['noise_guide_pairs'] = int(k_pairs)
+    config['selection_top_k'] = int(args.selection_top_k) if args.selection_top_k is not None else int(k_pairs)
     config['exported_epoch'] = int(best_epoch)
     config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
+    config['best_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+    config['best_epoch_guarded'] = int(getattr(model, 'best_epoch_guarded', -1))
+    config['best_epoch_guarded_score'] = float(getattr(model, 'best_epoch_guarded_score', -1.0))
+    config['best_epoch_score_only'] = int(getattr(model, 'best_epoch_score_only', -1))
+    config['best_epoch_score_only_score'] = float(getattr(model, 'best_epoch_score_only_score', -1.0))
+    config['raw_adjacency_convention'] = RAW_ADJ_CONVENTION
+    config['causal_adjacency_convention'] = CAUSAL_ADJ_CONVENTION
+    config['learned_adjacency_file_semantics'] = 'raw_internal_convention'
+    config['learned_adjacency_causal_file_semantics'] = 'causal_convention_for_eval'
 
     np.save(os.path.join(result_dir, 'config.npy'), config, allow_pickle=True)
 
@@ -1455,6 +1875,14 @@ def main():
 
         os.path.join(result_dir, 'pearson_matrix.csv'), index=False, header=False, float_format='%.4f'
 
+    )
+
+    np.save(os.path.join(result_dir, 'structure_init_matrix.npy'), structure_init_matrix.numpy())
+    pd.DataFrame(structure_init_matrix.numpy()).to_csv(
+        os.path.join(result_dir, 'structure_init_matrix.csv'),
+        index=False,
+        header=False,
+        float_format='%.8f',
     )
 
     if quality_history:
@@ -1506,12 +1934,17 @@ def main():
     print(f"Results saved to: {result_dir}")
 
     print(f"  [Best Epoch: {best_epoch}/{args.epochs}]")
+    print(f"  [Selection Mode: {getattr(model, 'best_epoch_selection_mode', 'unknown')}]")
 
     print(f"  - loss_curve.png          <- 查看此图判断收敛")
 
-    print(f"  - learned_adjacency.csv   <- best-epoch 导出的邻接矩阵")
+    print(f"  - learned_adjacency.csv   <- best-epoch 原始邻接矩阵（raw convention）")
 
-    print(f"  - final_epoch_adjacency.csv <- 最后一轮邻接矩阵（用于对照）")
+    print(f"  - learned_adjacency_causal.csv <- best-epoch 因果方向邻接矩阵（causal convention）")
+
+    print(f"  - final_epoch_adjacency.csv <- 最后一轮原始邻接矩阵（用于对照）")
+
+    print(f"  - final_epoch_adjacency_causal.csv <- 最后一轮因果邻接矩阵（用于对照）")
 
     print(f"  - loss_history.csv")
 

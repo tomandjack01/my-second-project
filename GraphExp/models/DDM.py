@@ -115,12 +115,23 @@ class DDM(nn.Module):
             T: int = 1000,
             init_features: Optional[torch.Tensor] = None,
             noise_guide_adj: Optional[torch.Tensor] = None,
+            normalize_noise: bool = True,
             preserve_noise_sign: bool = False,
             emb_dim: Optional[int] = None,  # None = full rank (N)
             adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
             use_temporal_encoder: bool = True,
+            # Fix 4: Uniform timestep sampling
+            uniform_timestep: bool = True,
+            # Fix 2: Noise normalization mode ('global', 'layernorm', 'none')
+            noise_norm_mode: Optional[str] = None,
+            # Fix 3: Zero-mean noise (drop neighbor mean bias)
+            noise_zero_mean: bool = True,
+            # Fix 6: Loss function type
+            loss_type: str = 'denoise_hybrid',
+            cosine_weight: float = 0.1,
+            mse_weight: float = 0.1,
             **kwargs
 
          ):
@@ -185,7 +196,22 @@ class DDM(nn.Module):
         else:
             self.noise_guide_adj = None
 
+        self.normalize_noise = normalize_noise
         self.preserve_noise_sign = preserve_noise_sign
+        # Fix 4: Uniform timestep — all nodes share the same t per forward pass
+        self.uniform_timestep = uniform_timestep
+        # Fix 2: Noise normalization mode
+        # Backward compat: if noise_norm_mode not explicitly set, derive from normalize_noise
+        if noise_norm_mode is not None:
+            self.noise_norm_mode = noise_norm_mode
+        else:
+            self.noise_norm_mode = 'layernorm' if normalize_noise else 'global'
+        # Fix 3: Zero-mean noise
+        self.noise_zero_mean = noise_zero_mean
+        # Fix 6: Loss function selection
+        self.loss_type = loss_type
+        self.cosine_weight = cosine_weight
+        self.mse_weight = mse_weight
 
         # Graph Structure Learning: Sender/Receiver embedding with SVD initialization
         self.structure_learning_mode = init_features is not None
@@ -259,33 +285,44 @@ class DDM(nn.Module):
             loss: Diffusion loss
             loss_item: Dictionary with loss value
         """
-        # Step 1: Optionally encode raw time series via causal conv
-        if self.use_temporal_encoder:
-            # [N, T] → [N, T] (causal features, same dimension)
-            x_processed = self.temporal_encoder(x)
+        # Step 1: Build the clean target x0 for diffusion.
+        # When the temporal encoder is enabled, use its unnormalized causal
+        # representation instead of the doubly-normalized output.
+        x_processed = self.prepare_clean_target(x)
+
+        # Step 2: Sample random timestep for diffusion
+        if self.uniform_timestep:
+            t_val = torch.randint(self.T, size=(1,), device=x_processed.device)
+            t = t_val.expand(x_processed.shape[0])
         else:
-            # Use raw time series directly
-            x_processed = x
+            t = torch.randint(self.T, size=(x_processed.shape[0], ), device=x_processed.device)
 
-        # Step 2: Apply layer normalization
-        x_processed = F.layer_norm(x_processed, (x_processed.shape[-1], ))
-
-        # Step 3: Sample random timestep for diffusion
-        t = torch.randint(self.T, size=(x_processed.shape[0], ), device=x_processed.device)
-
-        # Step 4: Get graph structure
+        # Step 3: Get graph structure
         if self.structure_learning_mode:
             g, edge_weight = self._get_structure_graph(x_processed.device)
         else:
             edge_weight = None
 
-        # Step 5: Diffusion forward process (add noise)
+        # Step 4: Diffusion forward process (add noise)
         x_t, time_embed, g = self.sample_q(t, x_processed, g)
 
-        # Step 6: Denoise and compute loss
+        # Step 5: Denoise and compute loss
         loss = self.node_denoising(x_processed, x_t, time_embed, g, edge_weight=edge_weight)
         loss_item = {"loss": loss.item()}
         return loss, loss_item
+
+    def prepare_clean_target(self, x):
+        """
+        Build the clean target x0 used by diffusion and denoising.
+
+        With the temporal encoder enabled, we use the encoder's unnormalized
+        causal representation so the denoiser learns to recover a meaningful
+        temporal state instead of a doubly-normalized proxy.
+        """
+        if self.use_temporal_encoder:
+            _, x_clean = self.temporal_encoder(x, return_unnormalized=True)
+            return x_clean
+        return x
 
     def sample_q(self, t, x, g):
         """
@@ -296,62 +333,8 @@ class DDM(nn.Module):
         """
         # Determine input shape: [N, Feats] or [Batch, N, Feats]
         is_batched = x.dim() == 3
-        
-        if is_batched:
-            B, N, D = x.shape
-        else:
-            N, D = x.shape
-            # Add batch dimension for unified processing
-            x = x.unsqueeze(0)  # [1, N, D]
-            B = 1
-        
-        # Global statistics as fallback
-        global_mean = x.mean(dim=1, keepdim=True)  # [B, 1, D]
-        global_std = x.std(dim=1, keepdim=True) + 1e-6  # [B, 1, D]
-        
-        # Generate base random noise
-        eps = torch.randn_like(x)  # [B, N, D]
-        
-        if self.noise_guide_adj is not None:
-            # Neighbor-Based Noise using matrix operations
-            # noise_guide_adj: [N, N], x: [B, N, D]
-            
-            # Step 1: Compute neighbor mean
-            # [N, N] @ [B, N, D] -> need to handle batch dimension
-            # Reshape for batched matmul: adj @ x[b] for each batch
-            adj = self.noise_guide_adj  # [N, N]
-            
-            # neighbor_mean[b, i, :] = sum_j(adj[i,j] * x[b, j, :])
-            # Using einsum for clarity: 'ij, bjd -> bid'
-            neighbor_mean = torch.einsum('ij,bjd->bid', adj, x)  # [B, N, D]
-            
-            # Step 2: Compute neighbor variance using E[X^2] - E[X]^2
-            x_sq = x ** 2  # [B, N, D]
-            neighbor_sq_mean = torch.einsum('ij,bjd->bid', adj, x_sq)  # [B, N, D]
-            neighbor_var = neighbor_sq_mean - neighbor_mean ** 2
-            
-            # Clamp to avoid negative variance due to numerical issues
-            neighbor_std = torch.sqrt(torch.clamp(neighbor_var, min=1e-6))  # [B, N, D]
-            
-            # Step 3: Generate noise with neighbor statistics
-            noise = eps * neighbor_std + neighbor_mean  # [B, N, D]
-        else:
-            # Fallback to global statistics
-            noise = eps * global_std + global_mean
-        
-        # Apply layer normalization to noise
-        with torch.no_grad():
-            noise = F.layer_norm(noise, (noise.shape[-1], ))
-        
-        # Optional: preserve sign alignment with the input
-        if self.preserve_noise_sign:
-            noise = torch.sign(x) * torch.abs(noise)
-        
-        # Remove batch dimension if input was unbatched
-        if not is_batched:
-            x = x.squeeze(0)
-            noise = noise.squeeze(0)
-        
+        noise = self.build_noise(x)
+
         # Diffusion forward process
         x_t = (
             extract(self.sqrt_alphas_bar, t, x.shape) * x +
@@ -360,10 +343,97 @@ class DDM(nn.Module):
         time_embed = self.time_embedding(t)
         return x_t, time_embed, g
 
+    def build_noise(self, x, eps=None, normalize_noise: Optional[bool] = None,
+                    noise_norm_mode: Optional[str] = None,
+                    noise_zero_mean: Optional[bool] = None,
+                    return_details: bool = False):
+        """
+        Build guided noise for x.
+
+        Args:
+            x: [N, D] or [B, N, D]
+            eps: Optional pre-sampled Gaussian noise with the same shape as x
+            normalize_noise: Legacy override (True→layernorm, False→skip)
+            noise_norm_mode: Override noise normalization ('global', 'layernorm', 'none')
+            noise_zero_mean: Override zero-mean noise flag
+            return_details: Return intermediate mean/std tensors for diagnostics
+        """
+        is_batched = x.dim() == 3
+        x_work = x if is_batched else x.unsqueeze(0)
+
+        global_mean = x_work.mean(dim=1, keepdim=True)
+        global_std = x_work.std(dim=1, keepdim=True) + 1e-6
+
+        if eps is None:
+            eps = torch.randn_like(x_work)
+        elif eps.shape != x_work.shape:
+            raise ValueError(f"eps shape {eps.shape} does not match x shape {x_work.shape}")
+
+        if self.noise_guide_adj is not None:
+            adj = self.noise_guide_adj
+            base_mean = torch.einsum('ij,bjd->bid', adj, x_work)
+            x_sq = x_work ** 2
+            base_sq_mean = torch.einsum('ij,bjd->bid', adj, x_sq)
+            base_var = base_sq_mean - base_mean ** 2
+            base_std = torch.sqrt(torch.clamp(base_var, min=1e-6))
+            noise_source = "neighbor"
+        else:
+            base_mean = global_mean
+            base_std = global_std
+            noise_source = "global"
+
+        # Fix 3: Zero-mean noise — drop neighbor mean bias to reduce signal correlation
+        use_zero_mean = noise_zero_mean if noise_zero_mean is not None else self.noise_zero_mean
+        if use_zero_mean:
+            raw_noise = eps * base_std
+        else:
+            raw_noise = eps * base_std + base_mean
+
+        # Fix 2: Noise normalization mode
+        # Resolve effective mode: explicit override > legacy override > instance default
+        if noise_norm_mode is not None:
+            eff_mode = noise_norm_mode
+        elif normalize_noise is not None:
+            eff_mode = 'layernorm' if normalize_noise else 'none'
+        else:
+            eff_mode = self.noise_norm_mode
+
+        if eff_mode == 'layernorm':
+            raw_noise = F.layer_norm(raw_noise, (raw_noise.shape[-1], ))
+        elif eff_mode == 'global':
+            noise_std = raw_noise.std()
+            raw_noise = raw_noise / (noise_std + 1e-6)
+        # 'none': no normalization
+
+        if self.preserve_noise_sign:
+            raw_noise = torch.sign(x_work) * torch.abs(raw_noise)
+
+        noise = raw_noise if is_batched else raw_noise.squeeze(0)
+        if not return_details:
+            return noise
+
+        details = {
+            "base_mean": base_mean if is_batched else base_mean.squeeze(0),
+            "base_std": base_std if is_batched else base_std.squeeze(0),
+            "global_mean": global_mean if is_batched else global_mean.squeeze(0),
+            "global_std": global_std if is_batched else global_std.squeeze(0),
+            "eps": eps if is_batched else eps.squeeze(0),
+            "noise_source": noise_source,
+        }
+        return noise, details
+
     def node_denoising(self, x, x_t, time_embed, g, edge_weight=None):
         out, _ = self.net(g, x_t=x_t, time_embed=time_embed, edge_weight=edge_weight)
-        loss = loss_fn(out, x, self.alpha_l)
-
+        if self.loss_type == 'denoise_hybrid':
+            loss = loss_fn_denoise_hybrid(out, x, self.alpha_l, self.cosine_weight)
+        elif self.loss_type == 'hybrid':
+            loss = loss_fn_hybrid(out, x, self.alpha_l, self.mse_weight)
+        elif self.loss_type == 'smooth_l1':
+            loss = F.smooth_l1_loss(out, x)
+        elif self.loss_type == 'mse':
+            loss = F.mse_loss(out, x)
+        else:  # 'cosine' or legacy default
+            loss = loss_fn(out, x, self.alpha_l)
         return loss
 
     def embed(self, g, x, T):
@@ -378,15 +448,10 @@ class DDM(nn.Module):
         Returns:
             hidden: Encoded hidden representations
         """
-        # Optionally encode raw time series first
-        if self.use_temporal_encoder:
-            x_processed = self.temporal_encoder(x)
-        else:
-            x_processed = x
+        # Embed in the same clean-target space used during training.
+        x_processed = self.prepare_clean_target(x)
 
         t = torch.full((1, ), T, device=x_processed.device)
-        with torch.no_grad():
-            x_processed = F.layer_norm(x_processed, (x_processed.shape[-1], ))
 
         # Use learned structure if in structure learning mode
         if self.structure_learning_mode:
@@ -407,6 +472,23 @@ def loss_fn(x, y, alpha=2):
 
     loss = loss.mean()
     return loss
+
+
+def loss_fn_hybrid(x, y, alpha=2, mse_weight=0.1):
+    """Legacy cosine similarity loss + weighted MSE loss."""
+    cos_loss = loss_fn(x, y, alpha)
+    mse_loss = F.mse_loss(x, y)
+    return cos_loss + mse_weight * mse_loss
+
+
+def loss_fn_denoise_hybrid(x, y, alpha=2, cosine_weight=0.1):
+    """
+    Default denoising loss: robust reconstruction in the clean-target space,
+    with a light cosine term to keep directional similarity stable.
+    """
+    recon_loss = F.smooth_l1_loss(x, y)
+    cos_loss = loss_fn(x, y, alpha)
+    return recon_loss + cosine_weight * cos_loss
 
 
 def get_beta_schedule(beta_schedule, beta_start, beta_end, num_diffusion_timesteps):

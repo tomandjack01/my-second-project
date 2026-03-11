@@ -42,19 +42,38 @@ def find_latest_pred(results_dir: Path) -> Path:
         reverse=True,
     )
     for run_dir in run_dirs:
-        pred_path = run_dir / "learned_adjacency.csv"
-        if pred_path.exists():
-            return pred_path
+        for filename in (
+            "learned_adjacency_causal.npy",
+            "learned_adjacency_causal.csv",
+            "learned_adjacency.npy",
+            "learned_adjacency.csv",
+        ):
+            pred_path = run_dir / filename
+            if pred_path.exists():
+                return pred_path
     raise FileNotFoundError(
-        f"No learned_adjacency.csv found under: {results_dir}"
+        f"No learned adjacency file found under: {results_dir}"
     )
 
 
-def load_adjacency(pred_path: Path):
-    adj = np.loadtxt(pred_path, delimiter=",")
+def infer_adjacency_convention(pred_path: Path) -> str:
+    return "causal" if "causal" in pred_path.stem.lower() else "raw"
+
+
+def load_adjacency(pred_path: Path, adj_convention: str = "auto"):
+    if pred_path.suffix.lower() == ".npy":
+        adj = np.load(pred_path)
+    else:
+        adj = np.loadtxt(pred_path, delimiter=",")
+    if adj_convention == "auto":
+        adj_convention = infer_adjacency_convention(pred_path)
+    if adj_convention == "raw":
+        adj = adj.T
+    elif adj_convention != "causal":
+        raise ValueError(f"Unsupported --adj_convention={adj_convention!r}")
     if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
         raise ValueError(f"Adjacency must be square, got shape={adj.shape}")
-    return adj
+    return adj, adj_convention
 
 
 def evaluate_directional(adj, gt_edges):
@@ -116,7 +135,7 @@ def main():
         "--pred",
         type=str,
         default=None,
-        help="Path to learned_adjacency.csv (default: latest run in GraphExp/results)",
+        help="Path to learned adjacency csv/npy (default: latest run in GraphExp/results)",
     )
     parser.add_argument(
         "--gt",
@@ -136,17 +155,25 @@ def main():
         default=100,
         help="Max number of predicted edges to print by confidence",
     )
+    parser.add_argument(
+        "--adj_convention",
+        type=str,
+        choices=["auto", "raw", "causal"],
+        default="auto",
+        help="Interpretation of the prediction file. raw means transpose before evaluation.",
+    )
     args = parser.parse_args()
 
     pred_path = Path(args.pred) if args.pred else find_latest_pred(Path(args.results_dir))
     gt_path = Path(args.gt)
 
-    adj = load_adjacency(pred_path)
+    adj, used_convention = load_adjacency(pred_path, adj_convention=args.adj_convention)
     gt_edges = load_ground_truth(gt_path)
     result = evaluate_directional(adj, gt_edges)
 
     print("=" * 72)
     print(f"Pred file: {pred_path}")
+    print(f"Adj convention used: {used_convention} -> evaluated as causal")
     print(f"GT file:   {gt_path}")
     print(f"Matrix shape: {adj.shape}")
     print("-" * 72)
