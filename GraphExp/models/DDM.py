@@ -21,6 +21,43 @@ from .mlp_gat import Denoising_Unet
 import numpy as np
 
 
+def _make_ix_like(input: torch.Tensor, dim: int) -> torch.Tensor:
+    """Create a 1..K index tensor broadcastable along `dim`."""
+    view = [1] * input.dim()
+    view[dim] = input.size(dim)
+    return torch.arange(1, input.size(dim) + 1, device=input.device, dtype=input.dtype).view(view)
+
+
+def sparsemax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Sparsemax activation producing exact zeros along `dim`."""
+    shifted = input - input.max(dim=dim, keepdim=True).values
+    zs = torch.sort(shifted, dim=dim, descending=True).values
+    range_ix = _make_ix_like(zs, dim)
+    bound = 1 + range_ix * zs
+    cumsum_zs = zs.cumsum(dim)
+    support = bound > cumsum_zs
+    k = support.sum(dim=dim, keepdim=True).clamp_min(1)
+    tau = (cumsum_zs.gather(dim, k - 1) - 1) / k.to(input.dtype)
+    return torch.clamp(shifted - tau, min=0.0)
+
+
+def entmax15(input: torch.Tensor, dim: int = -1, n_iter: int = 50) -> torch.Tensor:
+    """Entmax with alpha=1.5 via bisection; exact zeros but softer than sparsemax."""
+    alpha = 1.5
+    power = 1.0 / (alpha - 1.0)
+    max_val = input.max(dim=dim, keepdim=True).values
+    tau_lo = max_val - 1.0 / (alpha - 1.0)
+    tau_hi = max_val
+    for _ in range(n_iter):
+        tau_mid = 0.5 * (tau_lo + tau_hi)
+        probs_mid = torch.clamp((alpha - 1.0) * (input - tau_mid), min=0.0) ** power
+        sum_mid = probs_mid.sum(dim=dim, keepdim=True)
+        tau_lo = torch.where(sum_mid > 1.0, tau_mid, tau_lo)
+        tau_hi = torch.where(sum_mid > 1.0, tau_hi, tau_mid)
+    probs = torch.clamp((alpha - 1.0) * (input - tau_hi), min=0.0) ** power
+    return probs / probs.sum(dim=dim, keepdim=True).clamp_min(1e-8)
+
+
 def extract(v, t, x_shape):
     """
     Extract some coefficients at specified timesteps, then reshape to
@@ -115,10 +152,18 @@ class DDM(nn.Module):
             T: int = 1000,
             init_features: Optional[torch.Tensor] = None,
             noise_guide_adj: Optional[torch.Tensor] = None,
+            kappa_logit_bias_prior: Optional[torch.Tensor] = None,
+            direction_init_features: Optional[torch.Tensor] = None,
+            fixed_support_mask: Optional[torch.Tensor] = None,
             normalize_noise: bool = True,
             preserve_noise_sign: bool = False,
             emb_dim: Optional[int] = None,  # None = full rank (N)
+            structure_parameterization: str = 'coupled',  # coupled = one matrix; support_direction = symmetric support + pairwise direction split
+            structure_message_graph_mode: str = 'raw',  # raw uses internal [effect,cause], causal uses transpose
+            adj_activation: str = 'sigmoid',  # sigmoid = independent edges; sparsemax/entmax15 = competing parents
             adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
+            init_logit_scale: float = 1.0,  # Target std of initial structure logits after rescaling
+            kappa_logit_bias_scale: float = 0.0,  # Persistent symmetric Patel-kappa bias added to structure logits
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
             use_temporal_encoder: bool = True,
@@ -195,6 +240,15 @@ class DDM(nn.Module):
             print(f"Using Neighbor-Based Noise with adj shape {noise_guide_adj.shape}")
         else:
             self.noise_guide_adj = None
+        self.kappa_logit_bias_scale = float(kappa_logit_bias_scale)
+        if kappa_logit_bias_prior is not None:
+            self.register_buffer('kappa_logit_bias_prior', kappa_logit_bias_prior)
+        else:
+            self.kappa_logit_bias_prior = None
+        if fixed_support_mask is not None:
+            self.register_buffer('fixed_support_mask', fixed_support_mask)
+        else:
+            self.fixed_support_mask = None
 
         self.normalize_noise = normalize_noise
         self.preserve_noise_sign = preserve_noise_sign
@@ -212,6 +266,21 @@ class DDM(nn.Module):
         self.loss_type = loss_type
         self.cosine_weight = cosine_weight
         self.mse_weight = mse_weight
+        if structure_parameterization not in {'coupled', 'support_direction'}:
+            raise ValueError(
+                f"structure_parameterization must be one of ['coupled', 'support_direction'], got {structure_parameterization}"
+            )
+        self.structure_parameterization = structure_parameterization
+        if structure_message_graph_mode not in {'raw', 'causal'}:
+            raise ValueError(
+                f"structure_message_graph_mode must be 'raw' or 'causal', got {structure_message_graph_mode}"
+            )
+        self.structure_message_graph_mode = structure_message_graph_mode
+        if adj_activation not in {'sigmoid', 'sparsemax', 'entmax15'}:
+            raise ValueError(
+                f"adj_activation must be one of ['sigmoid', 'sparsemax', 'entmax15'], got {adj_activation}"
+            )
+        self.adj_activation = adj_activation
 
         # Graph Structure Learning: Sender/Receiver embedding with SVD initialization
         self.structure_learning_mode = init_features is not None
@@ -219,21 +288,23 @@ class DDM(nn.Module):
             N = init_features.shape[0]
             # Full rank by default: emb_dim=N gives same expressiveness as [N,N] parameter
             self.emb_dim = min(emb_dim if emb_dim is not None else N, N)
-            # SVD decomposition of init_features (Patel matrix) for asymmetric init
-            U, S, V = torch.svd(init_features.float())
-            U_trunc = U[:, :self.emb_dim]        # [N, emb_dim]
-            S_trunc = S[:self.emb_dim]            # [emb_dim]
-            V_trunc = V[:, :self.emb_dim]         # [N, emb_dim]
-            sqrt_S = torch.sqrt(S_trunc).unsqueeze(0)  # [1, emb_dim]
-            raw_sender = U_trunc * sqrt_S
-            raw_receiver = V_trunc * sqrt_S
-            # Rescale so logit std ≈ 1.0 (sigmoid linear region)
-            with torch.no_grad():
-                logits_est = raw_sender @ raw_receiver.T
-                logit_std = logits_est.std()
-                scale = (1.0 / (logit_std + 1e-8)).sqrt().item()
-            self.node_emb_sender = nn.Parameter(raw_sender * scale)    # [N, emb_dim]
-            self.node_emb_receiver = nn.Parameter(raw_receiver * scale)  # [N, emb_dim]
+            support_sender, support_receiver = self._factorized_init_from_matrix(
+                init_features.float(),
+                emb_dim=self.emb_dim,
+                target_std=init_logit_scale,
+            )
+            self.node_emb_sender = nn.Parameter(support_sender)    # [N, emb_dim]
+            self.node_emb_receiver = nn.Parameter(support_receiver)  # [N, emb_dim]
+            if self.structure_parameterization == 'support_direction':
+                if direction_init_features is None:
+                    direction_init_features = torch.zeros_like(init_features)
+                direction_sender, direction_receiver = self._factorized_init_from_matrix(
+                    direction_init_features.float(),
+                    emb_dim=self.emb_dim,
+                    target_std=init_logit_scale,
+                )
+                self.direction_emb_sender = nn.Parameter(direction_sender)
+                self.direction_emb_receiver = nn.Parameter(direction_receiver)
             # Learnable sparsity bias: shifts all logits to encourage sparse output
             if adj_bias_init is not None:
                 self.adj_bias = nn.Parameter(torch.tensor(float(adj_bias_init)))
@@ -248,28 +319,106 @@ class DDM(nn.Module):
             self.register_buffer('full_g_dst', dst)
             self.register_buffer('diag_mask', 1.0 - torch.eye(N))
             self.num_nodes = N
+            print(f"Structure parameterization mode: {self.structure_parameterization}")
+            print(
+                "Structure message graph mode: "
+                f"{self.structure_message_graph_mode} "
+                f"({'cause->effect' if self.structure_message_graph_mode == 'causal' else 'raw internal convention'})"
+            )
+            print(f"Structure adjacency activation: {self.adj_activation}")
+            if self.kappa_logit_bias_prior is not None and abs(self.kappa_logit_bias_scale) > 0.0:
+                print(
+                    "Kappa logit bias: "
+                    f"enabled (scale={self.kappa_logit_bias_scale:g}, "
+                    f"prior_range=[{self.kappa_logit_bias_prior.min().item():.4f}, "
+                    f"{self.kappa_logit_bias_prior.max().item():.4f}])"
+                )
+            if self.fixed_support_mask is not None:
+                support_pairs = int(self.fixed_support_mask.sum().item() / 2.0)
+                print(f"Fixed support mask: enabled ({support_pairs} undirected pairs)")
+
+    def _factorized_init_from_matrix(
+        self,
+        matrix: torch.Tensor,
+        emb_dim: int,
+        target_std: float,
+    ) -> tuple:
+        """SVD init shared by support and direction factors."""
+        U, S, V = torch.svd(matrix)
+        U_trunc = U[:, :emb_dim]
+        S_trunc = S[:emb_dim]
+        V_trunc = V[:, :emb_dim]
+        sqrt_S = torch.sqrt(S_trunc).unsqueeze(0)
+        raw_sender = U_trunc * sqrt_S
+        raw_receiver = V_trunc * sqrt_S
+        with torch.no_grad():
+            logits_est = raw_sender @ raw_receiver.T
+            logit_std = logits_est.std()
+            target_std = max(float(target_std), 0.0)
+            scale = math.sqrt(target_std / (logit_std + 1e-8)) if target_std > 0 else 0.0
+        return raw_sender * scale, raw_receiver * scale
 
     def get_structure_logits(self):
         """Return the clamped structure logits used everywhere downstream."""
         if not self.structure_learning_mode:
             raise RuntimeError("Structure logits requested when structure learning mode is disabled.")
         adj_logits = self.node_emb_sender @ self.node_emb_receiver.T + self.adj_bias
+        if self.kappa_logit_bias_prior is not None and abs(self.kappa_logit_bias_scale) > 0.0:
+            adj_logits = adj_logits + self.kappa_logit_bias_scale * self.kappa_logit_bias_prior
+        if self.structure_parameterization == 'support_direction':
+            adj_logits = 0.5 * (adj_logits + adj_logits.transpose(0, 1))
         return torch.clamp(adj_logits, -6.0, 6.0)
+
+    def get_direction_logits(self):
+        """Return raw pairwise directional logits for support/direction factorization."""
+        if self.structure_parameterization != 'support_direction':
+            return self.get_structure_logits()
+        direction_logits = self.direction_emb_sender @ self.direction_emb_receiver.T
+        return torch.clamp(direction_logits, -6.0, 6.0)
 
     def get_structure_adj(self):
         """Return the masked adjacency matrix used for graph weights and export."""
-        adj_logits = self.get_structure_logits()
-        adj_weights = torch.sigmoid(adj_logits)
+        if self.structure_parameterization == 'support_direction':
+            support_logits = self.get_structure_logits()
+            support_weights = torch.sigmoid(support_logits)
+            support_weights = support_weights * self.diag_mask.to(support_weights.device)
+            if self.fixed_support_mask is not None:
+                support_weights = support_weights * self.fixed_support_mask.to(support_weights.device)
+            direction_logits = self.get_direction_logits()
+            direction_gate = torch.sigmoid(direction_logits - direction_logits.transpose(0, 1))
+            adj_weights = support_weights * direction_gate
+        else:
+            adj_logits = self.get_structure_logits()
+            if self.adj_activation == 'sigmoid':
+                adj_weights = torch.sigmoid(adj_logits)
+            else:
+                masked_logits = adj_logits.masked_fill(self.diag_mask.to(adj_logits.device) <= 0.0, -1e9)
+                if self.adj_activation == 'sparsemax':
+                    adj_weights = sparsemax(masked_logits, dim=1)
+                else:
+                    adj_weights = entmax15(masked_logits, dim=1)
         adj_weights = adj_weights * self.diag_mask.to(adj_weights.device)
         self.learned_adj_weights = adj_weights
+        return adj_weights
+
+    def get_structure_message_adj(self):
+        """
+        Return the adjacency used for graph message passing.
+
+        `raw` preserves the internal convention A_raw[effect, cause].
+        `causal` transposes into A_msg[cause, effect] so message edges follow
+        cause -> effect semantics.
+        """
+        adj_weights = self.get_structure_adj()
+        if self.structure_message_graph_mode == 'causal':
+            return adj_weights.transpose(0, 1)
         return adj_weights
 
     def _get_structure_graph(self, device):
         """Create fully connected graph and compute edge weights from sender/receiver embeddings."""
         g = dgl.graph((self.full_g_src, self.full_g_dst), num_nodes=self.num_nodes)
         g = g.to(device)
-        adj_weights = self.get_structure_adj()
-        edge_weights = adj_weights.flatten()
+        edge_weights = self.get_structure_message_adj().flatten()
         return g, edge_weights
 
     def forward(self, g, x):
@@ -324,16 +473,25 @@ class DDM(nn.Module):
             return x_clean
         return x
 
-    def sample_q(self, t, x, g):
+    def sample_q(
+        self,
+        t,
+        x,
+        g,
+        eps_override: Optional[torch.Tensor] = None,
+        noise_guide_adj_override: Optional[torch.Tensor] = None,
+    ):
         """
         Diffusion forward process with Neighbor-Based Statistical Noise.
         
         For each node i, noise is drawn from N(mu_neighbors, sigma_neighbors)
         where neighbors are defined by self.noise_guide_adj.
         """
-        # Determine input shape: [N, Feats] or [Batch, N, Feats]
-        is_batched = x.dim() == 3
-        noise = self.build_noise(x)
+        noise = self.build_noise(
+            x,
+            eps=eps_override,
+            noise_guide_adj_override=noise_guide_adj_override,
+        )
 
         # Diffusion forward process
         x_t = (
@@ -346,7 +504,8 @@ class DDM(nn.Module):
     def build_noise(self, x, eps=None, normalize_noise: Optional[bool] = None,
                     noise_norm_mode: Optional[str] = None,
                     noise_zero_mean: Optional[bool] = None,
-                    return_details: bool = False):
+                    return_details: bool = False,
+                    noise_guide_adj_override: Optional[torch.Tensor] = None):
         """
         Build guided noise for x.
 
@@ -369,8 +528,11 @@ class DDM(nn.Module):
         elif eps.shape != x_work.shape:
             raise ValueError(f"eps shape {eps.shape} does not match x shape {x_work.shape}")
 
-        if self.noise_guide_adj is not None:
-            adj = self.noise_guide_adj
+        effective_noise_guide_adj = (
+            noise_guide_adj_override if noise_guide_adj_override is not None else self.noise_guide_adj
+        )
+        if effective_noise_guide_adj is not None:
+            adj = effective_noise_guide_adj
             base_mean = torch.einsum('ij,bjd->bid', adj, x_work)
             x_sq = x_work ** 2
             base_sq_mean = torch.einsum('ij,bjd->bid', adj, x_sq)

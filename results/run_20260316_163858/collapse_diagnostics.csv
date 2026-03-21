@@ -1,0 +1,2 @@
+epoch,effective_rank,mean_cosine_sim,dead_dims_ratio,feature_std_mean,inter_subject_var,encoder_weight_norm
+1,101.955215,0.163683,0.000000,0.918712,0.872059,3.290323
