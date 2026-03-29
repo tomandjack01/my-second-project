@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Patel × DDM 结合点数学描述</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '$', right: '$', display: false}
+    ]
+  });"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  h1 + p { color: var(--text-muted); margin-bottom: 2rem; }
+  h2 {
+    font-size: 1.4rem;
+    color: var(--accent);
+    margin-top: 2.5rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.1rem; color: var(--purple); margin: 1.2rem 0 0.6rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.5rem;
+    margin: 1rem 0;
+  }
+  .card.green  { border-left: 4px solid var(--green); }
+  .card.orange { border-left: 4px solid var(--orange); }
+  .card.red    { border-left: 4px solid var(--red); }
+  .card.purple { border-left: 4px solid var(--purple); }
+  .card .label {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 0.6rem;
+  }
+  .card.green  .label { background: rgba(63,185,80,0.2); color: var(--green); }
+  .card.orange .label { background: rgba(210,153,34,0.2); color: var(--orange); }
+  .card.red    .label { background: rgba(248,81,73,0.2);  color: var(--red); }
+  .card.purple .label { background: rgba(188,140,255,0.2); color: var(--purple); }
+  .formula-box {
+    background: rgba(88,166,255,0.05);
+    border: 1px solid rgba(88,166,255,0.15);
+    border-radius: 6px;
+    padding: 1rem 1.2rem;
+    margin: 0.8rem 0;
+    overflow-x: auto;
+  }
+  .key-formula {
+    background: rgba(63,185,80,0.08);
+    border: 2px solid rgba(63,185,80,0.3);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  th, td {
+    padding: 0.5rem 0.8rem;
+    border: 1px solid var(--border);
+    text-align: left;
+  }
+  th { background: rgba(88,166,255,0.1); color: var(--accent); }
+  .tag {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .tag-frozen { background: rgba(139,148,158,0.2); color: var(--text-muted); }
+  .tag-init   { background: rgba(210,153,34,0.2); color: var(--orange); }
+  .tag-grad   { background: rgba(63,185,80,0.2); color: var(--green); }
+  .tag-no     { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tag-yes    { background: rgba(63,185,80,0.15); color: var(--green); }
+  p { margin: 0.5rem 0; }
+  code {
+    background: rgba(110,118,129,0.2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .arrow { color: var(--accent); font-weight: bold; }
+  .katex-display { margin: 0.6rem 0 !important; }
+  .note {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    font-style: italic;
+    margin: 0.4rem 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>Patel × 扩散模型：所有结合点</h1>
+<p>8 个数学结合点的完整公式描述</p>
+
+<!-- ==================== SECTION 0 ==================== -->
+<h2>0. Patel 统计量定义</h2>
+
+<p>给定 fMRI 数据 $X \in \mathbb{R}^{T \times N}$，Patel 算法产出三个矩阵。</p>
+
+<h3>二值化</h3>
+<p>对每个节点 $i$，取 10/90 分位数归一化到 $[0,1]$，阈值 0.75 得到 $B \in \{0,1\}^{T \times N}$。</p>
+
+<h3>联合概率</h3>
+<div class="formula-box">
+$$\theta_1[i,j] = P(B_i\!=\!1,\, B_j\!=\!1), \quad \theta_2[i,j] = P(B_i\!=\!1,\, B_j\!=\!0)$$
+$$\theta_3[i,j] = P(B_i\!=\!0,\, B_j\!=\!1), \quad \theta_4[i,j] = P(B_i\!=\!0,\, B_j\!=\!0)$$
+</div>
+
+<h3>Kappa（对称关联强度）</h3>
+<div class="formula-box">
+$$E = (\theta_1 + \theta_2)(\theta_1 + \theta_3) \quad \text{（独立性假设下的期望）}$$
+$$\kappa[i,j] = \frac{\theta_1 - E}{\delta \cdot (\max\theta_1 - E) + (1-\delta)(E - \min\theta_1)}$$
+</div>
+<p class="note">$\delta$ 取决于 $\theta_1$ 和 $E$ 的大小关系（详见 <code>patel_util.py:84-139</code>）。</p>
+
+<h3>Tau（方向先验）</h3>
+<div class="formula-box">
+$$\tau[i,j] = \begin{cases} 1 - \dfrac{\theta_1 + \theta_3}{\theta_1 + \theta_2} & \text{if } \theta_2[i,j] > \theta_3[i,j] \\[8pt] \dfrac{\theta_1 + \theta_2}{\theta_1 + \theta_3} - 1 & \text{otherwise} \end{cases}$$
+</div>
+<p>代码返回 $-\tau$。<strong>核心含义</strong>：$\theta_2 > \theta_3$ 表示"$i$ 单独活跃的概率 > $j$ 单独活跃的概率"，暗示 $i$ 可能是原因。</p>
+
+<h3>Score（综合得分）</h3>
+<div class="formula-box">
+$$S = -\kappa \cdot \tau$$
+</div>
+
+<!-- ==================== SECTION 1 ==================== -->
+<h2>结合点 ① — Support 嵌入的 SVD 初始化</h2>
+
+<div class="card orange">
+  <div class="label">一次性初始化</div>
+  <p><strong>输入</strong>：$S = -\kappa \cdot \tau \in \mathbb{R}^{N \times N}$（非对称）</p>
+
+  <h3>SVD 分解 + 截断</h3>
+  <div class="formula-box">
+  $$S = U \Sigma V^T \quad \xrightarrow{\text{截断}} \quad \tilde{U} = U_{:,:d},\; \tilde{\Sigma} = \text{diag}(\sigma_1, \dots, \sigma_d),\; \tilde{V} = V_{:,:d}$$
+  </div>
+
+  <h3>嵌入初始化</h3>
+  <div class="formula-box">
+  $$E_s^{(0)} = \tilde{U} \cdot \sqrt{\tilde{\Sigma}} \cdot c, \qquad E_r^{(0)} = \tilde{V} \cdot \sqrt{\tilde{\Sigma}} \cdot c$$
+  </div>
+  <p>其中缩放系数 $c = \sqrt{\dfrac{\sigma_{\text{target}}}{\text{std}(E_s^{(0)} {E_r^{(0)}}^T)}}$ 使初始 logits 的标准差为 <code>init_logit_scale</code>。</p>
+
+  <h3>重建关系</h3>
+  <div class="formula-box">
+  $$E_s^{(0)} \cdot {E_r^{(0)}}^T \;\approx\; c^2 \cdot S \;=\; c^2 \cdot (-\kappa \cdot \tau)$$
+  </div>
+  <p class="note">初始 support logits ≈ Patel score 的缩放版。训练后会被梯度覆盖。</p>
+</div>
+
+<!-- ==================== SECTION 2 ==================== -->
+<h2>结合点 ② — Kappa Logit Bias（持久骨架锚定）</h2>
+
+<div class="card red">
+  <div class="label">Frozen — 不可学习</div>
+
+  <h3>构造</h3>
+  <div class="formula-box">
+  $$P_\kappa[i,j] = \max\big(\kappa[i,j],\; \kappa[j,i]\big), \qquad P_\kappa[i,i] = 0$$
+  </div>
+  <p>$P_\kappa$ 是<strong>对称、非负</strong>的——只编码关联强度，不编码方向。</p>
+
+  <h3>在每次 forward 中加入 support logits</h3>
+  <div class="formula-box key-formula">
+  $$L_{\text{support}}[i,j] = \underbrace{E_s \cdot E_r^T + b}_{\text{可学习部分}} + \underbrace{\lambda_\kappa \cdot P_\kappa[i,j]}_{\text{frozen Patel 锚}}$$
+  </div>
+
+  <h3>对称化</h3>
+  <div class="formula-box">
+  $$L_{\text{support}} \;\leftarrow\; \frac{1}{2}\big(L_{\text{support}} + L_{\text{support}}^T\big)$$
+  </div>
+  <p><strong>作用</strong>：即使可学习嵌入偏移，$P_\kappa$ 始终把高 kappa 节点对往"边存在"方向拉。</p>
+</div>
+
+<!-- ==================== SECTION 3 ==================== -->
+<h2>结合点 ③ — Maxgap 骨架硬掩码</h2>
+
+<div class="card red">
+  <div class="label">Frozen — 不可学习</div>
+
+  <h3>排序 + 最大间隔切割</h3>
+  <p>取 $P_\kappa$ 的上三角值（$i < j$），降序排列：$s_1 \geq s_2 \geq \cdots \geq s_M$</p>
+  <div class="formula-box">
+  $$k^* = \arg\max_{k \in [1,\, M-1]} \big(s_k - s_{k+1}\big)$$
+  </div>
+
+  <h3>二值掩码</h3>
+  <div class="formula-box">
+  $$F[i,j] = F[j,i] = \begin{cases} 1 & \text{if 对 } (i,j) \text{ 在 top-}k^* \text{ 中} \\ 0 & \text{otherwise} \end{cases}$$
+  </div>
+
+  <h3>硬约束乘入</h3>
+  <div class="formula-box key-formula">
+  $$W_{\text{support}}[i,j] = \sigma\big(L_{\text{support}}[i,j]\big) \cdot (1 - \delta_{ij}) \cdot F[i,j]$$
+  </div>
+  <p><strong>含义</strong>：不在 maxgap 骨架里的边<strong>永远为零</strong>。模型只能在 Patel 选出的 $k^*$ 条无向边上学习。</p>
+</div>
+
+<!-- ==================== SECTION 4 ==================== -->
+<h2>结合点 ④ — 前向扩散噪声引导</h2>
+
+<div class="card red">
+  <div class="label">Frozen — 不可学习</div>
+
+  <h3>噪声引导矩阵</h3>
+  <div class="formula-box">
+  $$\tilde{F} = F + I_N, \qquad G_{\text{noise}}[i,j] = \frac{\tilde{F}[i,j]}{\sum_k \tilde{F}[i,k]}$$
+  </div>
+  <p>$G_{\text{noise}}$ 是行随机矩阵（每行和为 1），对称（因为 $F$ 对称）。</p>
+
+  <h3>噪声生成</h3>
+  <div class="formula-box">
+  $$\sigma_i^2 = \sum_j G_{\text{noise}}[i,j] \cdot x_j^2 - \Big(\sum_j G_{\text{noise}}[i,j] \cdot x_j\Big)^2$$
+  $$\varepsilon_i \sim \mathcal{N}(0,1), \qquad \text{noise}_i = \text{LayerNorm}(\varepsilon_i \cdot \sigma_i)$$
+  </div>
+
+  <h3>前向扩散</h3>
+  <div class="formula-box">
+  $$x_t = \sqrt{\bar\alpha_t}\, x_{\text{clean}} + \sqrt{1-\bar\alpha_t}\, \text{noise}$$
+  </div>
+  <p class="note">节点间 $\varepsilon_i$ 独立采样 → 无跨节点噪声相关性 → 噪声不编码方向。</p>
+</div>
+
+<!-- ==================== SECTION 5 ==================== -->
+<h2>结合点 ⑤ — Direction Gate 初始化</h2>
+
+<div class="card orange">
+  <div class="label">一次性初始化</div>
+
+  <p>与结合点 ① 相同的 SVD 流程，输入为 Patel $\tau$ 或零矩阵：</p>
+  <div class="formula-box">
+  $$\tau_{\text{init}} \;\xrightarrow{\;\text{SVD}\;}\; D_s^{(0)},\, D_r^{(0)} \in \mathbb{R}^{N \times d}$$
+  </div>
+
+  <h3>Direction logits</h3>
+  <div class="formula-box">
+  $$L_{\text{dir}}[i,j] = D_s \cdot D_r^T$$
+  </div>
+
+  <h3>Direction gate（核心公式）</h3>
+  <div class="formula-box key-formula">
+  $$G_{\text{dir}}[i,j] = \sigma\big(L_{\text{dir}}[i,j] - L_{\text{dir}}[j,i]\big)$$
+  </div>
+
+  <p><strong>性质</strong>：$G_{\text{dir}}[i,j] + G_{\text{dir}}[j,i] = 1$（互补门控）</p>
+  <ul>
+    <li>$L_{\text{dir}}[i,j] > L_{\text{dir}}[j,i]$ → $G_{\text{dir}}[i,j] > 0.5$ → $i \to j$ 方向权重更大</li>
+    <li>$L_{\text{dir}}[i,j] = L_{\text{dir}}[j,i]$ → 两方向 $= 0.5$（对称 / 无方向）</li>
+  </ul>
+</div>
+
+<!-- ==================== SECTION 6 ==================== -->
+<h2>结合点 ⑥ — 方向 Margin Loss ☆</h2>
+
+<div class="card green">
+  <div class="label">持续梯度 — 唯一方向信号源</div>
+
+  <h3>方向先验差</h3>
+  <div class="formula-box">
+  $$\Delta_P[i,j] = \tau[i,j] - \tau[j,i]$$
+  </div>
+
+  <h3>自适应置信门</h3>
+  <div class="formula-box">
+  $$q = \text{median}\big\{|\Delta_P[i,j]| : |\Delta_P[i,j]| > 0\big\}$$
+  $$\text{active}[i,j] = \mathbb{1}\big[|\Delta_P[i,j]| > q\big]$$
+  </div>
+
+  <h3>加权</h3>
+  <div class="formula-box">
+  $$w[i,j] = \text{active}[i,j] \cdot |\Delta_P[i,j]|$$
+  </div>
+
+  <h3>有符号方向得分</h3>
+  <div class="formula-box">
+  $$D[i,j] = L_{\text{dir}}[i,j] - L_{\text{dir}}[j,i] \quad \text{（模型当前方向差）}$$
+  $$\text{signed}_D[i,j] = \text{sign}(\Delta_P[i,j]) \cdot D[i,j]$$
+  </div>
+  <p>正值 = 模型方向和 Patel 一致，负值 = 方向错误。</p>
+
+  <h3>自适应 margin</h3>
+  <div class="formula-box">
+  $$m = \max\big(1.0,\; Q_{0.25}(\text{signed}_D[\text{active}])\big)$$
+  </div>
+
+  <h3>最终损失</h3>
+  <div class="formula-box key-formula">
+  $$\boxed{\mathcal{L}_{\text{dir}} = \frac{\displaystyle\sum_{i,j}\; w[i,j] \cdot \text{ReLU}\big(m - \text{signed}_D[i,j]\big)}{\displaystyle\sum_{i,j}\; w[i,j] + \varepsilon}}$$
+  </div>
+
+  <h3>自适应权重系数</h3>
+  <div class="formula-box">
+  $$\lambda_{\text{dir}} = \text{EMA}\bigg(\min\Big(\frac{\mathcal{L}_{\text{main}} \cdot r_{\text{target}}}{\mathcal{L}_{\text{dir}} + \varepsilon} \cdot f_{\text{anneal}},\; 0.5\Big)\bigg)$$
+  </div>
+  <p>$r_{\text{target}} = 0.01$，$f_{\text{anneal}}$ = warmup + cosine anneal。</p>
+</div>
+
+<!-- ==================== SECTION 7 ==================== -->
+<h2>结合点 ⑦ — Kappa Gate（边筛选器）</h2>
+
+<div class="card red">
+  <div class="label">Frozen — 不可学习</div>
+
+  <div class="formula-box">
+  $$P_\kappa^{\text{sym}}[i,j] = \max(\kappa[i,j],\; \kappa[j,i])$$
+  $$q_\kappa = \text{quantile}_{p}\big(P_\kappa^{\text{sym}}[\text{off-diag}]\big)$$
+  $$\text{KappaGate}[i,j] = \mathbb{1}\big[P_\kappa^{\text{sym}}[i,j] > q_\kappa\big]$$
+  </div>
+  <p>在 Margin Loss（结合点 ⑥）中额外约束：</p>
+  <div class="formula-box">
+  $$\text{active}[i,j] \;\leftarrow\; \text{active}[i,j] \;\wedge\; \text{KappaGate}[i,j]$$
+  </div>
+  <p><strong>含义</strong>：只在 Patel 认为关联强度高的节点对上施加方向监督。</p>
+</div>
+
+<!-- ==================== FINAL ADJ ==================== -->
+<h2>最终邻接矩阵</h2>
+
+<div class="card purple">
+  <div class="label">核心输出</div>
+  <div class="formula-box key-formula">
+  $$\boxed{A[i,j] = \underbrace{\sigma\!\left(\frac{L_{\text{sup}} + L_{\text{sup}}^T}{2}\right) \cdot F_{\text{maxgap}}}_{\text{Support（哪些边存在）}} \;\times\; \underbrace{\sigma\big(L_{\text{dir}}[i,j] - L_{\text{dir}}[j,i]\big)}_{\text{Direction Gate（谁影响谁）}}}$$
+  </div>
+  <p>其中 $L_{\text{sup}} = E_s E_r^T + b + \lambda_\kappa P_\kappa$</p>
+</div>
+
+<!-- ==================== SECTION 8 ==================== -->
+<h2>结合点 ⑧ — Best-Epoch 质量评分</h2>
+
+<div class="card red">
+  <div class="label">Frozen — 基于 Patel 的选择器</div>
+
+  <div class="formula-box">
+  $$\text{score} = \underbrace{0.35 \cdot \text{skel\_overlap}}_{\text{与 Patel } \kappa \text{ top-k 重叠}} + \underbrace{0.25 \cdot \text{agree\_score}}_{\text{与 Patel } \tau \text{ 方向一致率}} + 0.20 \cdot \text{density} + 0.15 \cdot \text{margin} + 0.05 \cdot \text{asym}$$
+  </div>
+  <p class="note">60% 的权重直接衡量模型输出与 Patel 的一致性。</p>
+</div>
+
+<!-- ==================== SUMMARY TABLE ==================== -->
+<h2>总结：8 个结合点一览</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>结合点</th>
+      <th>Patel 输入</th>
+      <th>可学习?</th>
+      <th>方向?</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>①</td>
+      <td>SVD Init → support</td>
+      <td>$S = -\kappa\tau$</td>
+      <td><span class="tag tag-init">初始值</span></td>
+      <td><span class="tag tag-yes">✓ 通过 τ</span></td>
+    </tr>
+    <tr>
+      <td>②</td>
+      <td>Kappa Logit Bias</td>
+      <td>$\max(\kappa, \kappa^T)$</td>
+      <td><span class="tag tag-frozen">frozen</span></td>
+      <td><span class="tag tag-no">✗ 对称</span></td>
+    </tr>
+    <tr>
+      <td>③</td>
+      <td>Maxgap Mask</td>
+      <td>$\max(\kappa, \kappa^T)$</td>
+      <td><span class="tag tag-frozen">frozen</span></td>
+      <td><span class="tag tag-no">✗ 对称</span></td>
+    </tr>
+    <tr>
+      <td>④</td>
+      <td>Noise Guide</td>
+      <td>maxgap 骨架</td>
+      <td><span class="tag tag-frozen">frozen</span></td>
+      <td><span class="tag tag-no">✗ 对称</span></td>
+    </tr>
+    <tr>
+      <td>⑤</td>
+      <td>Direction Init</td>
+      <td>$\tau$ 或 $\mathbf{0}$</td>
+      <td><span class="tag tag-init">初始值</span></td>
+      <td><span class="tag tag-yes">✓</span></td>
+    </tr>
+    <tr>
+      <td>⑥</td>
+      <td>Margin Loss ☆</td>
+      <td>$\tau$</td>
+      <td><span class="tag tag-grad">每步梯度</span></td>
+      <td><span class="tag tag-yes">✓ 主力</span></td>
+    </tr>
+    <tr>
+      <td>⑦</td>
+      <td>Kappa Gate</td>
+      <td>$\max(\kappa, \kappa^T)$</td>
+      <td><span class="tag tag-frozen">frozen</span></td>
+      <td><span class="tag tag-no">✗ 筛选器</span></td>
+    </tr>
+    <tr>
+      <td>⑧</td>
+      <td>Quality Score</td>
+      <td>$\kappa + \tau$</td>
+      <td><span class="tag tag-frozen">frozen</span></td>
+      <td><span class="tag tag-yes">✓ 隐式</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="card green" style="margin-top: 2rem;">
+  <div class="label">核心结论</div>
+  <p><strong>绿色</strong>（Margin Loss ⑥）是唯一持续向方向参数提供 Patel $\tau$ 梯度的路径。</p>
+  <p><strong>橙色</strong>（去噪损失）通过 $A = \text{support} \times \text{gate}$ 间接影响方向参数，但实验证明其在方向上是 <strong>anti-retentive</strong> 的（push_correct $\approx$ 0.48 < 0.5）。</p>
+  <p>其余路径要么 frozen（②③④⑦），要么是一次性初始化（①⑤）。</p>
+</div>
+
+</body>
+</html>

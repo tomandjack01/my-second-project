@@ -1,6 +1,6 @@
 # Cross-Prediction V1 Tracker
 
-Last updated: 2026-03-20
+Last updated: 2026-03-21
 
 ## Goal
 
@@ -108,6 +108,8 @@ First proper experiment:
 - [x] `sparsemax` cap-ablation pilot on `sim3` completed
 - [x] `sparsemax + no-cap` formal on `sim3` completed
 - [x] `sim4` sparsemax scale / symmetry / message-direction follow-up completed
+- [x] Goal 4B retention formal follow-up completed
+- [x] Remaining-data extension on `sim2` and `fMRI.csv` completed
 
 ## Implemented Code Paths
 
@@ -5615,3 +5617,311 @@ Paired comparison against the GPU `0.30` anchor:
   - if Goal 4A is revisited formally, it should likely be:
     - shorter pilot first
     - or paired with lighter runtime settings
+
+### Experiment: Goal 4B direction-retention formal follow-up on `sim4` (`3` seeds)
+
+- Objective:
+  - test whether simple retention interventions can preserve the strong
+    best-epoch direction quality of the current full branch through the final
+    epoch
+  - compare the two most promising settings from the `seed=11` smoke run:
+    - freeze direction updates after epoch `30`
+    - freeze after epoch `30` plus lower direction learning-rate multiplier
+
+- Setup:
+  - dataset:
+    - `sim4.csv`
+  - seeds:
+    - `11,22,33`
+  - common branch:
+    - `structure_parameterization = support_direction`
+    - `fixed_support_mask_mode = maxgap_kappa`
+    - `direction_init_mode = random`
+    - `structure_init_mode = patel_kappa`
+    - `structure_init_scale = 0.5`
+    - `adj_activation = sigmoid`
+    - `directional_prior_mode = patel`
+    - `directional_schedule = plateau`
+    - `directional_kappa_gate = True`
+    - `directional_kappa_gate_quantile = 0.50`
+    - `directional_target_ratio = 0.01`
+    - `main_loss_weight = 1.0`
+    - `selection_agreement_weight = 0.0`
+  - treatments:
+    - `direction_lr_multiplier = 1.0`, `freeze_direction_after_epoch = 30`
+    - `direction_lr_multiplier = 0.3`, `freeze_direction_after_epoch = 30`
+  - comparison baseline:
+    - same-seed slice (`11,22,33`) from the earlier formal current-best run
+    - baseline config:
+      - `direction_lr_multiplier = 1.0`
+      - `freeze_direction_after_epoch = -1`
+
+- Artifacts:
+  - summary:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_3seeds_20260321_140850_goal4b_retention_sim4_formal3_freeze30.csv`
+  - aggregate:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_3seeds_20260321_140850_goal4b_retention_sim4_formal3_freeze30_aggregate.csv`
+  - shell log:
+    - `GraphExp/results/goal4b_retention_sim4_formal3_freeze30_shell.log`
+  - historical same-seed baseline source:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_5seeds_20260317_172003_sim4_support_direction_maxgap_formal.csv`
+
+- Aggregate result summary:
+  - historical same-seed baseline (`dir_lr_mult=1.0`, `freeze=-1`)
+    - failure mode:
+      - `symmetric_collapse` in `3/3` seeds
+    - best epoch:
+      - `best_strict_f1 @ eps=0 = 0.8033`
+      - `best_strict_f1 @ eps=3e-4 = 0.8054`
+      - `best_gt_margin_median = 0.0410`
+    - final epoch:
+      - `strict_f1 @ eps=0 = 0.7322`
+      - `strict_f1 @ eps=3e-4 = 0.7272`
+      - `best_final_gap_strict_f1 = 0.0710`
+      - `best_final_gap_strict_f1 @ eps=3e-4 = 0.0783`
+      - `gt_margin_median = 0.0099`
+      - `best_final_gap_gt_margin_median = 0.0311`
+      - `final_diff_loss = 1.0974`
+  - freeze only (`dir_lr_mult=1.0`, `freeze=30`)
+    - failure mode:
+      - `symmetric_collapse` in `3/3` seeds
+    - best epoch:
+      - `best_strict_f1 @ eps=0 = 0.8142`
+      - `best_strict_f1 @ eps=3e-4 = 0.8142`
+      - `best_gt_margin_median = 0.0410`
+    - final epoch:
+      - `strict_f1 @ eps=0 = 0.7978`
+      - `strict_f1 @ eps=3e-4 = 0.8011`
+      - `best_final_gap_strict_f1 = 0.0164`
+      - `best_final_gap_strict_f1 @ eps=3e-4 = 0.0131`
+      - `gt_margin_median = 0.0124`
+      - `best_final_gap_gt_margin_median = 0.0286`
+      - `final_diff_loss = 1.0980`
+  - low-LR plus freeze (`dir_lr_mult=0.3`, `freeze=30`)
+    - failure mode:
+      - `symmetric_collapse` in `3/3` seeds
+    - best epoch:
+      - `best_strict_f1 @ eps=0 = 0.7978`
+      - `best_strict_f1 @ eps=3e-4 = 0.7879`
+      - `best_gt_margin_median = 0.0193`
+    - final epoch:
+      - `strict_f1 @ eps=0 = 0.7869`
+      - `strict_f1 @ eps=3e-4 = 0.7912`
+      - `best_final_gap_strict_f1 = 0.0109`
+      - `best_final_gap_strict_f1 @ eps=3e-4 = -0.0033`
+      - `gt_margin_median = 0.0124`
+      - `best_final_gap_gt_margin_median = 0.0068`
+      - `final_diff_loss = 1.1143`
+
+- Interpretation / Thoughts:
+  - freezing direction updates after epoch `30` is the first intervention that
+    clearly improves final retention on `sim4` without sacrificing best-epoch
+    quality
+    - versus the historical same-seed baseline:
+      - `strict_f1 @ eps=0: 0.7322 -> 0.7978`
+      - `best_final_gap_strict_f1: 0.0710 -> 0.0164`
+  - adding lower direction LR on top of the freeze shrinks the best-final gap
+    even further, but it does so by compressing the whole margin scale
+    - `best_gt_margin_median: 0.0410 -> 0.0193`
+    - `best_strict_f1 @ eps=0: 0.8142 -> 0.7978`
+  - neither treatment resolves the deeper failure mode
+    - all seeds still end in `symmetric_collapse`
+    - final signed margins remain very small (`~0.0124`)
+  - this means Goal 4B is a retention repair, not a mechanism repair
+    - it keeps the factorized Patel-guided direction signal alive longer
+    - it does not make diffusion become direction-discovering
+
+- Practical conclusion:
+  - under the current Option A framing, `freeze_direction_after_epoch = 30`
+    should be treated as the default retention fix
+  - among the tested settings, the best trade-off is:
+    - keep `direction_lr_multiplier = 1.0`
+    - freeze direction updates after epoch `30`
+  - the lower-LR variant is useful if the sole target is minimizing best-final
+    drift, but it is not the best headline setting because it also lowers the
+    peak margin / strict-F1 operating point
+
+### Experiment: current recommended retention-fix branch on `sim2` (`5` seeds)
+
+- Objective:
+  - verify whether the current Option A headline configuration also transfers to
+    the remaining synthetic dataset
+  - use the now-recommended retention setting directly:
+    - `direction_lr_multiplier = 1.0`
+    - `freeze_direction_after_epoch = 30`
+
+- Setup:
+  - dataset:
+    - `sim2.csv`
+  - seeds:
+    - `11,22,33,44,55`
+  - config:
+    - `structure_parameterization = support_direction`
+    - `fixed_support_mask_mode = maxgap_kappa`
+    - `direction_init_mode = random`
+    - `structure_init_mode = patel_kappa`
+    - `structure_init_scale = 0.5`
+    - `adj_activation = sigmoid`
+    - `directional_prior_mode = patel`
+    - `directional_schedule = plateau`
+    - `directional_kappa_gate = True`
+    - `directional_kappa_gate_quantile = 0.50`
+    - `directional_target_ratio = 0.01`
+    - `lambda_l1 = 0.02`
+    - `optimizer_step_mode = subject`
+    - `main_loss_weight = 1.0`
+    - `selection_agreement_weight = 0.0`
+    - `direction_lr_multiplier = 1.0`
+    - `freeze_direction_after_epoch = 30`
+    - `strict_margin_eps in {0, 3e-4, 0.1}`
+
+- Artifacts:
+  - summary:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_5seeds_20260321_180424_sim2_support_direction_maxgap_retentionfreeze30_formal.csv`
+  - aggregate:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_5seeds_20260321_180424_sim2_support_direction_maxgap_retentionfreeze30_formal_aggregate.csv`
+  - shell log:
+    - `GraphExp/results/goal_all_data_sim2_formal_shell.log`
+
+- Aggregate result summary:
+  - failure mode:
+    - `mixed_or_partial` in `5/5` seeds
+  - best epoch:
+    - `best_strict_f1 @ eps=0 = 0.7818`
+    - `best_strict_f1 @ eps=3e-4 = 0.7818`
+    - `best_strict_f1 @ eps=0.1 = 0.7205`
+    - `best_gt_margin_median = 0.1763`
+  - final epoch:
+    - `strict_f1 @ eps=0 = 0.8364`
+    - `strict_f1 @ eps=3e-4 = 0.8364`
+    - `strict_f1 @ eps=0.1 = 0.1441`
+    - `best_final_gap_strict_f1 = -0.0545`
+    - `gt_margin_median = 0.0496`
+    - `best_final_gap_gt_margin_median = 0.1267`
+    - `final_diff_loss = 1.1489`
+
+- Interpretation / Thoughts:
+  - `sim2` behaves differently from `sim3` / `sim4`
+    - on the primary strict metric (`eps=0`), the final epoch is actually
+      slightly better than the exported best checkpoint
+  - this suggests the retention problem is not universal across the synthetic
+    suite
+    - it is concentrated on the harder benchmarks
+  - however, `sim2` is not "solved perfectly"
+    - the signed margin scale still shrinks substantially:
+      - `0.1763 -> 0.0496`
+    - the large deadzone metric also drops sharply:
+      - `strict_f1 @ eps=0.1: 0.7205 -> 0.1441`
+  - so the correct reading is:
+    - the recommended branch transfers cleanly to `sim2`
+    - but the final solution is still mostly low-margin rather than strongly
+      separated
+
+- Practical conclusion:
+  - the current recommended Option A configuration is now verified on all three
+    synthetic datasets:
+    - `sim2`
+    - `sim3`
+    - `sim4`
+  - the retention bottleneck remains a `sim3` / `sim4` story, not a full-suite
+    story
+
+### Experiment: full `fMRI.csv` formal evaluation with the current retention-fix branch (`5` seeds)
+
+- Objective:
+  - evaluate the current recommended Option A branch on the full
+    synthetic `fMRI.csv` benchmark using the available directed reference graph
+    - dataset: `fMRI.csv`
+    - GT: `h1.txt`
+  - determine whether the current retention fix also solves checkpoint
+    selection on this small synthetic `fMRI.csv` setting
+
+- Setup:
+  - dataset:
+    - `fMRI.csv`
+    - `50` subjects
+    - `5` nodes
+    - `200` time points per subject
+  - GT:
+    - `h1.txt`
+    - `5` directed edges / `5` undirected pairs
+  - seeds:
+    - `11,22,33,44,55`
+  - config:
+    - `structure_parameterization = support_direction`
+    - `fixed_support_mask_mode = maxgap_kappa`
+    - `direction_init_mode = random`
+    - `structure_init_mode = patel_kappa`
+    - `structure_init_scale = 0.5`
+    - `adj_activation = sigmoid`
+    - `directional_prior_mode = patel`
+    - `directional_schedule = plateau`
+    - `directional_kappa_gate = True`
+    - `directional_kappa_gate_quantile = 0.50`
+    - `directional_target_ratio = 0.01`
+    - `lambda_l1 = 0.02`
+    - `optimizer_step_mode = subject`
+    - `main_loss_weight = 1.0`
+    - `selection_agreement_weight = 0.0`
+    - `direction_lr_multiplier = 1.0`
+    - `freeze_direction_after_epoch = 30`
+    - `strict_margin_eps in {0, 3e-4, 0.1}`
+
+- Artifacts:
+  - summary:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_5seeds_20260321_202949_fmri_support_direction_maxgap_retentionfreeze30_formal.csv`
+  - aggregate:
+    - `GraphExp/results/cross_pred_v1_final_only_compare_patel_kappa_dir_patel_5seeds_20260321_202949_fmri_support_direction_maxgap_retentionfreeze30_formal_aggregate.csv`
+  - shell log:
+    - `GraphExp/results/goal_all_data_fmri_formal_shell.log`
+  - preliminary single-run diagnostics retained for inspection:
+    - `GraphExp/results/goal_all_data_fmri_seed11_shell.log`
+    - `GraphExp/results/goal_all_data_fmri_seed22_shell.log`
+    - `GraphExp/results/goal_all_data_fmri_seed33_shell.log`
+
+- Aggregate result summary:
+  - failure mode:
+    - `mixed_or_partial` in `5/5` seeds
+  - exported / "best" checkpoint:
+    - `best_strict_f1 @ eps=0 = 0.4000`
+    - `best_strict_f1 @ eps=3e-4 = 0.4000`
+    - `best_strict_f1 @ eps=0.1 = 0.2960`
+    - `best_gt_margin_median = -0.0669`
+  - final epoch:
+    - `strict_f1 @ eps=0 = 0.7200`
+    - `strict_f1 @ eps=3e-4 = 0.7200`
+    - `strict_f1 @ eps=0.1 = 0.2286`
+    - `best_final_gap_strict_f1 = -0.3200`
+    - `gt_margin_median = 0.0375`
+    - `best_final_gap_gt_margin_median = -0.1044`
+    - `final_diff_loss = 1.1017`
+
+- Interpretation / Thoughts:
+  - `fMRI.csv` does have a usable GT, so the correct conclusion is stronger than
+    the earlier diagnostic-only reading:
+    - the branch reaches a **reasonable final direction score**
+      - `strict_f1 @ eps=0 = 0.7200`
+  - however, the real failure on this dataset is now very clear:
+    - the exported checkpoint is dramatically worse than the final epoch
+      - `best_strict_f1 @ eps=0 = 0.4000`
+      - `final_strict_f1 @ eps=0 = 0.7200`
+  - this is the opposite of the `sim3` / `sim4` retention story
+    - on `fMRI.csv`, the problem is not that the final epoch collapses below a
+      good early checkpoint
+    - it is that the current checkpoint-selection proxy picks a bad early
+      checkpoint and misses the later improvement
+  - the negative exported margin median (`-0.0669`) reinforces that diagnosis:
+    - the selected checkpoint can be directionally wrong even when the final
+      epoch is directionally useful
+
+- Practical conclusion:
+  - the current recommended Option A branch now has full-benchmark evidence:
+    - `sim2`, `sim3`, `sim4`, and `fMRI.csv` have all been run
+  - but the bottleneck is now dataset-dependent:
+    - `sim3` / `sim4`:
+      - retention to the final epoch is the main issue
+    - `fMRI.csv`:
+      - checkpoint selection is the main issue
+  - for the synthetic `fMRI.csv` benchmark, the defensible statement is:
+    - the branch can reach `~0.72` strict F1 on `fMRI.csv`
+    - but the current best-epoch selector is not yet trustworthy there

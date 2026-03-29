@@ -20,7 +20,7 @@ import argparse
 import math
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -730,6 +730,8 @@ def compute_direction_grad_alignment_diagnostics(
     patel_direction_matrix: torch.Tensor,
     directional_pair_gate_matrix: Optional[torch.Tensor],
     lambda_dir_effective: float,
+    fixed_direction_prior_matrix: Optional[torch.Tensor] = None,
+    direction_prior_reliability_matrix: Optional[torch.Tensor] = None,
     seed: int = 0,
 ) -> Dict[str, float]:
     """Compare diffusion-vs-directional gradients on the separate direction branch."""
@@ -773,18 +775,22 @@ def compute_direction_grad_alignment_diagnostics(
             hub_loss = 0.01 * (sender_norms.var() + receiver_norms.var())
             loss_ddm_main = loss + sparsity_loss + hub_loss
 
-            direction_prior_matrix = compute_online_direction_prior_matrix(
-                model=model,
-                x=x,
-                mode=directional_prior_mode,
-                patel_direction_matrix=patel_direction_matrix,
-                lag_direction_source=lag_direction_source,
-            )
+            if fixed_direction_prior_matrix is not None:
+                direction_prior_matrix = fixed_direction_prior_matrix
+            else:
+                direction_prior_matrix = compute_online_direction_prior_matrix(
+                    model=model,
+                    x=x,
+                    mode=directional_prior_mode,
+                    patel_direction_matrix=patel_direction_matrix,
+                    lag_direction_source=lag_direction_source,
+                )
             causal_logits = get_current_directional_logits(model, causal=True)
             raw_loss_dir = compute_directional_margin_loss(
                 causal_logits,
                 direction_prior_matrix,
                 pair_gate_matrix=directional_pair_gate_matrix,
+                pair_reliability_matrix=direction_prior_reliability_matrix,
             )
             weighted_loss_dir = raw_loss_dir * float(lambda_dir_effective)
 
@@ -977,11 +983,45 @@ def build_kappa_gate_matrix(
     return gate, threshold, pair_frac
 
 
+def build_directional_active_mask(
+    direction_prior_matrix: torch.Tensor,
+    pair_gate_matrix: Optional[torch.Tensor] = None,
+    pair_reliability_matrix: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Build the confidence-weighted active mask for directional supervision."""
+    delta_prior = direction_prior_matrix - direction_prior_matrix.t()
+    abs_delta_prior = torch.abs(delta_prior)
+    nonzero_vals = abs_delta_prior[abs_delta_prior > 0]
+    if nonzero_vals.numel() == 0:
+        empty_mask = torch.zeros_like(abs_delta_prior, dtype=torch.bool)
+        empty_weight = torch.zeros_like(abs_delta_prior)
+        return delta_prior, empty_mask, empty_weight, 0.0
+
+    q_threshold = float(nonzero_vals.median().item())
+    active_mask = abs_delta_prior > q_threshold
+    if pair_gate_matrix is not None:
+        active_mask = active_mask & pair_gate_matrix.bool()
+    weight_matrix = active_mask.float() * abs_delta_prior
+    if pair_reliability_matrix is not None:
+        if pair_reliability_matrix.shape != weight_matrix.shape:
+            raise ValueError(
+                "pair_reliability_matrix must match direction_prior_matrix shape, "
+                f"got {tuple(pair_reliability_matrix.shape)} vs {tuple(weight_matrix.shape)}"
+            )
+        reliability = torch.clamp(
+            pair_reliability_matrix.to(device=weight_matrix.device, dtype=weight_matrix.dtype),
+            min=0.0,
+        )
+        weight_matrix = weight_matrix * reliability
+    return delta_prior, active_mask, weight_matrix, q_threshold
+
+
 def compute_directional_margin_loss(
     logits,
     direction_prior_matrix,
     margin=1.0,
     pair_gate_matrix: Optional[torch.Tensor] = None,
+    pair_reliability_matrix: Optional[torch.Tensor] = None,
 ):
     """
     基于 Patel 算法的高置信度先验，在 causal Logit 空间计算带 Margin 的方向引导损失。
@@ -990,22 +1030,13 @@ def compute_directional_margin_loss(
     margin 自适应：在有效边（w>0）上对 sign(delta_P)*D 取 25 分位数，
                   并以下界 margin 保持正的监督压力，避免全 tie 时梯度归零。
     """
-    delta_prior = direction_prior_matrix - direction_prior_matrix.t()
-    abs_delta_prior = torch.abs(delta_prior)
-
-    # 自适应 q_threshold：非零 |delta_P| 的中位数
-    nonzero_vals = abs_delta_prior[abs_delta_prior > 0]
-    if nonzero_vals.numel() == 0:
-        return torch.tensor(0.0, device=logits.device)
-    q_threshold = nonzero_vals.median().item()
-
-    # 只对高置信度（差值大于自适应阈值）的边施加先验
-    active_mask = abs_delta_prior > q_threshold
-    if pair_gate_matrix is not None:
-        active_mask = active_mask & pair_gate_matrix.bool()
+    delta_prior, active_mask, w, _ = build_directional_active_mask(
+        direction_prior_matrix,
+        pair_gate_matrix=pair_gate_matrix,
+        pair_reliability_matrix=pair_reliability_matrix,
+    )
     if active_mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
-    w = active_mask.float() * abs_delta_prior
 
     D = logits - logits.t()
     signed_D = torch.sign(delta_prior) * D  # 正值=方向正确，负值=方向错误
@@ -1024,6 +1055,108 @@ def compute_directional_margin_loss(
     wrong_dir_penalty = F.relu(adaptive_margin - signed_D)
     loss_dir = torch.sum(w * wrong_dir_penalty) / (torch.sum(w) + 1e-8)
     return loss_dir
+
+
+def compute_directional_anti_collapse_loss(
+    logits: torch.Tensor,
+    direction_prior_matrix: torch.Tensor,
+    margin_floor: float,
+    pair_gate_matrix: Optional[torch.Tensor] = None,
+    pair_reliability_matrix: Optional[torch.Tensor] = None,
+    mode: str = "unsigned_raw",
+) -> torch.Tensor:
+    """Keep confident directional pairs away from the symmetric tie basin."""
+    if margin_floor <= 0.0:
+        return logits.new_tensor(0.0)
+
+    delta_prior, active_mask, w, _ = build_directional_active_mask(
+        direction_prior_matrix,
+        pair_gate_matrix=pair_gate_matrix,
+        pair_reliability_matrix=pair_reliability_matrix,
+    )
+    if active_mask.sum() == 0:
+        return logits.new_tensor(0.0)
+
+    directional_delta = logits - logits.t()
+    if mode == "unsigned_raw":
+        anti_collapse_margin = torch.abs(directional_delta)
+    else:
+        signed_delta = torch.sign(delta_prior) * directional_delta
+        if mode == "signed_raw":
+            anti_collapse_margin = signed_delta
+        elif mode == "signed_gate":
+            anti_collapse_margin = torch.tanh(0.5 * signed_delta)
+        else:
+            raise ValueError(f"Unsupported anti-collapse mode: {mode}")
+
+    collapse_penalty = F.relu(float(margin_floor) - anti_collapse_margin)
+    return torch.sum(w * collapse_penalty) / (torch.sum(w) + 1e-8)
+
+
+@torch.no_grad()
+def compute_directional_margin_diagnostics(
+    logits: torch.Tensor,
+    direction_prior_matrix: torch.Tensor,
+    pair_gate_matrix: Optional[torch.Tensor] = None,
+    pair_reliability_matrix: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """Summarize directional contrast on the active supervision pairs."""
+    delta_prior, active_mask, _, q_threshold = build_directional_active_mask(
+        direction_prior_matrix,
+        pair_gate_matrix=pair_gate_matrix,
+        pair_reliability_matrix=pair_reliability_matrix,
+    )
+    if active_mask.sum() == 0:
+        return {
+            "dir_active_pair_frac": 0.0,
+            "dir_prior_q_threshold": float(q_threshold),
+            "dir_active_reliability_mean": 0.0,
+            "dir_active_reliability_median": 0.0,
+            "dir_active_reliability_p10": 0.0,
+            "dir_active_abs_margin_mean": 0.0,
+            "dir_active_abs_margin_median": 0.0,
+            "dir_active_abs_margin_p90": 0.0,
+            "dir_active_abs_margin_near0_frac": 0.0,
+            "dir_active_signed_raw_mean": 0.0,
+            "dir_active_signed_raw_median": 0.0,
+            "dir_active_signed_raw_p10": 0.0,
+            "dir_active_signed_raw_frac_pos": 0.0,
+            "dir_active_signed_gate_mean": 0.0,
+            "dir_active_signed_gate_median": 0.0,
+            "dir_active_signed_gate_p10": 0.0,
+            "dir_active_signed_gate_frac_pos": 0.0,
+        }
+
+    directional_delta = logits - logits.t()
+    directional_contrast = torch.abs(directional_delta).masked_select(active_mask)
+    signed_raw_margin = (torch.sign(delta_prior) * directional_delta).masked_select(active_mask)
+    signed_gate_margin = torch.tanh(0.5 * signed_raw_margin)
+    if pair_reliability_matrix is not None:
+        active_reliability = pair_reliability_matrix.to(
+            device=directional_delta.device,
+            dtype=directional_delta.dtype,
+        ).masked_select(active_mask)
+    else:
+        active_reliability = torch.ones_like(directional_contrast)
+    return {
+        "dir_active_pair_frac": float(active_mask.float().mean().item()),
+        "dir_prior_q_threshold": float(q_threshold),
+        "dir_active_reliability_mean": float(active_reliability.mean().item()),
+        "dir_active_reliability_median": float(torch.quantile(active_reliability, 0.50).item()),
+        "dir_active_reliability_p10": float(torch.quantile(active_reliability, 0.10).item()),
+        "dir_active_abs_margin_mean": float(directional_contrast.mean().item()),
+        "dir_active_abs_margin_median": float(torch.quantile(directional_contrast, 0.50).item()),
+        "dir_active_abs_margin_p90": float(torch.quantile(directional_contrast, 0.90).item()),
+        "dir_active_abs_margin_near0_frac": float((directional_contrast < 1e-3).float().mean().item()),
+        "dir_active_signed_raw_mean": float(signed_raw_margin.mean().item()),
+        "dir_active_signed_raw_median": float(torch.quantile(signed_raw_margin, 0.50).item()),
+        "dir_active_signed_raw_p10": float(torch.quantile(signed_raw_margin, 0.10).item()),
+        "dir_active_signed_raw_frac_pos": float((signed_raw_margin > 0.0).float().mean().item()),
+        "dir_active_signed_gate_mean": float(signed_gate_margin.mean().item()),
+        "dir_active_signed_gate_median": float(torch.quantile(signed_gate_margin, 0.50).item()),
+        "dir_active_signed_gate_p10": float(torch.quantile(signed_gate_margin, 0.10).item()),
+        "dir_active_signed_gate_frac_pos": float((signed_gate_margin > 0.0).float().mean().item()),
+    }
 
 
 def compute_feature_ortho_loss(S, R):
@@ -1171,16 +1304,321 @@ def zscore_per_node_time(x: torch.Tensor) -> torch.Tensor:
     return (x - mean) / (std + 1e-6)
 
 
+def load_gt_edges(gt_path: str) -> Set[Tuple[int, int]]:
+    """Load 1-based directed GT edges from a text file into 0-based tuples."""
+    gt: Set[Tuple[int, int]] = set()
+    with open(gt_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(f"Malformed GT edge line: {raw_line!r}")
+            src = int(parts[0]) - 1
+            dst = int(parts[1]) - 1
+            if src != dst:
+                gt.add((src, dst))
+    return gt
+
+
+def normalize_margin_eps_value(value: float) -> float:
+    """Canonicalize tiny margin eps values to exact zero for stable field names."""
+    return 0.0 if abs(float(value)) <= 1e-12 else float(value)
+
+
+def margin_eps_label(value: float) -> str:
+    """Build a CSV-safe label for a strict-margin epsilon."""
+    normalized = normalize_margin_eps_value(value)
+    if normalized == 0.0:
+        return "0"
+    return np.format_float_positional(normalized, trim="-").replace(".", "p")
+
+
+def selector_audit_strict_metric_field(metric: str, margin_eps: float) -> str:
+    """Field name used by per-epoch selector audit strict metrics."""
+    return f"selector_audit_{metric}_eps_{margin_eps_label(margin_eps)}"
+
+
+def selector_audit_directional_predictions(adj: np.ndarray) -> List[Tuple[int, int, float]]:
+    """Return one directed prediction per unordered pair, sorted by margin."""
+    preds: List[Tuple[int, int, float]] = []
+    n = adj.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            w_ij = float(adj[i, j])
+            w_ji = float(adj[j, i])
+            if w_ij >= w_ji:
+                src, dst = i, j
+            else:
+                src, dst = j, i
+            preds.append((src, dst, abs(w_ij - w_ji)))
+    preds.sort(key=lambda x: x[2], reverse=True)
+    return preds
+
+
+def selector_audit_evaluate_directional(
+    adj: np.ndarray,
+    gt_edges: Set[Tuple[int, int]],
+) -> Dict[str, float]:
+    """Evaluate one-direction-per-pair predictions against GT."""
+    preds = selector_audit_directional_predictions(adj)
+    pred_edges = {(src, dst) for src, dst, _ in preds}
+    tp = len(pred_edges & gt_edges)
+    fp = len(pred_edges - gt_edges)
+    fn = len(gt_edges - pred_edges)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    tie_count = sum(1 for _, _, margin in preds if margin == 0.0)
+    return {
+        "selector_audit_precision": float(precision),
+        "selector_audit_recall": float(recall),
+        "selector_audit_f1": float(f1),
+        "selector_audit_tie_count": float(tie_count),
+    }
+
+
+def selector_audit_evaluate_directional_strict(
+    adj: np.ndarray,
+    gt_edges: Set[Tuple[int, int]],
+    margin_eps: float,
+) -> Dict[str, float]:
+    """Evaluate only directed pairs whose signed margin exceeds margin_eps."""
+    pred_edges: Set[Tuple[int, int]] = set()
+    for i in range(adj.shape[0]):
+        for j in range(i + 1, adj.shape[1]):
+            delta = float(adj[i, j] - adj[j, i])
+            if delta > margin_eps:
+                pred_edges.add((i, j))
+            elif delta < -margin_eps:
+                pred_edges.add((j, i))
+
+    tp = len(pred_edges & gt_edges)
+    fp = len(pred_edges - gt_edges)
+    fn = len(gt_edges - pred_edges)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "strict_precision": float(precision),
+        "strict_recall": float(recall),
+        "strict_f1": float(f1),
+        "strict_pred_count": float(len(pred_edges)),
+    }
+
+
+def selector_audit_margin_stats(adj: np.ndarray) -> Dict[str, float]:
+    """Summarize exported pairwise asymmetry on a causal adjacency."""
+    margins = np.abs(adj - adj.T)
+    mask = ~np.eye(adj.shape[0], dtype=bool)
+    vals = margins[mask]
+    if vals.size == 0:
+        return {
+            "selector_audit_margin_mean": 0.0,
+            "selector_audit_margin_median": 0.0,
+            "selector_audit_margin_std": 0.0,
+            "selector_audit_margin_p90": 0.0,
+            "selector_audit_margin_max": 0.0,
+            "selector_audit_margin_lt_1e3_frac": 1.0,
+            "selector_audit_margin_lt_1e2_frac": 1.0,
+        }
+    return {
+        "selector_audit_margin_mean": float(vals.mean()),
+        "selector_audit_margin_median": float(np.median(vals)),
+        "selector_audit_margin_std": float(vals.std()),
+        "selector_audit_margin_p90": float(np.quantile(vals, 0.90)),
+        "selector_audit_margin_max": float(vals.max()),
+        "selector_audit_margin_lt_1e3_frac": float(np.mean(vals < 1e-3)),
+        "selector_audit_margin_lt_1e2_frac": float(np.mean(vals < 1e-2)),
+    }
+
+
+def selector_audit_gt_edge_margin_stats(
+    adj: np.ndarray,
+    gt_edges: Set[Tuple[int, int]],
+) -> Dict[str, float]:
+    """Summarize signed GT margins on a causal adjacency."""
+    gt_signed_margins: List[float] = []
+    for src, dst in gt_edges:
+        weight = float(adj[src, dst])
+        reverse_weight = float(adj[dst, src])
+        gt_signed_margins.append(weight - reverse_weight)
+
+    if not gt_signed_margins:
+        return {
+            "selector_audit_gt_signed_margin_mean": 0.0,
+            "selector_audit_gt_signed_margin_median": 0.0,
+            "selector_audit_gt_signed_margin_p10": 0.0,
+            "selector_audit_gt_signed_margin_p90": 0.0,
+            "selector_audit_gt_signed_margin_frac_pos": 0.0,
+        }
+
+    gt_signed_margins_np = np.array(gt_signed_margins, dtype=float)
+    return {
+        "selector_audit_gt_signed_margin_mean": float(np.mean(gt_signed_margins_np)),
+        "selector_audit_gt_signed_margin_median": float(np.median(gt_signed_margins_np)),
+        "selector_audit_gt_signed_margin_p10": float(np.quantile(gt_signed_margins_np, 0.10)),
+        "selector_audit_gt_signed_margin_p90": float(np.quantile(gt_signed_margins_np, 0.90)),
+        "selector_audit_gt_signed_margin_frac_pos": float(np.mean(gt_signed_margins_np > 0.0)),
+    }
+
+
+def selector_audit_failure_mode(
+    margin_stats: Dict[str, float],
+    directional_eval: Dict[str, float],
+) -> str:
+    """Reuse the existing failure taxonomy for GT selector audits."""
+    if (
+        margin_stats["selector_audit_margin_p90"] < 1e-3 or
+        margin_stats["selector_audit_margin_lt_1e2_frac"] > 0.95
+    ):
+        return "symmetric_collapse"
+    if (
+        directional_eval["selector_audit_f1"] <= 0.2 and
+        margin_stats["selector_audit_margin_median"] > 1e-2
+    ):
+        return "wrong_direction_asymmetry"
+    if (
+        directional_eval["selector_audit_f1"] <= 0.4 and
+        margin_stats["selector_audit_margin_p90"] < 5e-2
+    ):
+        return "weak_asymmetry"
+    return "mixed_or_partial"
+
+
+def compute_selector_audit_metrics(
+    adj: np.ndarray,
+    gt_edges: Set[Tuple[int, int]],
+    strict_margin_eps_values: Sequence[float],
+) -> Dict[str, Any]:
+    """Compute GT-only selector audit metrics for one exported adjacency."""
+    directional_eval = selector_audit_evaluate_directional(adj, gt_edges)
+    margin_stats = selector_audit_margin_stats(adj)
+    gt_margin_stats = selector_audit_gt_edge_margin_stats(adj, gt_edges)
+
+    metrics: Dict[str, Any] = {
+        **directional_eval,
+        **margin_stats,
+        **gt_margin_stats,
+    }
+    metrics["selector_audit_failure_mode"] = selector_audit_failure_mode(
+        margin_stats,
+        directional_eval,
+    )
+    for margin_eps in strict_margin_eps_values:
+        strict_eval = selector_audit_evaluate_directional_strict(
+            adj,
+            gt_edges,
+            margin_eps=margin_eps,
+        )
+        for metric_name, metric_value in strict_eval.items():
+            metrics[selector_audit_strict_metric_field(metric_name, margin_eps)] = float(metric_value)
+    return metrics
+
+
+def parse_int_csv_arg(text: str, *, name: str) -> List[int]:
+    """Parse a comma-separated integer argument."""
+    values: List[int] = []
+    for token in str(text).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(int(token))
+    if not values:
+        raise ValueError(f"{name} must include at least one integer value")
+    return values
+
+
+def parse_float_csv_arg(text: str, *, name: str) -> List[float]:
+    """Parse a comma-separated float argument."""
+    values: List[float] = []
+    for token in str(text).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    if not values:
+        raise ValueError(f"{name} must include at least one float value")
+    return values
+
+
+def resolve_lag_weight_spec(
+    lags: Sequence[int],
+    lag_weights: Optional[Sequence[float]] = None,
+    *,
+    default_mode: str = "inverse_lag",
+) -> Tuple[Tuple[int, ...], Tuple[float, ...]]:
+    """Validate lag steps and return normalized lag weights."""
+    lag_list = [int(v) for v in lags]
+    if not lag_list:
+        raise ValueError("lag spec must include at least one lag")
+    if any(v <= 0 for v in lag_list):
+        raise ValueError(f"All lag values must be positive, got {lag_list}")
+
+    if lag_weights is None:
+        if default_mode == "inverse_lag":
+            weight_list = [1.0 / float(v) for v in lag_list]
+        else:
+            weight_list = [1.0 for _ in lag_list]
+    else:
+        weight_list = [float(v) for v in lag_weights]
+        if len(weight_list) != len(lag_list):
+            raise ValueError(
+                f"lag_weights must match lags in length, got {len(weight_list)} vs {len(lag_list)}"
+            )
+        if any(v < 0.0 for v in weight_list):
+            raise ValueError(f"lag_weights must be non-negative, got {weight_list}")
+        if not any(v > 0.0 for v in weight_list):
+            raise ValueError(f"lag_weights must contain at least one positive value, got {weight_list}")
+
+    total = float(sum(weight_list))
+    normalized = tuple(v / total for v in weight_list)
+    return tuple(lag_list), normalized
+
+
+def validate_lag_against_series(source_node_time: torch.Tensor, target_node_time: torch.Tensor, lag: int) -> None:
+    """Check that a lag fits inside the available time dimension."""
+    if lag <= 0:
+        raise ValueError(f"lag must be positive, got {lag}")
+    time_len = min(int(source_node_time.shape[-1]), int(target_node_time.shape[-1]))
+    if time_len <= lag:
+        raise ValueError(f"lag={lag} is invalid for time length {time_len}")
+
+
 @torch.no_grad()
 def compute_pairwise_lagged_score_matrix(
     source_node_time: torch.Tensor,
     target_node_time: torch.Tensor,
+    lag: int = 1,
 ) -> torch.Tensor:
     """Compute pairwise lagged similarity scores for all ordered node pairs."""
-    source_past_z = zscore_per_node_time(source_node_time[:, :-1])
-    target_future_z = zscore_per_node_time(target_node_time[:, 1:])
+    validate_lag_against_series(source_node_time, target_node_time, lag)
+    source_past_z = zscore_per_node_time(source_node_time[:, :-lag])
+    target_future_z = zscore_per_node_time(target_node_time[:, lag:])
     num_steps = max(source_past_z.shape[-1], 1)
     return torch.einsum('nt,mt->nm', source_past_z, target_future_z) / float(num_steps)
+
+
+@torch.no_grad()
+def compute_pairwise_multilag_score_matrix(
+    source_node_time: torch.Tensor,
+    target_node_time: torch.Tensor,
+    lags: Sequence[int],
+    lag_weights: Sequence[float],
+) -> torch.Tensor:
+    """Aggregate ordered-pair lagged scores across multiple lags."""
+    if len(lags) != len(lag_weights):
+        raise ValueError(f"lags and lag_weights must align, got {len(lags)} vs {len(lag_weights)}")
+
+    score = source_node_time.new_zeros((source_node_time.shape[0], target_node_time.shape[0]))
+    for lag, weight in zip(lags, lag_weights):
+        score = score + float(weight) * compute_pairwise_lagged_score_matrix(
+            source_node_time,
+            target_node_time,
+            lag=int(lag),
+        )
+    return score
 
 
 @torch.no_grad()
@@ -1203,7 +1641,69 @@ def compute_online_direction_prior_matrix(
         source = model.prepare_clean_target(x)
     else:
         raise ValueError(f"Unsupported lag_direction_source: {lag_direction_source}")
-    return compute_pairwise_lagged_score_matrix(source, x)
+    lags = getattr(model, "directional_prior_lags", (1,))
+    lag_weights = getattr(model, "directional_prior_lag_weights", (1.0,))
+    return compute_pairwise_multilag_score_matrix(source, x, lags=lags, lag_weights=lag_weights)
+
+
+@torch.no_grad()
+def compute_dataset_direction_prior_components(
+    model: DDM,
+    data_3d: torch.Tensor,
+    mode: str,
+    patel_direction_matrix: torch.Tensor,
+    lag_direction_source: str = "raw",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build one fixed dataset prior plus per-pair sign-consistency diagnostics."""
+    if mode == "patel":
+        consistency = torch.ones_like(patel_direction_matrix)
+        consistency.fill_diagonal_(0.0)
+        return patel_direction_matrix, consistency
+    if mode != "lag_corr":
+        raise ValueError(f"Unsupported directional_prior_mode: {mode}")
+    if data_3d.dim() != 3:
+        raise ValueError(f"Expected [subjects, nodes, time], got {tuple(data_3d.shape)}")
+
+    subject_priors = [
+        compute_online_direction_prior_matrix(
+            model,
+            data_3d[s_idx],
+            mode=mode,
+            patel_direction_matrix=patel_direction_matrix,
+            lag_direction_source=lag_direction_source,
+        )
+        for s_idx in range(int(data_3d.shape[0]))
+    ]
+    stacked_priors = torch.stack(subject_priors, dim=0)
+    mean_prior = stacked_priors.mean(dim=0)
+    stacked_delta = stacked_priors - stacked_priors.transpose(-1, -2)
+    mean_delta = mean_prior - mean_prior.t()
+    mean_sign = torch.sign(mean_delta)
+    stacked_sign = torch.sign(stacked_delta)
+    consistency = (stacked_sign == mean_sign.unsqueeze(0)).float().mean(dim=0)
+    consistency = 0.5 * (consistency + consistency.t())
+    consistency = torch.where(mean_sign != 0, consistency, torch.zeros_like(consistency))
+    consistency.fill_diagonal_(0.0)
+    return mean_prior, consistency
+
+
+@torch.no_grad()
+def compute_dataset_direction_prior_matrix(
+    model: DDM,
+    data_3d: torch.Tensor,
+    mode: str,
+    patel_direction_matrix: torch.Tensor,
+    lag_direction_source: str = "raw",
+) -> torch.Tensor:
+    """Build one fixed directional-prior matrix by averaging subject-level priors."""
+    mean_prior, _ = compute_dataset_direction_prior_components(
+        model,
+        data_3d,
+        mode=mode,
+        patel_direction_matrix=patel_direction_matrix,
+        lag_direction_source=lag_direction_source,
+    )
+    return mean_prior
 
 
 def build_cross_prediction_aggregation_weights(
@@ -1234,21 +1734,36 @@ def build_cross_prediction_aggregation_weights(
 def get_cross_prediction_tensors(
     model: DDM,
     x: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build frozen source features, prediction, target, and causal adjacency for cross-prediction."""
+) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+    """Build frozen source features, predictions, and targets for each active lag."""
     with torch.no_grad():
         h = model.prepare_clean_target(x)
-
-    h_past = h[:, :-1]
-    x_future = x[:, 1:]
 
     adj_causal, agg_weights = build_cross_prediction_aggregation_weights(
         model,
         aggregation=getattr(model, "cross_pred_aggregation", "mean"),
         softmax_temp=getattr(model, "cross_pred_softmax_temp", 1.0),
     )
-    pred = torch.einsum('ce,ct->et', agg_weights, h_past)
-    return h_past, pred, x_future, adj_causal, agg_weights
+
+    lagged_batches: List[Dict[str, torch.Tensor]] = []
+    lags = getattr(model, "cross_pred_lags", (1,))
+    lag_weights = getattr(model, "cross_pred_lag_weights", (1.0,))
+    for lag, weight in zip(lags, lag_weights):
+        lag = int(lag)
+        validate_lag_against_series(h, x, lag)
+        h_past = h[:, :-lag]
+        x_future = x[:, lag:]
+        pred = torch.einsum('ce,ct->et', agg_weights, h_past)
+        lagged_batches.append(
+            {
+                "lag": torch.tensor(lag, device=x.device),
+                "weight": torch.tensor(float(weight), device=x.device, dtype=x.dtype),
+                "h_past": h_past,
+                "pred": pred,
+                "target": x_future,
+            }
+        )
+    return lagged_batches, adj_causal, agg_weights
 
 
 def offdiag_values(matrix: torch.Tensor) -> torch.Tensor:
@@ -1282,27 +1797,54 @@ def compute_pairwise_node_cosine_stats(node_time: torch.Tensor, prefix: str) -> 
 @torch.no_grad()
 def compute_cross_prediction_diagnostics(model: DDM, x: torch.Tensor) -> Dict[str, float]:
     """Summarize shared-signal and prediction-target alignment diagnostics for cross-prediction."""
-    h_past, pred, x_future, _, agg_weights = get_cross_prediction_tensors(model, x)
-    h_past_z = zscore_per_node_time(h_past)
-    pred_z = zscore_per_node_time(pred)
-    target_z = zscore_per_node_time(x_future)
+    lagged_batches, _, agg_weights = get_cross_prediction_tensors(model, x)
+    if not lagged_batches:
+        return {
+            "cross_num_lags": 0.0,
+            "cross_pred_target_diag_mean": 0.0,
+            "cross_pred_target_offdiag_mean": 0.0,
+            "cross_pred_target_diag_gap": 0.0,
+            "cross_agg_max_mean": 0.0,
+            "cross_agg_max_p90": 0.0,
+            "cross_agg_eff_parents_mean": 0.0,
+        }
 
-    pred_norm = F.normalize(pred_z, p=2, dim=-1, eps=1e-8)
-    target_norm = F.normalize(target_z, p=2, dim=-1, eps=1e-8)
-    pred_target_sim = pred_norm @ target_norm.transpose(0, 1)
-    diag_vals = torch.diagonal(pred_target_sim)
-    offdiag_sim = offdiag_values(pred_target_sim)
+    weighted_source_stats: Dict[str, float] = {}
+    weighted_pred_stats: Dict[str, float] = {}
+    weighted_target_stats: Dict[str, float] = {}
+    diag_mean = 0.0
+    offdiag_mean = 0.0
+    for batch in lagged_batches:
+        weight = float(batch["weight"].item())
+        h_past_z = zscore_per_node_time(batch["h_past"])
+        pred_z = zscore_per_node_time(batch["pred"])
+        target_z = zscore_per_node_time(batch["target"])
 
-    diag_mean = float(diag_vals.mean().item())
-    offdiag_mean = float(offdiag_sim.mean().item()) if offdiag_sim.numel() > 0 else 0.0
+        pred_norm = F.normalize(pred_z, p=2, dim=-1, eps=1e-8)
+        target_norm = F.normalize(target_z, p=2, dim=-1, eps=1e-8)
+        pred_target_sim = pred_norm @ target_norm.transpose(0, 1)
+        diag_vals = torch.diagonal(pred_target_sim)
+        offdiag_sim = offdiag_values(pred_target_sim)
+
+        diag_mean += weight * float(diag_vals.mean().item())
+        offdiag_mean += weight * (float(offdiag_sim.mean().item()) if offdiag_sim.numel() > 0 else 0.0)
+
+        for stats_dict, values, prefix in (
+            (weighted_source_stats, compute_pairwise_node_cosine_stats(h_past_z, "cross_source"), "cross_source"),
+            (weighted_pred_stats, compute_pairwise_node_cosine_stats(pred_z, "cross_pred"), "cross_pred"),
+            (weighted_target_stats, compute_pairwise_node_cosine_stats(target_z, "cross_target"), "cross_target"),
+        ):
+            for key, value in values.items():
+                stats_dict[key] = stats_dict.get(key, 0.0) + weight * float(value)
 
     stats = {}
-    stats.update(compute_pairwise_node_cosine_stats(h_past_z, "cross_source"))
-    stats.update(compute_pairwise_node_cosine_stats(pred_z, "cross_pred"))
-    stats.update(compute_pairwise_node_cosine_stats(target_z, "cross_target"))
+    stats.update(weighted_source_stats)
+    stats.update(weighted_pred_stats)
+    stats.update(weighted_target_stats)
     per_target_max = agg_weights.max(dim=0).values
     effective_parents = 1.0 / agg_weights.pow(2).sum(dim=0).clamp_min(1e-8)
     stats.update({
+        "cross_num_lags": float(len(lagged_batches)),
         "cross_pred_target_diag_mean": diag_mean,
         "cross_pred_target_offdiag_mean": offdiag_mean,
         "cross_pred_target_diag_gap": diag_mean - offdiag_mean,
@@ -1427,10 +1969,16 @@ def compute_cross_prediction_loss(model: DDM, x: torch.Tensor) -> torch.Tensor:
     adj_causal[cause, effect] predicts how source-node history contributes to
     the target node's future. For each target node, aggregate over causes.
     """
-    _, pred, x_future, _, _ = get_cross_prediction_tensors(model, x)
-    pred_z = zscore_per_node_time(pred)
-    target_z = zscore_per_node_time(x_future)
-    return F.smooth_l1_loss(pred_z, target_z)
+    lagged_batches, _, _ = get_cross_prediction_tensors(model, x)
+    if not lagged_batches:
+        return x.new_tensor(0.0)
+
+    loss = x.new_tensor(0.0)
+    for batch in lagged_batches:
+        pred_z = zscore_per_node_time(batch["pred"])
+        target_z = zscore_per_node_time(batch["target"])
+        loss = loss + batch["weight"] * F.smooth_l1_loss(pred_z, target_z)
+    return loss
 
 
 @torch.no_grad()
@@ -1440,6 +1988,8 @@ def compute_epoch_quality(
     patel_strength_cpu,
     top_k=61,
     agreement_weight: float = 0.25,
+    fixed_support_mask_active: bool = False,
+    agreement_mode: str = "hard_coverage",
 ):
     """
     不依赖 GT 的 epoch 质量评分，用于 best-epoch 选择。
@@ -1448,9 +1998,14 @@ def compute_epoch_quality(
 
     - agreement_score: Patel 高置信方向边上的一致率，但在覆盖不足时回缩到中性分 0.5，
       避免短训或语义不稳时整轮清零
+    - agreement_soft_score: 对 top-k 边上的 Patel 方向按 |delta_tau| 做软加权一致率，
+      用于 fixed-support / low-coverage 场景下减少“高幅值但方向偏早”的误选
     - dir_margin: top-k 边的平均 |adj[i,j] - adj[j,i]|（衡量方向强度，
       不受饱和高分假边误导）
     - density_factor: 惩罚实际密度偏离目标密度过远的情况（抑制过稀疏/过饱和）
+      - but when support pairs are fixed externally, density is neutralized because
+        hard `> 0.5` counting no longer reflects whether the selector is choosing
+        a good checkpoint
     - skeleton_overlap: 骨架与 Patel 强度先验的重叠度
 
     Args:
@@ -1463,6 +2018,11 @@ def compute_epoch_quality(
         score: float, 越高越好
         details: dict with sub-metrics
     """
+    if agreement_mode not in {"hard_coverage", "soft_weighted"}:
+        raise ValueError(
+            f"agreement_mode must be 'hard_coverage' or 'soft_weighted', got {agreement_mode}"
+        )
+
     n = adj_np.shape[0]
     patel_direction = patel_direction_cpu
     patel_strength = np.maximum(patel_strength_cpu, 0.0)
@@ -1524,18 +2084,29 @@ def compute_epoch_quality(
     # --- 1) agreement_strict: 仅在 Patel 高置信边上算 ---
     agree_count = 0
     high_conf_count = 0
+    soft_weight_sum = 0.0
+    soft_agree_sum = 0.0
     for src, dst, _, _ in top_edges:
-        p_delta = abs(patel_direction[src, dst] - patel_direction[dst, src])
+        signed_p_delta = float(patel_direction[src, dst] - patel_direction[dst, src])
+        p_delta = abs(signed_p_delta)
+        if p_delta > 0.0:
+            soft_weight_sum += p_delta
+            if signed_p_delta > 0.0:
+                soft_agree_sum += p_delta
         if p_delta <= patel_thresh:
             continue  # Patel 低置信 / 平局，跳过
         high_conf_count += 1
         # Patel 认为 src→dst 当 patel[src,dst] > patel[dst,src]
-        if patel_direction[src, dst] > patel_direction[dst, src]:
+        if signed_p_delta > 0.0:
             agree_count += 1
 
     agreement = agree_count / high_conf_count if high_conf_count > 0 else 0.0
     agreement_coverage = high_conf_count / k if k > 0 else 0.0
     agreement_score = 0.5 + (agreement - 0.5) * agreement_coverage
+    if soft_weight_sum > 0.0:
+        agreement_soft_score = soft_agree_sum / soft_weight_sum
+    else:
+        agreement_soft_score = 0.5
 
     # --- 2) dir_margin: 平均方向强度 |adj[i,j] - adj[j,i]| ---
     dir_margin = float(np.mean([e[3] for e in top_edges]))
@@ -1544,22 +2115,31 @@ def compute_epoch_quality(
     # --- 3) density_factor: 惩罚密度偏离 ---
     total_pairs = n * (n - 1) // 2
     target_density = k / max(total_pairs, 1)
-    actual_positive_pairs = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            if max(float(adj_np[i, j]), float(adj_np[j, i])) > 0.5:
-                actual_positive_pairs += 1
-    actual_density = actual_positive_pairs / max(total_pairs, 1)
-    density_ratio = actual_density / (target_density + 1e-8)
-    # Gaussian-style penalty: ratio=1 → factor=1, 宽容到 ~10x 偏离仍有 ~0.1 分
-    density_factor = float(np.exp(-0.5 * (np.log(density_ratio + 1e-8)) ** 2))
+    if fixed_support_mask_active:
+        actual_density = target_density
+        density_ratio = 1.0
+        density_factor = 1.0
+    else:
+        actual_positive_pairs = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if max(float(adj_np[i, j]), float(adj_np[j, i])) > 0.5:
+                    actual_positive_pairs += 1
+        actual_density = actual_positive_pairs / max(total_pairs, 1)
+        density_ratio = actual_density / (target_density + 1e-8)
+        # Gaussian-style penalty: ratio=1 → factor=1, 宽容到 ~10x 偏离仍有 ~0.1 分
+        density_factor = float(np.exp(-0.5 * (np.log(density_ratio + 1e-8)) ** 2))
 
     global_asymmetry = float(np.mean(np.abs(adj_np - adj_np.T)[off_diag_mask]))
     asymmetry_score = float(np.tanh(global_asymmetry / 0.15))
 
+    effective_agreement_score = (
+        agreement_score if agreement_mode == "hard_coverage" else agreement_soft_score
+    )
+
     score = (
         0.35 * skeleton_overlap +
-        agreement_weight * agreement_score +
+        agreement_weight * effective_agreement_score +
         0.20 * density_factor +
         0.15 * margin_score +
         0.05 * asymmetry_score
@@ -1567,6 +2147,9 @@ def compute_epoch_quality(
     return score, {
         "agreement": agreement,
         "agreement_score": agreement_score,
+        "agreement_soft_score": agreement_soft_score,
+        "agreement_mode": agreement_mode,
+        "effective_agreement_score": effective_agreement_score,
         "agreement_weight": agreement_weight,
         "agreement_coverage": agreement_coverage,
         "dir_margin": dir_margin,
@@ -1575,6 +2158,7 @@ def compute_epoch_quality(
         "skeleton_overlap": skeleton_overlap,
         "actual_pair_density": actual_density,
         "target_pair_density": target_density,
+        "fixed_support_mask_active": int(fixed_support_mask_active),
         "global_asymmetry": global_asymmetry,
         "asymmetry_score": asymmetry_score,
         "high_conf_edges": high_conf_count,
@@ -1670,6 +2254,11 @@ def train_brain_connectivity(
     directional_prior_mode: str = "patel",
     directional_schedule: str = "cosine_anneal",
     lag_direction_source: str = "raw",
+    directional_prior_scope: str = "online_subject",
+    directional_prior_consistency_floor: float = 0.0,
+    directional_prior_consistency_power: float = 0.0,
+    directional_prior_lags: Sequence[int] = (1,),
+    directional_prior_lag_weights: Sequence[float] = (1.0,),
     directional_kappa_gate: bool = False,
     directional_kappa_gate_quantile: float = 0.5,
     directional_target_ratio: float = 0.01,
@@ -1684,6 +2273,16 @@ def train_brain_connectivity(
     cross_pred_schedule: str = "cosine_anneal",
     cross_pred_aggregation: str = "mean",
     cross_pred_softmax_temp: float = 1.0,
+    cross_pred_lags: Sequence[int] = (1,),
+    cross_pred_lag_weights: Sequence[float] = (1.0,),
+    cross_pred_fixed_weight: float = 0.0,
+    cross_pred_fixed_warmup_epochs: int = 0,
+    cross_pred_fixed_ramp_epochs: int = 1,
+    anti_collapse_lambda: float = 0.0,
+    anti_collapse_margin: float = 0.0,
+    anti_collapse_mode: str = "unsigned_raw",
+    anti_collapse_warmup_epochs: int = 0,
+    anti_collapse_ramp_epochs: int = 1,
     parent_entropy_lambda: float = 0.0,
     parent_entropy_warmup_epochs: int = 0,
     parent_entropy_ramp_epochs: int = 1,
@@ -1695,6 +2294,9 @@ def train_brain_connectivity(
     ungated_symmetry_warmup_epochs: int = 0,
     ungated_symmetry_ramp_epochs: int = 1,
     selection_agreement_weight: float = 0.25,
+    selection_agreement_mode: str = "hard_coverage",
+    selector_audit_gt_edges: Optional[Set[Tuple[int, int]]] = None,
+    selector_audit_strict_margin_eps_values: Sequence[float] = (0.0, 3e-4, 0.1),
 
 ):
 
@@ -1771,6 +2373,21 @@ def train_brain_connectivity(
             "directional_loss_end_epoch must be >= -1, "
             f"got {directional_loss_end_epoch}"
         )
+    if selection_agreement_mode not in {"hard_coverage", "soft_weighted"}:
+        raise ValueError(
+            "selection_agreement_mode must be 'hard_coverage' or 'soft_weighted', "
+            f"got {selection_agreement_mode}"
+        )
+    selector_audit_strict_margin_eps_values = tuple(
+        normalize_margin_eps_value(v) for v in selector_audit_strict_margin_eps_values
+    )
+    if selector_audit_gt_edges is not None and not selector_audit_gt_edges:
+        raise ValueError("selector_audit_gt_edges must be non-empty when provided")
+    if any(v < 0.0 for v in selector_audit_strict_margin_eps_values):
+        raise ValueError(
+            "selector_audit_strict_margin_eps_values must be non-negative, "
+            f"got {selector_audit_strict_margin_eps_values}"
+        )
 
     data_3d = data_3d.to(device)
     probe_x = data_3d[0]
@@ -1803,6 +2420,7 @@ def train_brain_connectivity(
         ddm_kwargs['fixed_support_mask'] = fixed_support_mask
         if directional_pair_gate_matrix is not None:
             directional_pair_gate_matrix = directional_pair_gate_matrix & fixed_support_mask.bool()
+        print("Selection density: fixed support mask detected, neutralizing density term/guardrail in epoch proxy")
 
     # Extract use_temporal_encoder from ddm_kwargs to avoid duplicate argument
     use_temporal_encoder = ddm_kwargs.pop('use_temporal_encoder', True)
@@ -1852,6 +2470,7 @@ def train_brain_connectivity(
 
         noise_guide_adj=noise_guide_adj,  # Row-normalized adj for neighbor-based noise
         kappa_logit_bias_prior=kappa_logit_bias_prior,
+        direction_logit_bias_prior=to_causal_matrix_torch(patel_direction_matrix),
 
         adj_bias_init=adj_bias_init,
 
@@ -1868,14 +2487,59 @@ def train_brain_connectivity(
         f"emb_dim={getattr(model, 'emb_dim', num_nodes)} "
         f"(requested={'full' if requested_emb_dim is None else requested_emb_dim}) | "
         f"message_graph_mode={getattr(model, 'structure_message_graph_mode', 'raw')} | "
-        f"kappa_logit_bias_scale={getattr(model, 'kappa_logit_bias_scale', 0.0):g}"
+        f"kappa_logit_bias_scale={getattr(model, 'kappa_logit_bias_scale', 0.0):g} | "
+        f"direction_logit_bias_scale={getattr(model, 'direction_logit_bias_scale', 0.0):g}"
     )
     model.cross_pred_aggregation = cross_pred_aggregation
     model.cross_pred_softmax_temp = cross_pred_softmax_temp
+    model.directional_prior_scope = directional_prior_scope
+    model.directional_prior_consistency_floor = float(directional_prior_consistency_floor)
+    model.directional_prior_consistency_power = float(directional_prior_consistency_power)
+    model.directional_prior_lags = tuple(int(v) for v in directional_prior_lags)
+    model.directional_prior_lag_weights = tuple(float(v) for v in directional_prior_lag_weights)
+    model.cross_pred_lags = tuple(int(v) for v in cross_pred_lags)
+    model.cross_pred_lag_weights = tuple(float(v) for v in cross_pred_lag_weights)
+    model.cross_pred_fixed_weight = float(cross_pred_fixed_weight)
+    model.anti_collapse_lambda = float(anti_collapse_lambda)
+    model.anti_collapse_margin = float(anti_collapse_margin)
+    model.anti_collapse_mode = anti_collapse_mode
     if directional_kappa_gate:
         print(f"Directional kappa gate: enabled | quantile={directional_kappa_gate_quantile:.2f} | "
               f"threshold={directional_kappa_threshold:.4f} | "
               f"pair_frac={directional_kappa_gate_pair_frac:.2%}")
+    if enable_directional_loss and directional_prior_mode == "lag_corr":
+        print(
+            "Directional time prior: "
+            f"scope={directional_prior_scope} | "
+            f"consistency_floor={directional_prior_consistency_floor:.2f} | "
+            f"consistency_power={directional_prior_consistency_power:.2f} | "
+            f"lags={list(model.directional_prior_lags)} | "
+            f"weights={[round(v, 4) for v in model.directional_prior_lag_weights]}"
+        )
+    if enable_cross_prediction:
+        print(
+            "Cross-pred lag config: "
+            f"lags={list(model.cross_pred_lags)} | "
+            f"weights={[round(v, 4) for v in model.cross_pred_lag_weights]} | "
+            f"fixed_weight={cross_pred_fixed_weight:g}"
+        )
+    if anti_collapse_lambda > 0.0:
+        print(
+            "Anti-collapse: enabled | "
+            f"lambda={anti_collapse_lambda:g} | "
+            f"margin={anti_collapse_margin:g} | "
+            f"mode={anti_collapse_mode}"
+        )
+    if selector_audit_gt_edges is not None:
+        print(
+            "Selector audit: enabled | "
+            f"gt_edges={len(selector_audit_gt_edges)} | "
+            f"strict_margin_eps={list(selector_audit_strict_margin_eps_values)}"
+        )
+    print(
+        "Selection agreement: "
+        f"weight={selection_agreement_weight:.4f} | mode={selection_agreement_mode}"
+    )
 
     # ---- Autoregressive Causal Pretraining ----
     if model.use_temporal_encoder and not skip_pretrain and pretrain_epochs > 0:
@@ -1930,6 +2594,65 @@ def train_brain_connectivity(
 
     print(f"Learning adjacency matrix of shape [{num_nodes}, {num_nodes}]")
     print(f"Main DDM loss weight: {main_loss_weight:g}")
+
+    fixed_direction_prior_matrix: Optional[torch.Tensor] = None
+    fixed_direction_prior_consistency: Optional[torch.Tensor] = None
+    fixed_direction_prior_reliability: Optional[torch.Tensor] = None
+    if (
+        (enable_directional_loss or anti_collapse_lambda > 0.0)
+        and directional_prior_mode == "lag_corr"
+        and directional_prior_scope == "global_dataset"
+    ):
+        fixed_direction_prior_matrix, fixed_direction_prior_consistency = compute_dataset_direction_prior_components(
+            model,
+            data_3d,
+            mode=directional_prior_mode,
+            patel_direction_matrix=patel_direction_matrix,
+            lag_direction_source=lag_direction_source,
+        )
+        if directional_prior_consistency_floor > 0.0:
+            consistency_keep = (
+                fixed_direction_prior_consistency >= float(directional_prior_consistency_floor)
+            ).float()
+            fixed_direction_prior_matrix = fixed_direction_prior_matrix * consistency_keep
+        if directional_prior_consistency_power > 0.0:
+            fixed_direction_prior_reliability = torch.clamp(
+                fixed_direction_prior_consistency,
+                min=0.0,
+            ).pow(float(directional_prior_consistency_power))
+            if directional_prior_consistency_floor > 0.0:
+                fixed_direction_prior_reliability = fixed_direction_prior_reliability * consistency_keep
+            fixed_direction_prior_reliability.fill_diagonal_(0.0)
+        fixed_delta = fixed_direction_prior_matrix - fixed_direction_prior_matrix.t()
+        fixed_delta_abs = fixed_delta[~torch.eye(num_nodes, dtype=torch.bool, device=fixed_delta.device)].abs()
+        if fixed_direction_prior_consistency is not None:
+            fixed_consistency_vals = fixed_direction_prior_consistency[
+                ~torch.eye(num_nodes, dtype=torch.bool, device=fixed_direction_prior_consistency.device)
+            ]
+            kept_frac = float((fixed_delta_abs > 0).float().mean().item())
+            print(
+                "Directional prior consistency: "
+                f"floor={directional_prior_consistency_floor:.2f} | "
+                f"median={float(torch.quantile(fixed_consistency_vals, 0.50).item()):.4f} | "
+                f"p90={float(torch.quantile(fixed_consistency_vals, 0.90).item()):.4f} | "
+                f"kept_frac={kept_frac:.2%}"
+            )
+        if fixed_direction_prior_reliability is not None:
+            fixed_reliability_vals = fixed_direction_prior_reliability[
+                ~torch.eye(num_nodes, dtype=torch.bool, device=fixed_direction_prior_reliability.device)
+            ]
+            print(
+                "Directional prior soft weighting: "
+                f"power={directional_prior_consistency_power:.2f} | "
+                f"mean={float(fixed_reliability_vals.mean().item()):.4f} | "
+                f"p10={float(torch.quantile(fixed_reliability_vals, 0.10).item()):.4f} | "
+                f"p90={float(torch.quantile(fixed_reliability_vals, 0.90).item()):.4f}"
+            )
+        print(
+            "Directional prior cache: global_dataset | "
+            f"abs_delta_median={float(torch.quantile(fixed_delta_abs, 0.50).item()):.4f} | "
+            f"abs_delta_p90={float(torch.quantile(fixed_delta_abs, 0.90).item()):.4f}"
+        )
 
     optimizer, optimizer_stats = build_training_optimizer(
         model,
@@ -2034,6 +2757,8 @@ def train_brain_connectivity(
 
         epoch_cross_loss = 0.0
 
+        epoch_anti_collapse_loss = 0.0
+
         epoch_parent_entropy_loss = 0.0
 
         epoch_parent_cap_loss = 0.0
@@ -2045,6 +2770,10 @@ def train_brain_connectivity(
         current_parent_cap_weight = 0.0
 
         current_ungated_symmetry_weight = 0.0
+
+        current_cross_fixed_weight = 0.0
+
+        current_anti_collapse_weight = 0.0
 
         num_batches = 0
 
@@ -2145,21 +2874,39 @@ def train_brain_connectivity(
 
                 # --- Directional margin loss & feature orthogonality loss ---
                 causal_logits = get_current_directional_logits(model, causal=True)
-                if directional_loss_active:
-                    direction_prior_matrix = compute_online_direction_prior_matrix(
-                        model=model,
-                        x=x,
-                        mode=directional_prior_mode,
-                        patel_direction_matrix=patel_direction_matrix,
-                        lag_direction_source=lag_direction_source,
-                    )
+                direction_prior_matrix = None
+                if directional_loss_active or anti_collapse_lambda > 0.0:
+                    direction_prior_reliability_matrix = None
+                    if fixed_direction_prior_matrix is not None:
+                        direction_prior_matrix = fixed_direction_prior_matrix
+                        direction_prior_reliability_matrix = fixed_direction_prior_reliability
+                    else:
+                        direction_prior_matrix = compute_online_direction_prior_matrix(
+                            model=model,
+                            x=x,
+                            mode=directional_prior_mode,
+                            patel_direction_matrix=patel_direction_matrix,
+                            lag_direction_source=lag_direction_source,
+                        )
                     raw_loss_dir = compute_directional_margin_loss(
                         causal_logits,
                         direction_prior_matrix,
                         pair_gate_matrix=directional_pair_gate_matrix,
+                        pair_reliability_matrix=direction_prior_reliability_matrix,
                     )
                 else:
                     raw_loss_dir = torch.tensor(0.0, device=device)
+                if anti_collapse_lambda > 0.0 and direction_prior_matrix is not None:
+                    raw_loss_anti_collapse = compute_directional_anti_collapse_loss(
+                        causal_logits,
+                        direction_prior_matrix,
+                        margin_floor=anti_collapse_margin,
+                        pair_gate_matrix=directional_pair_gate_matrix,
+                        pair_reliability_matrix=direction_prior_reliability_matrix,
+                        mode=anti_collapse_mode,
+                    )
+                else:
+                    raw_loss_anti_collapse = torch.tensor(0.0, device=device)
                 if enable_cross_prediction:
                     raw_loss_cross = compute_cross_prediction_loss(model, x)
                 else:
@@ -2216,7 +2963,16 @@ def train_brain_connectivity(
 
                 weighted_dir = lambda_dir * raw_loss_dir
                 weighted_ortho = lambda_ortho * raw_loss_ortho
-                weighted_cross = lambda_cross * raw_loss_cross
+                current_cross_fixed_weight = compute_fixed_aux_weight(
+                    epoch=epoch,
+                    target_weight=cross_pred_fixed_weight,
+                    warmup_epochs=cross_pred_fixed_warmup_epochs,
+                    ramp_epochs=cross_pred_fixed_ramp_epochs,
+                )
+                if current_cross_fixed_weight > 0.0:
+                    weighted_cross = current_cross_fixed_weight * raw_loss_cross
+                else:
+                    weighted_cross = lambda_cross * raw_loss_cross
                 current_parent_entropy_weight = compute_fixed_aux_weight(
                     epoch=epoch,
                     target_weight=parent_entropy_lambda,
@@ -2240,6 +2996,15 @@ def train_brain_connectivity(
                 weighted_ungated_symmetry = (
                     current_ungated_symmetry_weight * raw_loss_ungated_symmetry
                 )
+                current_anti_collapse_weight = compute_fixed_aux_weight(
+                    epoch=epoch,
+                    target_weight=anti_collapse_lambda,
+                    warmup_epochs=anti_collapse_warmup_epochs,
+                    ramp_epochs=anti_collapse_ramp_epochs,
+                )
+                weighted_anti_collapse = (
+                    current_anti_collapse_weight * raw_loss_anti_collapse
+                )
 
                 weighted_ddm_main = main_loss_weight * loss_ddm_main
 
@@ -2248,6 +3013,7 @@ def train_brain_connectivity(
                     weighted_dir +
                     weighted_ortho +
                     weighted_cross +
+                    weighted_anti_collapse +
                     weighted_parent_entropy +
                     weighted_parent_cap +
                     weighted_ungated_symmetry
@@ -2286,6 +3052,8 @@ def train_brain_connectivity(
 
                 epoch_cross_loss += weighted_cross.item()
 
+                epoch_anti_collapse_loss += weighted_anti_collapse.item()
+
                 epoch_parent_entropy_loss += weighted_parent_entropy.item()
 
                 epoch_parent_cap_loss += weighted_parent_cap.item()
@@ -2304,6 +3072,7 @@ def train_brain_connectivity(
         avg_dir_loss = epoch_dir_loss / num_batches
         avg_ortho_loss = epoch_ortho_loss / num_batches
         avg_cross_loss = epoch_cross_loss / num_batches
+        avg_anti_collapse_loss = epoch_anti_collapse_loss / num_batches
         avg_parent_entropy_loss = epoch_parent_entropy_loss / num_batches
         avg_parent_cap_loss = epoch_parent_cap_loss / num_batches
         avg_ungated_symmetry_loss = epoch_ungated_symmetry_loss / num_batches
@@ -2320,6 +3089,8 @@ def train_brain_connectivity(
                 patel_direction_matrix=patel_direction_matrix,
                 directional_pair_gate_matrix=directional_pair_gate_matrix,
                 lambda_dir_effective=grad_probe_lambda_dir,
+                fixed_direction_prior_matrix=fixed_direction_prior_matrix,
+                direction_prior_reliability_matrix=fixed_direction_prior_reliability,
                 seed=gradient_alignment_probe_seed,
             )
         else:
@@ -2336,21 +3107,58 @@ def train_brain_connectivity(
 
         with torch.no_grad():
             causal_logits = get_current_directional_logits(model, causal=True)
-            if directional_loss_active:
-                probe_direction_prior = compute_online_direction_prior_matrix(
-                    model=model,
-                    x=probe_x,
-                    mode=directional_prior_mode,
-                    patel_direction_matrix=patel_direction_matrix,
-                    lag_direction_source=lag_direction_source,
+            probe_direction_prior = None
+            if directional_loss_active or anti_collapse_lambda > 0.0:
+                probe_direction_prior_reliability = None
+                if fixed_direction_prior_matrix is not None:
+                    probe_direction_prior = fixed_direction_prior_matrix
+                    probe_direction_prior_reliability = fixed_direction_prior_reliability
+                else:
+                    probe_direction_prior = compute_online_direction_prior_matrix(
+                        model=model,
+                        x=probe_x,
+                        mode=directional_prior_mode,
+                        patel_direction_matrix=patel_direction_matrix,
+                        lag_direction_source=lag_direction_source,
+                    )
+                direction_margin_stats = compute_directional_margin_diagnostics(
+                    causal_logits,
+                    probe_direction_prior,
+                    pair_gate_matrix=directional_pair_gate_matrix,
+                    pair_reliability_matrix=probe_direction_prior_reliability,
                 )
+            else:
+                direction_margin_stats = {
+                    "dir_active_pair_frac": 0.0,
+                    "dir_prior_q_threshold": 0.0,
+                    "dir_active_reliability_mean": 0.0,
+                    "dir_active_reliability_median": 0.0,
+                    "dir_active_reliability_p10": 0.0,
+                    "dir_active_abs_margin_mean": 0.0,
+                    "dir_active_abs_margin_median": 0.0,
+                    "dir_active_abs_margin_p90": 0.0,
+                    "dir_active_abs_margin_near0_frac": 0.0,
+                }
+            if directional_loss_active and probe_direction_prior is not None:
                 raw_dir_snap = compute_directional_margin_loss(
                     causal_logits,
                     probe_direction_prior,
                     pair_gate_matrix=directional_pair_gate_matrix,
+                    pair_reliability_matrix=probe_direction_prior_reliability,
                 ).item()
             else:
                 raw_dir_snap = 0.0
+            if anti_collapse_lambda > 0.0 and probe_direction_prior is not None:
+                raw_anti_collapse_snap = compute_directional_anti_collapse_loss(
+                    causal_logits,
+                    probe_direction_prior,
+                    margin_floor=anti_collapse_margin,
+                    pair_gate_matrix=directional_pair_gate_matrix,
+                    pair_reliability_matrix=probe_direction_prior_reliability,
+                    mode=anti_collapse_mode,
+                ).item()
+            else:
+                raw_anti_collapse_snap = 0.0
             if enable_cross_prediction:
                 raw_cross_snap = compute_cross_prediction_loss(model, probe_x).item()
                 cross_diag_stats = compute_cross_prediction_diagnostics(model, probe_x)
@@ -2390,7 +3198,17 @@ def train_brain_connectivity(
             patel_strength_cpu,
             top_k=quality_top_k,
             agreement_weight=selection_agreement_weight,
+            fixed_support_mask_active=bool(fixed_support_mask is not None),
+            agreement_mode=selection_agreement_mode,
         )
+        if selector_audit_gt_edges is not None:
+            selector_audit_metrics = compute_selector_audit_metrics(
+                curr_adj_causal,
+                selector_audit_gt_edges,
+                selector_audit_strict_margin_eps_values,
+            )
+        else:
+            selector_audit_metrics = {}
         selection_eligible = int((epoch + 1) >= selection_start_epoch)
         if selection_eligible:
             guardrail_details = evaluate_selection_guardrails(
@@ -2425,6 +3243,7 @@ def train_brain_connectivity(
             **adj_diag_stats,
             **parent_profile_stats,
             **ungated_asym_stats,
+            **direction_margin_stats,
             **cross_diag_stats,
             **noise_guide_probe_stats,
             **message_dir_stats,
@@ -2450,6 +3269,13 @@ def train_brain_connectivity(
             "direction_branch_frozen_from_epoch": int(direction_branch_frozen_from_epoch),
             "cross_loss_raw": float(raw_cross_snap),
             "cross_loss_weighted": float(avg_cross_loss),
+            "cross_lambda_current": float(current_cross_fixed_weight if current_cross_fixed_weight > 0.0 else prev_lambda_cross),
+            "cross_fixed_weight_target": float(cross_pred_fixed_weight),
+            "anti_collapse_raw": float(raw_anti_collapse_snap),
+            "anti_collapse_weighted": float(avg_anti_collapse_loss),
+            "anti_collapse_lambda_current": float(current_anti_collapse_weight),
+            "anti_collapse_margin": float(anti_collapse_margin),
+            "anti_collapse_mode": anti_collapse_mode,
             "ortho_loss_raw": float(raw_ortho_snap),
             "ortho_loss_weighted": float(avg_ortho_loss),
             "parent_entropy_raw": raw_parent_entropy_snap,
@@ -2464,7 +3290,9 @@ def train_brain_connectivity(
             "ungated_symmetry_lambda_current": current_ungated_symmetry_weight,
             "gradient_alignment_probe_enabled": int(enable_gradient_alignment_probe),
             "gradient_alignment_probe_seed": int(gradient_alignment_probe_seed),
+            "selector_audit_enabled": int(selector_audit_gt_edges is not None),
             **grad_probe_stats,
+            **selector_audit_metrics,
         })
         marker_parts = []
         if selection_eligible and epoch_score > fallback_best_score:
@@ -2501,6 +3329,8 @@ def train_brain_connectivity(
                   f"{int(direction_branch_frozen)} | "
                   f"Dir Loss(raw/w): {raw_dir_snap:.4f}/{avg_dir_loss:.4f} | "
                   f"Cross Loss(raw/w): {raw_cross_snap:.4f}/{avg_cross_loss:.4f} | "
+                  f"AntiCollapse(raw/w): {raw_anti_collapse_snap:.4f}/{avg_anti_collapse_loss:.4f} "
+                  f"(lambda={current_anti_collapse_weight:.4f}) | "
                   f"Parent Ent(raw/w): {raw_parent_entropy_snap:.4f}/{avg_parent_entropy_loss:.4f} "
                   f"(lambda={current_parent_entropy_weight:.4f}) | "
                   f"Parent Cap(raw/w): {raw_parent_cap_snap:.4f}/{avg_parent_cap_loss:.4f} "
@@ -2529,6 +3359,16 @@ def train_brain_connectivity(
                   f"ratio={guardrail_details['guardrail_density_ratio']:.2f}) | "
                   f"Best[{current_best_mode}]: epoch {current_best_epoch} score={current_best_score:.4f} | "
                   f"Eligible from epoch {selection_start_epoch}{marker}")
+            if selector_audit_metrics:
+                primary_selector_key = selector_audit_strict_metric_field(
+                    "strict_f1",
+                    selector_audit_strict_margin_eps_values[0],
+                )
+                print(f"  [SelAudit] strict@eps={selector_audit_strict_margin_eps_values[0]:g}="
+                      f"{selector_audit_metrics.get(primary_selector_key, 0.0):.4f} | "
+                      f"f1={selector_audit_metrics.get('selector_audit_f1', 0.0):.4f} | "
+                      f"gt_margin_med={selector_audit_metrics.get('selector_audit_gt_signed_margin_median', 0.0):+.4f} | "
+                      f"mode={selector_audit_metrics.get('selector_audit_failure_mode', 'n/a')}")
             print(f"  [AdjDiag] offdiag={adj_diag_stats['adj_offdiag_mean']:.4f}±"
                   f"{adj_diag_stats['adj_offdiag_std']:.4f} "
                   f"(cv={adj_diag_stats['adj_offdiag_cv']:.3f}, "
@@ -2637,6 +3477,72 @@ def train_brain_connectivity(
     model.best_epoch_score_only = fallback_best_epoch
     model.best_epoch_score_only_score = fallback_best_score
     model.quality_history = quality_history
+    if selector_audit_gt_edges is not None and quality_history:
+        primary_eps = selector_audit_strict_margin_eps_values[0]
+        primary_key = selector_audit_strict_metric_field("strict_f1", primary_eps)
+        gt_margin_key = "selector_audit_gt_signed_margin_median"
+        audit_rows = [row for row in quality_history if primary_key in row]
+        if audit_rows:
+            best_gt_row = max(
+                audit_rows,
+                key=lambda row: (
+                    float(row.get(primary_key, -1.0)),
+                    float(row.get(gt_margin_key, -1e9)),
+                    -float(row.get("epoch", 0.0)),
+                ),
+            )
+            exported_row = next(
+                (row for row in audit_rows if int(row.get("epoch", -1)) == int(best_epoch)),
+                None,
+            )
+            final_row = next(
+                (row for row in audit_rows if int(row.get("epoch", -1)) == int(num_epochs)),
+                None,
+            )
+            model.selector_audit_summary = {
+                "selector_audit_enabled": 1,
+                "selector_audit_gt_edge_count": int(len(selector_audit_gt_edges)),
+                "selector_audit_primary_margin_eps": float(primary_eps),
+                "selector_audit_best_gt_epoch": int(best_gt_row["epoch"]),
+                "selector_audit_best_gt_proxy_score": float(best_gt_row.get("score", 0.0)),
+                "selector_audit_best_gt_primary_strict_f1": float(best_gt_row.get(primary_key, 0.0)),
+                "selector_audit_best_gt_signed_margin_median": float(best_gt_row.get(gt_margin_key, 0.0)),
+                "selector_audit_best_gt_failure_mode": str(best_gt_row.get("selector_audit_failure_mode", "unknown")),
+                "selector_audit_exported_epoch": int(best_epoch),
+                "selector_audit_exported_primary_strict_f1": (
+                    float(exported_row.get(primary_key, 0.0)) if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_signed_margin_median": (
+                    float(exported_row.get(gt_margin_key, 0.0)) if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_failure_mode": (
+                    str(exported_row.get("selector_audit_failure_mode", "unknown"))
+                    if exported_row is not None else "unknown"
+                ),
+                "selector_audit_final_epoch": int(num_epochs),
+                "selector_audit_final_primary_strict_f1": (
+                    float(final_row.get(primary_key, 0.0)) if final_row is not None else 0.0
+                ),
+                "selector_audit_final_signed_margin_median": (
+                    float(final_row.get(gt_margin_key, 0.0)) if final_row is not None else 0.0
+                ),
+                "selector_audit_final_failure_mode": (
+                    str(final_row.get("selector_audit_failure_mode", "unknown"))
+                    if final_row is not None else "unknown"
+                ),
+            }
+            model.selector_audit_summary["selector_audit_exported_vs_best_gt_gap_primary_strict_f1"] = (
+                model.selector_audit_summary["selector_audit_exported_primary_strict_f1"] -
+                model.selector_audit_summary["selector_audit_best_gt_primary_strict_f1"]
+            )
+            model.selector_audit_summary["selector_audit_final_vs_best_gt_gap_primary_strict_f1"] = (
+                model.selector_audit_summary["selector_audit_final_primary_strict_f1"] -
+                model.selector_audit_summary["selector_audit_best_gt_primary_strict_f1"]
+            )
+        else:
+            model.selector_audit_summary = None
+    else:
+        model.selector_audit_summary = None
     model.directional_loss_end_epoch = int(directional_loss_end_epoch)
     model.directional_loss_deactivated_from_epoch = int(directional_loss_deactivated_from_epoch)
     model.main_loss_weight = float(main_loss_weight)
@@ -2745,6 +3651,8 @@ def main():
                         help='Adjacency activation: sigmoid = independent edges; sparsemax/entmax15 = competing parents per target')
     parser.add_argument('--kappa_logit_bias_scale', type=float, default=0.0,
                         help='Persistent symmetric Patel-kappa bias added to structure logits during training')
+    parser.add_argument('--direction_logit_bias_scale', type=float, default=0.0,
+                        help='Persistent Patel-tau bias added to direction logits during training; for a pure residual setup prefer --direction_init_mode zeros or random')
     parser.add_argument('--fixed_support_mask_mode', type=str, default='none',
                         choices=['none', 'topk_kappa', 'maxgap_kappa'],
                         help='Optional fixed undirected support mask injected into support/direction factorization')
@@ -2772,6 +3680,13 @@ def main():
 
     parser.add_argument('--selection_agreement_weight', type=float, default=0.25,
                         help='Weight of Patel tau agreement term in best-epoch proxy score; set 0 to disable')
+    parser.add_argument('--selection_agreement_mode', type=str, default='hard_coverage',
+                        choices=['hard_coverage', 'soft_weighted'],
+                        help='Patel-agreement scoring mode for best-epoch selection')
+    parser.add_argument('--selector_audit_gt_path', type=str, default=None,
+                        help='Optional GT edge file used only for per-epoch selector audit; never used for training or checkpoint selection')
+    parser.add_argument('--selector_audit_strict_margin_eps_values', type=str, default='0,3e-4,0.1',
+                        help='Comma-separated strict-margin eps values recorded by the selector audit when --selector_audit_gt_path is provided')
 
     parser.add_argument('--debug_checks', action='store_true', default=False,
 
@@ -2829,6 +3744,17 @@ def main():
     parser.add_argument('--lag_direction_source', type=str, default='raw',
                         choices=['raw', 'encoder'],
                         help='Signal source for lag_corr directional prior')
+    parser.add_argument('--directional_prior_scope', type=str, default='online_subject',
+                        choices=['online_subject', 'global_dataset'],
+                        help='Whether lag_corr directional prior is recomputed per subject or fixed once from the full dataset')
+    parser.add_argument('--directional_prior_consistency_floor', type=float, default=0.0,
+                        help='Optional cross-subject sign-consistency floor applied only to cached global_dataset lag priors')
+    parser.add_argument('--directional_prior_consistency_power', type=float, default=0.0,
+                        help='Optional soft weighting power applied to cached global_dataset lag priors using cross-subject sign consistency')
+    parser.add_argument('--directional_prior_lags', type=str, default='1',
+                        help='Comma-separated lag steps used by lag_corr directional prior')
+    parser.add_argument('--directional_prior_lag_weights', type=str, default='',
+                        help='Optional comma-separated lag weights for lag_corr directional prior; defaults to inverse-lag weighting')
     parser.add_argument('--directional_kappa_gate', action='store_true', default=False,
                         help='Gate directional margin loss to high-kappa pairs only')
     parser.add_argument('--directional_kappa_gate_quantile', type=float, default=0.5,
@@ -2859,6 +3785,27 @@ def main():
                         help='Cross-pred aggregation inside the auxiliary loss')
     parser.add_argument('--cross_pred_softmax_temp', type=float, default=1.0,
                         help='Temperature for softmax cross-pred aggregation')
+    parser.add_argument('--cross_pred_lags', type=str, default='1',
+                        help='Comma-separated lag steps used by cross-prediction supervision')
+    parser.add_argument('--cross_pred_lag_weights', type=str, default='',
+                        help='Optional comma-separated lag weights for cross-prediction; defaults to inverse-lag weighting')
+    parser.add_argument('--cross_pred_fixed_weight', type=float, default=0.0,
+                        help='Fixed weight for cross-prediction supervision; if > 0 it overrides adaptive cross weighting')
+    parser.add_argument('--cross_pred_fixed_warmup_epochs', type=int, default=0,
+                        help='Warmup epochs before fixed cross-prediction weight activates')
+    parser.add_argument('--cross_pred_fixed_ramp_epochs', type=int, default=1,
+                        help='Linear ramp epochs for fixed cross-prediction weight')
+    parser.add_argument('--anti_collapse_lambda', type=float, default=0.0,
+                        help='Fixed weight for direct anti-collapse loss on directional contrasts')
+    parser.add_argument('--anti_collapse_margin', type=float, default=0.0,
+                        help='Minimum absolute directional contrast encouraged on active pairs')
+    parser.add_argument('--anti_collapse_mode', type=str, default='unsigned_raw',
+                        choices=['unsigned_raw', 'signed_raw', 'signed_gate'],
+                        help='Anti-collapse space: unsigned raw logit gap, signed raw gap, or signed gate skew')
+    parser.add_argument('--anti_collapse_warmup_epochs', type=int, default=0,
+                        help='Warmup epochs before anti-collapse loss activates')
+    parser.add_argument('--anti_collapse_ramp_epochs', type=int, default=1,
+                        help='Linear ramp epochs for anti-collapse loss')
     parser.add_argument('--parent_entropy_lambda', type=float, default=0.0,
                         help='Weight for incoming-parent entropy regularization on the main graph')
     parser.add_argument('--parent_entropy_warmup_epochs', type=int, default=0,
@@ -2922,6 +3869,56 @@ def main():
         parser.error(
             '--enable_gradient_alignment_probe requires --structure_parameterization support_direction'
         )
+    if args.cross_pred_fixed_weight < 0.0:
+        parser.error('--cross_pred_fixed_weight must be >= 0')
+    if args.cross_pred_fixed_warmup_epochs < 0 or args.cross_pred_fixed_ramp_epochs < 1:
+        parser.error('--cross_pred_fixed_warmup_epochs must be >= 0 and --cross_pred_fixed_ramp_epochs must be >= 1')
+    if args.anti_collapse_lambda < 0.0:
+        parser.error('--anti_collapse_lambda must be >= 0')
+    if args.anti_collapse_margin < 0.0:
+        parser.error('--anti_collapse_margin must be >= 0')
+    if args.anti_collapse_mode == 'signed_gate' and args.anti_collapse_margin >= 1.0:
+        parser.error('--anti_collapse_margin must be < 1 when --anti_collapse_mode signed_gate')
+    if not 0.0 <= args.directional_prior_consistency_floor <= 1.0:
+        parser.error('--directional_prior_consistency_floor must be in [0, 1]')
+    if args.directional_prior_consistency_power < 0.0:
+        parser.error('--directional_prior_consistency_power must be >= 0')
+    if args.anti_collapse_lambda > 0.0:
+        if args.disable_directional_loss:
+            parser.error('--anti_collapse_lambda requires directional supervision to remain enabled')
+        if not args.directional_kappa_gate:
+            parser.error('--anti_collapse_lambda requires --directional_kappa_gate')
+    if args.anti_collapse_warmup_epochs < 0 or args.anti_collapse_ramp_epochs < 1:
+        parser.error('--anti_collapse_warmup_epochs must be >= 0 and --anti_collapse_ramp_epochs must be >= 1')
+
+    try:
+        directional_prior_lags, directional_prior_lag_weights = resolve_lag_weight_spec(
+            parse_int_csv_arg(args.directional_prior_lags, name='--directional_prior_lags'),
+            (
+                parse_float_csv_arg(args.directional_prior_lag_weights, name='--directional_prior_lag_weights')
+                if args.directional_prior_lag_weights.strip()
+                else None
+            ),
+        )
+        cross_pred_lags, cross_pred_lag_weights = resolve_lag_weight_spec(
+            parse_int_csv_arg(args.cross_pred_lags, name='--cross_pred_lags'),
+            (
+                parse_float_csv_arg(args.cross_pred_lag_weights, name='--cross_pred_lag_weights')
+                if args.cross_pred_lag_weights.strip()
+                else None
+            ),
+        )
+        selector_audit_strict_margin_eps_values = tuple(
+            normalize_margin_eps_value(v)
+            for v in parse_float_csv_arg(
+                args.selector_audit_strict_margin_eps_values,
+                name='--selector_audit_strict_margin_eps_values',
+            )
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if any(v < 0.0 for v in selector_audit_strict_margin_eps_values):
+        parser.error('--selector_audit_strict_margin_eps_values must be non-negative')
 
     
 
@@ -2951,7 +3948,17 @@ def main():
     print(f"Structure parameterization: {args.structure_parameterization}")
     print(f"Adjacency activation: {args.adj_activation}")
     print(f"Kappa logit bias scale: {args.kappa_logit_bias_scale}")
+    print(f"Direction logit bias scale: {args.direction_logit_bias_scale}")
     print(f"Main DDM loss weight: {args.main_loss_weight}")
+    print(f"Directional prior lags/weights: {list(directional_prior_lags)} / {[round(v, 4) for v in directional_prior_lag_weights]}")
+    print(f"Directional prior consistency floor: {args.directional_prior_consistency_floor}")
+    print(f"Directional prior consistency power: {args.directional_prior_consistency_power}")
+    print(f"Cross-pred lags/weights: {list(cross_pred_lags)} / {[round(v, 4) for v in cross_pred_lag_weights]}")
+    print(f"Cross-pred fixed weight: {args.cross_pred_fixed_weight}")
+    print(f"Anti-collapse lambda/margin/mode: {args.anti_collapse_lambda} / {args.anti_collapse_margin} / {args.anti_collapse_mode}")
+    print(f"Selection agreement mode: {args.selection_agreement_mode}")
+    print(f"Selector audit GT path: {args.selector_audit_gt_path}")
+    print(f"Selector audit strict eps: {list(selector_audit_strict_margin_eps_values)}")
 
     print("=" * 60)
 
@@ -2975,6 +3982,21 @@ def main():
 
     effective_time_points = int(data_3d.shape[-1])
     print(f"Effective dataset: subjects={num_subjects}, nodes={num_nodes}, time_points={effective_time_points}")
+    selector_audit_gt_edges: Optional[Set[Tuple[int, int]]] = None
+    if args.selector_audit_gt_path:
+        selector_audit_gt_edges = load_gt_edges(args.selector_audit_gt_path)
+        if not selector_audit_gt_edges:
+            raise ValueError(f"No GT edges found in {args.selector_audit_gt_path}")
+        max_gt_node = max(max(src, dst) for src, dst in selector_audit_gt_edges)
+        if max_gt_node >= num_nodes:
+            raise ValueError(
+                f"GT path {args.selector_audit_gt_path} contains node index {max_gt_node + 1}, "
+                f"but dataset has only {num_nodes} nodes"
+            )
+        print(
+            "Selector audit GT: "
+            f"loaded {len(selector_audit_gt_edges)} directed edges from {args.selector_audit_gt_path}"
+        )
 
     
 
@@ -3019,11 +4041,21 @@ def main():
             f"sym_range=[{torch.clamp(patel_kappa_matrix, min=0.0).min():.4f}, "
             f"{torch.clamp(patel_kappa_matrix, min=0.0).max():.4f}]"
         )
+    if args.direction_logit_bias_scale != 0.0:
+        tau_contrast = patel_tau_matrix - patel_tau_matrix.t()
+        print(
+            "Direction logit bias: enabled | "
+            f"scale={args.direction_logit_bias_scale} | "
+            f"contrast_range=[{tau_contrast.min():.4f}, {tau_contrast.max():.4f}]"
+        )
     if args.enable_cross_prediction:
         print(f"Cross-prediction: enabled | target_ratio={args.cross_pred_target_ratio} | "
               f"schedule={args.cross_pred_schedule} | "
               f"aggregation={args.cross_pred_aggregation} | "
-              f"softmax_temp={args.cross_pred_softmax_temp}")
+              f"softmax_temp={args.cross_pred_softmax_temp} | "
+              f"lags={list(cross_pred_lags)} | "
+              f"lag_weights={[round(v, 4) for v in cross_pred_lag_weights]} | "
+              f"fixed_weight={args.cross_pred_fixed_weight:g}")
     if args.parent_entropy_lambda > 0.0:
         print(f"Parent concentration: enabled | entropy_lambda={args.parent_entropy_lambda} | "
               f"warmup={args.parent_entropy_warmup_epochs} | "
@@ -3042,9 +4074,20 @@ def main():
               f"schedule={args.directional_schedule} | "
               f"target_ratio={args.directional_target_ratio} | "
               f"end_epoch={args.directional_loss_end_epoch} | "
-              f"lag_source={args.lag_direction_source}")
+              f"lag_source={args.lag_direction_source} | "
+              f"scope={args.directional_prior_scope} | "
+              f"consistency_floor={args.directional_prior_consistency_floor:.2f} | "
+              f"consistency_power={args.directional_prior_consistency_power:.2f} | "
+              f"lags={list(directional_prior_lags)} | "
+              f"lag_weights={[round(v, 4) for v in directional_prior_lag_weights]}")
         if args.directional_kappa_gate:
             print(f"Directional kappa gate requested | quantile={args.directional_kappa_gate_quantile}")
+    if args.anti_collapse_lambda > 0.0:
+        print(f"Anti-collapse: enabled | lambda={args.anti_collapse_lambda} | "
+              f"margin={args.anti_collapse_margin} | "
+              f"mode={args.anti_collapse_mode} | "
+              f"warmup={args.anti_collapse_warmup_epochs} | "
+              f"ramp={args.anti_collapse_ramp_epochs}")
     if args.structure_parameterization == 'support_direction':
         print(f"Direction retention: lr_multiplier={args.direction_lr_multiplier:g} | "
               f"freeze_after_epoch={args.freeze_direction_after_epoch}")
@@ -3172,6 +4215,11 @@ def main():
         directional_prior_mode=args.directional_prior_mode,
         directional_schedule=args.directional_schedule,
         lag_direction_source=args.lag_direction_source,
+        directional_prior_scope=args.directional_prior_scope,
+        directional_prior_consistency_floor=args.directional_prior_consistency_floor,
+        directional_prior_consistency_power=args.directional_prior_consistency_power,
+        directional_prior_lags=directional_prior_lags,
+        directional_prior_lag_weights=directional_prior_lag_weights,
         directional_kappa_gate=args.directional_kappa_gate,
         directional_kappa_gate_quantile=args.directional_kappa_gate_quantile,
         directional_target_ratio=args.directional_target_ratio,
@@ -3186,6 +4234,16 @@ def main():
         cross_pred_schedule=args.cross_pred_schedule,
         cross_pred_aggregation=args.cross_pred_aggregation,
         cross_pred_softmax_temp=args.cross_pred_softmax_temp,
+        cross_pred_lags=cross_pred_lags,
+        cross_pred_lag_weights=cross_pred_lag_weights,
+        cross_pred_fixed_weight=args.cross_pred_fixed_weight,
+        cross_pred_fixed_warmup_epochs=args.cross_pred_fixed_warmup_epochs,
+        cross_pred_fixed_ramp_epochs=args.cross_pred_fixed_ramp_epochs,
+        anti_collapse_lambda=args.anti_collapse_lambda,
+        anti_collapse_margin=args.anti_collapse_margin,
+        anti_collapse_mode=args.anti_collapse_mode,
+        anti_collapse_warmup_epochs=args.anti_collapse_warmup_epochs,
+        anti_collapse_ramp_epochs=args.anti_collapse_ramp_epochs,
         parent_entropy_lambda=args.parent_entropy_lambda,
         parent_entropy_warmup_epochs=args.parent_entropy_warmup_epochs,
         parent_entropy_ramp_epochs=args.parent_entropy_ramp_epochs,
@@ -3197,6 +4255,9 @@ def main():
         ungated_symmetry_warmup_epochs=args.ungated_symmetry_warmup_epochs,
         ungated_symmetry_ramp_epochs=args.ungated_symmetry_ramp_epochs,
         selection_agreement_weight=args.selection_agreement_weight,
+        selection_agreement_mode=args.selection_agreement_mode,
+        selector_audit_gt_edges=selector_audit_gt_edges,
+        selector_audit_strict_margin_eps_values=selector_audit_strict_margin_eps_values,
         ddm_kwargs={
             'use_temporal_encoder': not args.disable_temporal_encoder,
             'uniform_timestep': not args.per_node_timestep,
@@ -3208,6 +4269,7 @@ def main():
             'structure_message_graph_mode': args.structure_message_graph_mode,
             'adj_activation': args.adj_activation,
             'kappa_logit_bias_scale': args.kappa_logit_bias_scale,
+            'direction_logit_bias_scale': args.direction_logit_bias_scale,
             'direction_init_features': direction_init_matrix,
             'fixed_support_mask': fixed_support_mask,
             'loss_type': args.loss_type,
@@ -3363,6 +4425,7 @@ def main():
     config['exported_epoch'] = int(best_epoch)
     config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
     config['best_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+    config['selection_agreement_mode'] = str(args.selection_agreement_mode)
     config['best_epoch_guarded'] = int(getattr(model, 'best_epoch_guarded', -1))
     config['best_epoch_guarded_score'] = float(getattr(model, 'best_epoch_guarded_score', -1.0))
     config['best_epoch_score_only'] = int(getattr(model, 'best_epoch_score_only', -1))
@@ -3375,14 +4438,52 @@ def main():
     config['effective_emb_dim'] = int(getattr(model, 'emb_dim', num_nodes))
     config['structure_message_graph_mode'] = str(getattr(model, 'structure_message_graph_mode', args.structure_message_graph_mode))
     config['adj_activation'] = str(getattr(model, 'adj_activation', args.adj_activation))
+    config['kappa_logit_bias_scale'] = float(getattr(model, 'kappa_logit_bias_scale', args.kappa_logit_bias_scale))
+    config['direction_logit_bias_scale'] = float(getattr(model, 'direction_logit_bias_scale', args.direction_logit_bias_scale))
+    config['directional_prior_scope'] = args.directional_prior_scope
+    config['directional_prior_consistency_floor'] = float(args.directional_prior_consistency_floor)
+    config['directional_prior_consistency_power'] = float(args.directional_prior_consistency_power)
+    config['directional_prior_lags'] = ",".join(str(v) for v in directional_prior_lags)
+    config['directional_prior_lag_weights'] = ",".join(f"{v:.8f}" for v in directional_prior_lag_weights)
+    config['cross_pred_lags'] = ",".join(str(v) for v in cross_pred_lags)
+    config['cross_pred_lag_weights'] = ",".join(f"{v:.8f}" for v in cross_pred_lag_weights)
+    config['selector_audit_gt_path'] = args.selector_audit_gt_path
+    config['selector_audit_strict_margin_eps_values'] = ",".join(
+        np.format_float_positional(v, trim='-') for v in selector_audit_strict_margin_eps_values
+    )
+    config['cross_pred_fixed_weight'] = float(args.cross_pred_fixed_weight)
+    config['cross_pred_fixed_warmup_epochs'] = int(args.cross_pred_fixed_warmup_epochs)
+    config['cross_pred_fixed_ramp_epochs'] = int(args.cross_pred_fixed_ramp_epochs)
+    config['anti_collapse_lambda'] = float(args.anti_collapse_lambda)
+    config['anti_collapse_margin'] = float(args.anti_collapse_margin)
+    config['anti_collapse_mode'] = args.anti_collapse_mode
+    config['anti_collapse_warmup_epochs'] = int(args.anti_collapse_warmup_epochs)
+    config['anti_collapse_ramp_epochs'] = int(args.anti_collapse_ramp_epochs)
     config['directional_loss_deactivated_from_epoch'] = int(getattr(model, 'directional_loss_deactivated_from_epoch', -1))
     config['direction_branch_frozen_from_epoch'] = int(getattr(model, 'direction_branch_frozen_from_epoch', -1))
     final_adj_diag = getattr(model, 'last_epoch_adj_diagnostics', None)
     if final_adj_diag is not None:
         for key, value in final_adj_diag.items():
             config[f'final_{key}'] = float(value)
+    selector_audit_summary = getattr(model, 'selector_audit_summary', None)
+    if selector_audit_summary is not None:
+        for key, value in selector_audit_summary.items():
+            config[key] = value
 
     np.save(os.path.join(result_dir, 'config.npy'), config, allow_pickle=True)
+
+    model_checkpoint_path = os.path.join(result_dir, 'model_final.pt')
+    torch.save(
+        {
+            'model_state_dict': model.state_dict(),
+            'exported_epoch': int(best_epoch),
+            'best_epoch_selection_mode': str(getattr(model, 'best_epoch_selection_mode', 'unknown')),
+            'raw_adjacency_convention': RAW_ADJ_CONVENTION,
+            'causal_adjacency_convention': CAUSAL_ADJ_CONVENTION,
+        },
+        model_checkpoint_path,
+    )
+    print(f"Saved full model checkpoint to: {model_checkpoint_path}")
 
     
 
@@ -3409,6 +4510,14 @@ def main():
         quality_csv_path = os.path.join(result_dir, 'quality_history.csv')
         quality_df.to_csv(quality_csv_path, index=False, float_format='%.6f')
         print(f"Saved quality history to: {quality_csv_path}")
+    if selector_audit_summary is not None:
+        selector_audit_summary_path = os.path.join(result_dir, 'selector_audit_summary.csv')
+        pd.DataFrame([selector_audit_summary]).to_csv(
+            selector_audit_summary_path,
+            index=False,
+            float_format='%.6f',
+        )
+        print(f"Saved selector audit summary to: {selector_audit_summary_path}")
 
     # Save Patel matrices for reference (both npy and csv)
     np.save(os.path.join(result_dir, 'patel_score.npy'), patel_score_matrix.numpy())
@@ -3468,6 +4577,8 @@ def main():
     print(f"  - loss_history.csv")
 
     print(f"  - quality_history.csv")
+    if selector_audit_summary is not None:
+        print(f"  - selector_audit_summary.csv <- GT-only selector audit（不参与训练/选模）")
 
     print(f"  - pearson_matrix.csv")
 
@@ -3497,6 +4608,21 @@ def main():
         print(f"  - Offdiag Max:  {final_adj_diag['adj_offdiag_max']:.4f}")
         print(f"  - InDeg Mean:   {final_adj_diag['adj_in_degree_mean']:.4f}")
         print(f"  - InDeg Std:    {final_adj_diag['adj_in_degree_std']:.4f}")
+    if selector_audit_summary is not None:
+        print("Selector audit summary:")
+        print(f"  - Primary strict eps: {selector_audit_summary['selector_audit_primary_margin_eps']:g}")
+        print(f"  - Best GT epoch: {selector_audit_summary['selector_audit_best_gt_epoch']} | "
+              f"strict={selector_audit_summary['selector_audit_best_gt_primary_strict_f1']:.4f} | "
+              f"gt_margin_med={selector_audit_summary['selector_audit_best_gt_signed_margin_median']:+.4f} | "
+              f"mode={selector_audit_summary['selector_audit_best_gt_failure_mode']}")
+        print(f"  - Exported epoch: {selector_audit_summary['selector_audit_exported_epoch']} | "
+              f"strict={selector_audit_summary['selector_audit_exported_primary_strict_f1']:.4f} | "
+              f"gap_vs_best={selector_audit_summary['selector_audit_exported_vs_best_gt_gap_primary_strict_f1']:+.4f} | "
+              f"mode={selector_audit_summary['selector_audit_exported_failure_mode']}")
+        print(f"  - Final epoch: {selector_audit_summary['selector_audit_final_epoch']} | "
+              f"strict={selector_audit_summary['selector_audit_final_primary_strict_f1']:.4f} | "
+              f"gap_vs_best={selector_audit_summary['selector_audit_final_vs_best_gt_gap_primary_strict_f1']:+.4f} | "
+              f"mode={selector_audit_summary['selector_audit_final_failure_mode']}")
 
     
 

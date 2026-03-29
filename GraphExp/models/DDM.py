@@ -153,6 +153,7 @@ class DDM(nn.Module):
             init_features: Optional[torch.Tensor] = None,
             noise_guide_adj: Optional[torch.Tensor] = None,
             kappa_logit_bias_prior: Optional[torch.Tensor] = None,
+            direction_logit_bias_prior: Optional[torch.Tensor] = None,
             direction_init_features: Optional[torch.Tensor] = None,
             fixed_support_mask: Optional[torch.Tensor] = None,
             normalize_noise: bool = True,
@@ -164,6 +165,7 @@ class DDM(nn.Module):
             adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
             init_logit_scale: float = 1.0,  # Target std of initial structure logits after rescaling
             kappa_logit_bias_scale: float = 0.0,  # Persistent symmetric Patel-kappa bias added to structure logits
+            direction_logit_bias_scale: float = 0.0,  # Persistent Patel-tau bias added to direction logits
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
             use_temporal_encoder: bool = True,
@@ -245,6 +247,17 @@ class DDM(nn.Module):
             self.register_buffer('kappa_logit_bias_prior', kappa_logit_bias_prior)
         else:
             self.kappa_logit_bias_prior = None
+        self.direction_logit_bias_scale = float(direction_logit_bias_scale)
+        if direction_logit_bias_prior is not None:
+            # Store half of the skew-symmetric prior so the downstream
+            # direction_gate = sigmoid(D - D^T) receives the full Patel tau
+            # contrast after the transpose subtraction.
+            direction_logit_bias_prior = 0.5 * (
+                direction_logit_bias_prior - direction_logit_bias_prior.transpose(0, 1)
+            )
+            self.register_buffer('direction_logit_bias_prior', direction_logit_bias_prior)
+        else:
+            self.direction_logit_bias_prior = None
         if fixed_support_mask is not None:
             self.register_buffer('fixed_support_mask', fixed_support_mask)
         else:
@@ -333,6 +346,16 @@ class DDM(nn.Module):
                     f"prior_range=[{self.kappa_logit_bias_prior.min().item():.4f}, "
                     f"{self.kappa_logit_bias_prior.max().item():.4f}])"
                 )
+            if self.direction_logit_bias_prior is not None and abs(self.direction_logit_bias_scale) > 0.0:
+                direction_prior_contrast = (
+                    self.direction_logit_bias_prior - self.direction_logit_bias_prior.transpose(0, 1)
+                )
+                print(
+                    "Direction logit bias: "
+                    f"enabled (scale={self.direction_logit_bias_scale:g}, "
+                    f"contrast_range=[{direction_prior_contrast.min().item():.4f}, "
+                    f"{direction_prior_contrast.max().item():.4f}])"
+                )
             if self.fixed_support_mask is not None:
                 support_pairs = int(self.fixed_support_mask.sum().item() / 2.0)
                 print(f"Fixed support mask: enabled ({support_pairs} undirected pairs)")
@@ -374,6 +397,10 @@ class DDM(nn.Module):
         if self.structure_parameterization != 'support_direction':
             return self.get_structure_logits()
         direction_logits = self.direction_emb_sender @ self.direction_emb_receiver.T
+        if self.direction_logit_bias_prior is not None and abs(self.direction_logit_bias_scale) > 0.0:
+            direction_logits = (
+                direction_logits + self.direction_logit_bias_scale * self.direction_logit_bias_prior
+            )
         return torch.clamp(direction_logits, -6.0, 6.0)
 
     def get_structure_adj(self):
