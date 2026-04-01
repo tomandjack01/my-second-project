@@ -607,7 +607,10 @@ def compute_noise_guide_probe_diagnostics(model: DDM, x: torch.Tensor) -> Dict[s
             eps_override=probe_eps,
             noise_guide_adj_override=noise_guide_adj,
         )
-        return float(model.node_denoising(clean, x_t, time_embed, g, edge_weight=edge_weight).item())
+        probe_loss = model.node_denoising(clean, x_t, time_embed, g, edge_weight=edge_weight)
+        if isinstance(probe_loss, tuple):
+            probe_loss = probe_loss[0]
+        return float(probe_loss.item())
 
     patel_loss = compute_probe_loss(patel_noise_guide_adj)
     blend50_loss = compute_probe_loss(blend50_noise_guide_adj)
@@ -627,14 +630,6 @@ def compute_noise_guide_probe_diagnostics(model: DDM, x: torch.Tensor) -> Dict[s
             torch.abs(learned_noise_guide_adj - patel_noise_guide_adj).mean().item()
         ),
     }
-
-
-def get_current_structure_logits(model: DDM, causal: bool = False, detach: bool = False) -> torch.Tensor:
-    """Fetch the current structure logits under raw or causal convention."""
-    logits = model.get_structure_logits()
-    if causal:
-        logits = to_causal_matrix_torch(logits)
-    return logits.detach() if detach else logits
 
 
 def get_current_directional_logits(model: DDM, causal: bool = False, detach: bool = False) -> torch.Tensor:
@@ -908,19 +903,14 @@ def compute_auxiliary_lambdas(
     loss_ddm_main: torch.Tensor,
     raw_loss_dir: torch.Tensor,
     raw_loss_ortho: torch.Tensor,
-    raw_loss_cross: torch.Tensor,
     prev_lambda_dir: float,
     prev_lambda_ortho: float,
-    prev_lambda_cross: float,
     dir_target_ratio: float = 0.01,
     ortho_target_ratio: float = 0.005,
-    cross_target_ratio: float = 0.02,
     warmup_epochs: int = 5,
     dir_schedule: str = "cosine_anneal",
-    cross_warmup_epochs: int = 3,
-    cross_schedule: str = "cosine_anneal",
 ):
-    """Compute adaptive weights for directional, orthogonality, and cross-prediction losses."""
+    """Compute adaptive weights for directional and orthogonality losses."""
     lambda_dir = compute_single_aux_lambda(
         epoch=epoch,
         num_epochs=num_epochs,
@@ -940,17 +930,7 @@ def compute_auxiliary_lambdas(
         target_ratio=ortho_target_ratio,
         warmup_epochs=warmup_epochs,
     )
-    lambda_cross = compute_single_aux_lambda(
-        epoch=epoch,
-        num_epochs=num_epochs,
-        loss_ddm_main=loss_ddm_main,
-        raw_loss=raw_loss_cross,
-        prev_lambda=prev_lambda_cross,
-        target_ratio=cross_target_ratio,
-        warmup_epochs=cross_warmup_epochs,
-        schedule=cross_schedule,
-    )
-    return lambda_dir, lambda_ortho, lambda_cross
+    return lambda_dir, lambda_ortho
 
 
 
@@ -1055,42 +1035,6 @@ def compute_directional_margin_loss(
     wrong_dir_penalty = F.relu(adaptive_margin - signed_D)
     loss_dir = torch.sum(w * wrong_dir_penalty) / (torch.sum(w) + 1e-8)
     return loss_dir
-
-
-def compute_directional_anti_collapse_loss(
-    logits: torch.Tensor,
-    direction_prior_matrix: torch.Tensor,
-    margin_floor: float,
-    pair_gate_matrix: Optional[torch.Tensor] = None,
-    pair_reliability_matrix: Optional[torch.Tensor] = None,
-    mode: str = "unsigned_raw",
-) -> torch.Tensor:
-    """Keep confident directional pairs away from the symmetric tie basin."""
-    if margin_floor <= 0.0:
-        return logits.new_tensor(0.0)
-
-    delta_prior, active_mask, w, _ = build_directional_active_mask(
-        direction_prior_matrix,
-        pair_gate_matrix=pair_gate_matrix,
-        pair_reliability_matrix=pair_reliability_matrix,
-    )
-    if active_mask.sum() == 0:
-        return logits.new_tensor(0.0)
-
-    directional_delta = logits - logits.t()
-    if mode == "unsigned_raw":
-        anti_collapse_margin = torch.abs(directional_delta)
-    else:
-        signed_delta = torch.sign(delta_prior) * directional_delta
-        if mode == "signed_raw":
-            anti_collapse_margin = signed_delta
-        elif mode == "signed_gate":
-            anti_collapse_margin = torch.tanh(0.5 * signed_delta)
-        else:
-            raise ValueError(f"Unsupported anti-collapse mode: {mode}")
-
-    collapse_penalty = F.relu(float(margin_floor) - anti_collapse_margin)
-    return torch.sum(w * collapse_penalty) / (torch.sum(w) + 1e-8)
 
 
 @torch.no_grad()
@@ -1687,32 +1631,23 @@ def compute_dataset_direction_prior_components(
     return mean_prior, consistency
 
 
-@torch.no_grad()
-def compute_dataset_direction_prior_matrix(
-    model: DDM,
-    data_3d: torch.Tensor,
-    mode: str,
-    patel_direction_matrix: torch.Tensor,
-    lag_direction_source: str = "raw",
-) -> torch.Tensor:
-    """Build one fixed directional-prior matrix by averaging subject-level priors."""
-    mean_prior, _ = compute_dataset_direction_prior_components(
-        model,
-        data_3d,
-        mode=mode,
-        patel_direction_matrix=patel_direction_matrix,
-        lag_direction_source=lag_direction_source,
-    )
-    return mean_prior
-
-
-def build_cross_prediction_aggregation_weights(
+def build_causal_lag_aggregation_weights(
     model: DDM,
     aggregation: str = "mean",
     softmax_temp: float = 1.0,
+    reverse_causal: bool = False,
+    detach_direction_gate: bool = False,
+    detach_support_weights: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build causal adjacency and cross-pred aggregation weights."""
-    adj_causal = to_causal_matrix_torch(model.get_structure_adj())
+    """Build causal adjacency and aggregation weights for causal-lag reconstruction."""
+    adj_causal = to_causal_matrix_torch(
+        model.get_structure_adj(
+            detach_direction_gate=detach_direction_gate,
+            detach_support_weights=detach_support_weights,
+        )
+    )
+    if reverse_causal:
+        adj_causal = adj_causal.transpose(0, 1)
     if aggregation == "mean":
         in_degree = adj_causal.sum(dim=0, keepdim=True).clamp_min(1e-8)
         agg_weights = adj_causal / in_degree
@@ -1720,139 +1655,26 @@ def build_cross_prediction_aggregation_weights(
     if aggregation == "softmax":
         if softmax_temp <= 0.0:
             raise ValueError(f"softmax_temp must be positive, got {softmax_temp}")
-        causal_logits = get_current_structure_logits(model, causal=True)
         diag_mask = torch.eye(
-            causal_logits.shape[0], dtype=torch.bool, device=causal_logits.device,
+            adj_causal.shape[0], dtype=torch.bool, device=adj_causal.device,
         )
-        masked_logits = causal_logits.masked_fill(diag_mask, float("-inf"))
-        agg_weights = torch.softmax(masked_logits / softmax_temp, dim=0)
+        support_mask = adj_causal > 0.0
+        masked_scores = adj_causal.masked_fill(diag_mask, float("-inf"))
+        masked_scores = masked_scores.masked_fill(~support_mask, float("-inf"))
+        zero_incoming = (~support_mask).all(dim=0)
+        agg_weights = torch.softmax(masked_scores / softmax_temp, dim=0)
         agg_weights = agg_weights.masked_fill(diag_mask, 0.0)
+        agg_weights = agg_weights.masked_fill(~support_mask, 0.0)
+        if zero_incoming.any():
+            agg_weights[:, zero_incoming] = 0.0
         return adj_causal, agg_weights
-    raise ValueError(f"Unsupported cross-pred aggregation: {aggregation}")
-
-
-def get_cross_prediction_tensors(
-    model: DDM,
-    x: torch.Tensor,
-) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
-    """Build frozen source features, predictions, and targets for each active lag."""
-    with torch.no_grad():
-        h = model.prepare_clean_target(x)
-
-    adj_causal, agg_weights = build_cross_prediction_aggregation_weights(
-        model,
-        aggregation=getattr(model, "cross_pred_aggregation", "mean"),
-        softmax_temp=getattr(model, "cross_pred_softmax_temp", 1.0),
-    )
-
-    lagged_batches: List[Dict[str, torch.Tensor]] = []
-    lags = getattr(model, "cross_pred_lags", (1,))
-    lag_weights = getattr(model, "cross_pred_lag_weights", (1.0,))
-    for lag, weight in zip(lags, lag_weights):
-        lag = int(lag)
-        validate_lag_against_series(h, x, lag)
-        h_past = h[:, :-lag]
-        x_future = x[:, lag:]
-        pred = torch.einsum('ce,ct->et', agg_weights, h_past)
-        lagged_batches.append(
-            {
-                "lag": torch.tensor(lag, device=x.device),
-                "weight": torch.tensor(float(weight), device=x.device, dtype=x.dtype),
-                "h_past": h_past,
-                "pred": pred,
-                "target": x_future,
-            }
-        )
-    return lagged_batches, adj_causal, agg_weights
+    raise ValueError(f"Unsupported causal-lag aggregation: {aggregation}")
 
 
 def offdiag_values(matrix: torch.Tensor) -> torch.Tensor:
     """Return off-diagonal values from a square matrix."""
     mask = ~torch.eye(matrix.shape[0], dtype=torch.bool, device=matrix.device)
     return matrix.masked_select(mask)
-
-
-def compute_pairwise_node_cosine_stats(node_time: torch.Tensor, prefix: str) -> Dict[str, float]:
-    """Summarize off-diagonal node-to-node cosine similarities for [N, T] features."""
-    if node_time.dim() != 2:
-        raise ValueError(f"Expected [N, T] tensor, got shape {tuple(node_time.shape)}")
-
-    if node_time.shape[0] <= 1:
-        return {
-            f"{prefix}_mean_cos": 0.0,
-            f"{prefix}_p90_cos": 0.0,
-            f"{prefix}_gt_0p7_frac": 0.0,
-        }
-
-    normalized = F.normalize(node_time, p=2, dim=-1, eps=1e-8)
-    sim = normalized @ normalized.transpose(0, 1)
-    vals = offdiag_values(sim)
-    return {
-        f"{prefix}_mean_cos": float(vals.mean().item()),
-        f"{prefix}_p90_cos": float(torch.quantile(vals, 0.90).item()),
-        f"{prefix}_gt_0p7_frac": float((vals > 0.7).float().mean().item()),
-    }
-
-
-@torch.no_grad()
-def compute_cross_prediction_diagnostics(model: DDM, x: torch.Tensor) -> Dict[str, float]:
-    """Summarize shared-signal and prediction-target alignment diagnostics for cross-prediction."""
-    lagged_batches, _, agg_weights = get_cross_prediction_tensors(model, x)
-    if not lagged_batches:
-        return {
-            "cross_num_lags": 0.0,
-            "cross_pred_target_diag_mean": 0.0,
-            "cross_pred_target_offdiag_mean": 0.0,
-            "cross_pred_target_diag_gap": 0.0,
-            "cross_agg_max_mean": 0.0,
-            "cross_agg_max_p90": 0.0,
-            "cross_agg_eff_parents_mean": 0.0,
-        }
-
-    weighted_source_stats: Dict[str, float] = {}
-    weighted_pred_stats: Dict[str, float] = {}
-    weighted_target_stats: Dict[str, float] = {}
-    diag_mean = 0.0
-    offdiag_mean = 0.0
-    for batch in lagged_batches:
-        weight = float(batch["weight"].item())
-        h_past_z = zscore_per_node_time(batch["h_past"])
-        pred_z = zscore_per_node_time(batch["pred"])
-        target_z = zscore_per_node_time(batch["target"])
-
-        pred_norm = F.normalize(pred_z, p=2, dim=-1, eps=1e-8)
-        target_norm = F.normalize(target_z, p=2, dim=-1, eps=1e-8)
-        pred_target_sim = pred_norm @ target_norm.transpose(0, 1)
-        diag_vals = torch.diagonal(pred_target_sim)
-        offdiag_sim = offdiag_values(pred_target_sim)
-
-        diag_mean += weight * float(diag_vals.mean().item())
-        offdiag_mean += weight * (float(offdiag_sim.mean().item()) if offdiag_sim.numel() > 0 else 0.0)
-
-        for stats_dict, values, prefix in (
-            (weighted_source_stats, compute_pairwise_node_cosine_stats(h_past_z, "cross_source"), "cross_source"),
-            (weighted_pred_stats, compute_pairwise_node_cosine_stats(pred_z, "cross_pred"), "cross_pred"),
-            (weighted_target_stats, compute_pairwise_node_cosine_stats(target_z, "cross_target"), "cross_target"),
-        ):
-            for key, value in values.items():
-                stats_dict[key] = stats_dict.get(key, 0.0) + weight * float(value)
-
-    stats = {}
-    stats.update(weighted_source_stats)
-    stats.update(weighted_pred_stats)
-    stats.update(weighted_target_stats)
-    per_target_max = agg_weights.max(dim=0).values
-    effective_parents = 1.0 / agg_weights.pow(2).sum(dim=0).clamp_min(1e-8)
-    stats.update({
-        "cross_num_lags": float(len(lagged_batches)),
-        "cross_pred_target_diag_mean": diag_mean,
-        "cross_pred_target_offdiag_mean": offdiag_mean,
-        "cross_pred_target_diag_gap": diag_mean - offdiag_mean,
-        "cross_agg_max_mean": float(per_target_max.mean().item()),
-        "cross_agg_max_p90": float(torch.quantile(per_target_max, 0.90).item()),
-        "cross_agg_eff_parents_mean": float(effective_parents.mean().item()),
-    })
-    return stats
 
 
 @torch.no_grad()
@@ -1961,24 +1783,315 @@ def compute_adjacency_uniformity_diagnostics(adj_causal: torch.Tensor) -> Dict[s
     }
 
 
-def compute_cross_prediction_loss(model: DDM, x: torch.Tensor) -> torch.Tensor:
+def compute_causal_lag_main_loss(
+    model: DDM,
+    source_node_time: torch.Tensor,
+    target_node_time: torch.Tensor,
+    *,
+    aggregation: str = "mean",
+    softmax_temp: float = 1.0,
+    lags: Sequence[int] = (1,),
+    lag_weights: Sequence[float] = (1.0,),
+    reverse_causal: bool = False,
+    detach_direction_gate: bool = False,
+    detach_support_weights: bool = False,
+) -> torch.Tensor:
     """
-    Online directionality loss from cross prediction.
-
-    We use explicit causal adjacency semantics:
-    adj_causal[cause, effect] predicts how source-node history contributes to
-    the target node's future. For each target node, aggregate over causes.
+    Reconstruct each node's future from lagged candidate-parent signals
+    using the exported causal adjacency.
     """
-    lagged_batches, _, _ = get_cross_prediction_tensors(model, x)
-    if not lagged_batches:
-        return x.new_tensor(0.0)
-
-    loss = x.new_tensor(0.0)
-    for batch in lagged_batches:
-        pred_z = zscore_per_node_time(batch["pred"])
-        target_z = zscore_per_node_time(batch["target"])
-        loss = loss + batch["weight"] * F.smooth_l1_loss(pred_z, target_z)
+    if source_node_time.dim() != 2 or target_node_time.dim() != 2:
+        raise ValueError(
+            "compute_causal_lag_main_loss expects [N, T] tensors, got "
+            f"{tuple(source_node_time.shape)} and {tuple(target_node_time.shape)}"
+        )
+    _, agg_weights = build_causal_lag_aggregation_weights(
+        model,
+        aggregation=aggregation,
+        softmax_temp=softmax_temp,
+        reverse_causal=reverse_causal,
+        detach_direction_gate=detach_direction_gate,
+        detach_support_weights=detach_support_weights,
+    )
+    loss = source_node_time.new_tensor(0.0)
+    for lag, weight in zip(lags, lag_weights):
+        lag = int(lag)
+        validate_lag_against_series(source_node_time, target_node_time, lag)
+        source_past = source_node_time[:, :-lag]
+        target_future = target_node_time[:, lag:]
+        pred_future = torch.einsum("ce,ct->et", agg_weights, source_past)
+        pred_future_z = zscore_per_node_time(pred_future)
+        target_future_z = zscore_per_node_time(target_future)
+        loss = loss + float(weight) * F.smooth_l1_loss(pred_future_z, target_future_z)
     return loss
+
+
+@torch.no_grad()
+def compute_causal_lag_main_diagnostics(
+    model: DDM,
+    x: torch.Tensor,
+    *,
+    aggregation: str = "mean",
+    softmax_temp: float = 1.0,
+    lags: Sequence[int] = (1,),
+    lag_weights: Sequence[float] = (1.0,),
+) -> Dict[str, float]:
+    """Compare forward vs reversed causal-lag reconstruction on clean targets."""
+    stats = {
+        "causal_lag_diag_available": 0.0,
+        "causal_lag_diag_forward_loss": 0.0,
+        "causal_lag_diag_reverse_loss": 0.0,
+        "causal_lag_diag_reverse_minus_forward": 0.0,
+        "causal_lag_diag_forward_over_reverse": 0.0,
+        "causal_lag_diag_prefers_forward": 0.0,
+        "causal_lag_diag_num_lags": 0.0,
+    }
+    if x.dim() != 2 or not lags:
+        return stats
+
+    clean = model.prepare_clean_target(x)
+    max_lag = max(int(v) for v in lags)
+    if clean.shape[-1] <= max_lag:
+        return stats
+
+    forward_loss = compute_causal_lag_main_loss(
+        model,
+        clean,
+        clean,
+        aggregation=aggregation,
+        softmax_temp=softmax_temp,
+        lags=lags,
+        lag_weights=lag_weights,
+        reverse_causal=False,
+    )
+    reverse_loss = compute_causal_lag_main_loss(
+        model,
+        clean,
+        clean,
+        aggregation=aggregation,
+        softmax_temp=softmax_temp,
+        lags=lags,
+        lag_weights=lag_weights,
+        reverse_causal=True,
+    )
+    forward_value = float(forward_loss.item())
+    reverse_value = float(reverse_loss.item())
+    stats.update({
+        "causal_lag_diag_available": 1.0,
+        "causal_lag_diag_forward_loss": forward_value,
+        "causal_lag_diag_reverse_loss": reverse_value,
+        "causal_lag_diag_reverse_minus_forward": reverse_value - forward_value,
+        "causal_lag_diag_forward_over_reverse": forward_value / max(reverse_value, 1e-8),
+        "causal_lag_diag_prefers_forward": float(forward_value < reverse_value),
+        "causal_lag_diag_num_lags": float(len(lags)),
+    })
+    return stats
+
+
+@torch.no_grad()
+def compute_dataset_causal_lag_selector_diagnostics(
+    model: DDM,
+    data_3d: torch.Tensor,
+    *,
+    aggregation: str = "mean",
+    softmax_temp: float = 1.0,
+    lags: Sequence[int] = (1,),
+    lag_weights: Sequence[float] = (1.0,),
+    subject_limit: int = -1,
+) -> Dict[str, float]:
+    """
+    Summarize causal-lag forward/reverse diagnostics across multiple subjects.
+
+    This is intended for selector analysis rather than training loss, so we only
+    record detached statistics.
+    """
+    stats = {
+        "selection_causal_lag_subject_count": 0.0,
+        "selection_causal_lag_forward_mean": 0.0,
+        "selection_causal_lag_forward_std": 0.0,
+        "selection_causal_lag_reverse_mean": 0.0,
+        "selection_causal_lag_reverse_std": 0.0,
+        "selection_causal_lag_delta_mean": 0.0,
+        "selection_causal_lag_delta_std": 0.0,
+        "selection_causal_lag_delta_min": 0.0,
+        "selection_causal_lag_delta_max": 0.0,
+        "selection_causal_lag_prefers_forward_frac": 0.0,
+        "selection_causal_lag_num_lags": float(len(lags)),
+    }
+    if data_3d.dim() != 3 or not lags:
+        return stats
+    if subject_limit == 0 or subject_limit < -1:
+        raise ValueError(
+            f"subject_limit must be -1 or a positive integer, got {subject_limit}"
+        )
+
+    num_subjects = data_3d.shape[0]
+    effective_subjects = (
+        num_subjects if subject_limit < 0 else min(num_subjects, subject_limit)
+    )
+    if effective_subjects <= 0:
+        return stats
+
+    forward_values: List[float] = []
+    reverse_values: List[float] = []
+    delta_values: List[float] = []
+    prefers_forward_values: List[float] = []
+    for subj_idx in range(effective_subjects):
+        subj_stats = compute_causal_lag_main_diagnostics(
+            model,
+            data_3d[subj_idx],
+            aggregation=aggregation,
+            softmax_temp=softmax_temp,
+            lags=lags,
+            lag_weights=lag_weights,
+        )
+        if subj_stats.get("causal_lag_diag_available", 0.0) <= 0.5:
+            continue
+        forward_values.append(float(subj_stats["causal_lag_diag_forward_loss"]))
+        reverse_values.append(float(subj_stats["causal_lag_diag_reverse_loss"]))
+        delta_values.append(float(subj_stats["causal_lag_diag_reverse_minus_forward"]))
+        prefers_forward_values.append(float(subj_stats["causal_lag_diag_prefers_forward"]))
+
+    if not forward_values:
+        return stats
+
+    forward_arr = np.asarray(forward_values, dtype=np.float64)
+    reverse_arr = np.asarray(reverse_values, dtype=np.float64)
+    delta_arr = np.asarray(delta_values, dtype=np.float64)
+    prefers_forward_arr = np.asarray(prefers_forward_values, dtype=np.float64)
+    stats.update({
+        "selection_causal_lag_subject_count": float(forward_arr.shape[0]),
+        "selection_causal_lag_forward_mean": float(forward_arr.mean()),
+        "selection_causal_lag_forward_std": float(forward_arr.std()),
+        "selection_causal_lag_reverse_mean": float(reverse_arr.mean()),
+        "selection_causal_lag_reverse_std": float(reverse_arr.std()),
+        "selection_causal_lag_delta_mean": float(delta_arr.mean()),
+        "selection_causal_lag_delta_std": float(delta_arr.std()),
+        "selection_causal_lag_delta_min": float(delta_arr.min()),
+        "selection_causal_lag_delta_max": float(delta_arr.max()),
+        "selection_causal_lag_prefers_forward_frac": float(prefers_forward_arr.mean()),
+        "selection_causal_lag_num_lags": float(len(lags)),
+    })
+    return stats
+
+
+def compute_post_detach_direction_contrast_loss(
+    model: DDM,
+    batch_x: torch.Tensor,
+    *,
+    aggregation: str = "mean",
+    softmax_temp: float = 1.0,
+    lags: Sequence[int] = (1,),
+    lag_weights: Sequence[float] = (1.0,),
+    contrast_weight: float = 0.0,
+    variance_weight: float = 0.0,
+    parent_entropy_weight: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Direction-only post-detach objective.
+
+    After the main denoising path has been detached from the direction gate,
+    this loss keeps optimizing only the directional branch by:
+    - rewarding forward-vs-reverse causal-lag separation across subjects
+    - penalizing cross-subject variance of that separation
+    - optionally applying a light parent-entropy term through the direction gate
+
+    Support weights are detached so this objective does not reshape the support
+    branch while acting as a direction-specific late-phase teacher.
+    """
+    stats = {
+        "post_detach_direction_available": 0.0,
+        "post_detach_direction_batch_count": 0.0,
+        "post_detach_direction_subject_count": 0.0,
+        "post_detach_direction_forward_mean": 0.0,
+        "post_detach_direction_reverse_mean": 0.0,
+        "post_detach_direction_delta_mean": 0.0,
+        "post_detach_direction_delta_var": 0.0,
+        "post_detach_direction_parent_entropy": 0.0,
+    }
+    zero = batch_x.new_tensor(0.0)
+    if batch_x.dim() != 3 or batch_x.shape[0] <= 0:
+        return zero, stats
+    if (
+        contrast_weight <= 0.0 and
+        variance_weight <= 0.0 and
+        parent_entropy_weight <= 0.0
+    ):
+        return zero, stats
+
+    forward_values: List[torch.Tensor] = []
+    reverse_values: List[torch.Tensor] = []
+    delta_values: List[torch.Tensor] = []
+    for subj_idx in range(batch_x.shape[0]):
+        clean = model.prepare_clean_target(batch_x[subj_idx])
+        forward_loss = compute_causal_lag_main_loss(
+            model,
+            clean,
+            clean,
+            aggregation=aggregation,
+            softmax_temp=softmax_temp,
+            lags=lags,
+            lag_weights=lag_weights,
+            reverse_causal=False,
+            detach_direction_gate=False,
+            detach_support_weights=True,
+        )
+        reverse_loss = compute_causal_lag_main_loss(
+            model,
+            clean,
+            clean,
+            aggregation=aggregation,
+            softmax_temp=softmax_temp,
+            lags=lags,
+            lag_weights=lag_weights,
+            reverse_causal=True,
+            detach_direction_gate=False,
+            detach_support_weights=True,
+        )
+        delta = reverse_loss - forward_loss
+        forward_values.append(forward_loss)
+        reverse_values.append(reverse_loss)
+        delta_values.append(delta)
+
+    if not delta_values:
+        return zero, stats
+
+    forward_tensor = torch.stack(forward_values)
+    reverse_tensor = torch.stack(reverse_values)
+    delta_tensor = torch.stack(delta_values)
+    delta_mean = delta_tensor.mean()
+    delta_var = (
+        delta_tensor.var(unbiased=False)
+        if delta_tensor.numel() > 1
+        else delta_tensor.new_tensor(0.0)
+    )
+    if parent_entropy_weight > 0.0:
+        adj_causal = to_causal_matrix_torch(
+            model.get_structure_adj(
+                detach_direction_gate=False,
+                detach_support_weights=True,
+            )
+        )
+        parent_entropy = compute_incoming_entropy_loss(adj_causal)
+    else:
+        parent_entropy = delta_tensor.new_tensor(0.0)
+
+    loss = (
+        - float(contrast_weight) * delta_mean +
+        float(variance_weight) * delta_var +
+        float(parent_entropy_weight) * parent_entropy
+    )
+    stats.update({
+        "post_detach_direction_available": 1.0,
+        "post_detach_direction_batch_count": 1.0,
+        "post_detach_direction_subject_count": float(delta_tensor.shape[0]),
+        "post_detach_direction_forward_mean": float(forward_tensor.mean().detach().item()),
+        "post_detach_direction_reverse_mean": float(reverse_tensor.mean().detach().item()),
+        "post_detach_direction_delta_mean": float(delta_mean.detach().item()),
+        "post_detach_direction_delta_var": float(delta_var.detach().item()),
+        "post_detach_direction_parent_entropy": float(parent_entropy.detach().item()),
+    })
+    return loss, stats
 
 
 @torch.no_grad()
@@ -1990,6 +2103,20 @@ def compute_epoch_quality(
     agreement_weight: float = 0.25,
     fixed_support_mask_active: bool = False,
     agreement_mode: str = "hard_coverage",
+    score_mode: str = "legacy",
+    causal_lag_reverse_minus_forward: float = 0.0,
+    selection_causal_lag_delta_mean: float = 0.0,
+    selection_causal_lag_delta_std: float = 0.0,
+    selection_parent_entropy_mean: float = 0.0,
+    composite_soft_agreement_weight: float = 0.20,
+    composite_causal_lag_weight: float = 1.0,
+    composite_margin_penalty_weight: float = 0.05,
+    composite_causal_lag_std_penalty_weight: float = 0.0,
+    composite_parent_entropy_penalty_weight: float = 0.0,
+    primary_causal_lag_weight: float = 1.0,
+    primary_soft_tiebreak_weight: float = 0.05,
+    primary_skeleton_tiebreak_weight: float = 0.05,
+    primary_density_tiebreak_weight: float = 0.0,
 ):
     """
     不依赖 GT 的 epoch 质量评分，用于 best-epoch 选择。
@@ -2007,6 +2134,15 @@ def compute_epoch_quality(
         hard `> 0.5` counting no longer reflects whether the selector is choosing
         a good checkpoint
     - skeleton_overlap: 骨架与 Patel 强度先验的重叠度
+    - score_mode:
+      - legacy: 保持原有 skeleton / agreement / density / margin / asymmetry 加权和
+      - causal_lag_composite: 用更贴近当前机制线的组合分数
+        `soft_agreement + causal_lag_delta - dir_margin`
+      - causal_lag_entropy_composite: 用跨主体 causal-lag 稳定性和当前图的
+        parent concentration 做组合分数
+        `soft_agreement + subject_delta_mean - subject_delta_std - parent_entropy - dir_margin`
+            - causal_lag_primary: 让单主体 causal-lag delta 主导评分，Patel/骨架/密度
+                仅作为弱 tie-break，不再让启发式 margin/asymmetry 主导早期排序
 
     Args:
         adj_np: causal 邻接矩阵 [N, N] numpy array (sigmoid 后)
@@ -2021,6 +2157,17 @@ def compute_epoch_quality(
     if agreement_mode not in {"hard_coverage", "soft_weighted"}:
         raise ValueError(
             f"agreement_mode must be 'hard_coverage' or 'soft_weighted', got {agreement_mode}"
+        )
+    if score_mode not in {
+        "legacy",
+        "causal_lag_composite",
+        "causal_lag_entropy_composite",
+        "causal_lag_primary",
+    }:
+        raise ValueError(
+            "score_mode must be 'legacy', 'causal_lag_composite', "
+            "'causal_lag_entropy_composite', or 'causal_lag_primary', "
+            f"got {score_mode}"
         )
 
     n = adj_np.shape[0]
@@ -2137,14 +2284,67 @@ def compute_epoch_quality(
         agreement_score if agreement_mode == "hard_coverage" else agreement_soft_score
     )
 
-    score = (
-        0.35 * skeleton_overlap +
-        agreement_weight * effective_agreement_score +
-        0.20 * density_factor +
-        0.15 * margin_score +
-        0.05 * asymmetry_score
+    legacy_skeleton_term = 0.35 * skeleton_overlap
+    legacy_agreement_term = agreement_weight * effective_agreement_score
+    legacy_density_term = 0.20 * density_factor
+    legacy_margin_term = 0.15 * margin_score
+    legacy_asymmetry_term = 0.05 * asymmetry_score
+    legacy_score = (
+        legacy_skeleton_term +
+        legacy_agreement_term +
+        legacy_density_term +
+        legacy_margin_term +
+        legacy_asymmetry_term
     )
+
+    composite_soft_agreement_term = composite_soft_agreement_weight * agreement_soft_score
+    composite_causal_lag_term = (
+        composite_causal_lag_weight * float(causal_lag_reverse_minus_forward)
+    )
+    composite_margin_penalty_term = composite_margin_penalty_weight * dir_margin
+    composite_score = (
+        composite_soft_agreement_term +
+        composite_causal_lag_term -
+        composite_margin_penalty_term
+    )
+    entropy_composite_lag_term = (
+        composite_causal_lag_weight * float(selection_causal_lag_delta_mean)
+    )
+    entropy_composite_lag_std_penalty_term = (
+        composite_causal_lag_std_penalty_weight * float(selection_causal_lag_delta_std)
+    )
+    entropy_composite_parent_entropy_penalty_term = (
+        composite_parent_entropy_penalty_weight * float(selection_parent_entropy_mean)
+    )
+    entropy_composite_margin_penalty_term = composite_margin_penalty_weight * dir_margin
+    entropy_composite_score = (
+        composite_soft_agreement_term +
+        entropy_composite_lag_term -
+        entropy_composite_lag_std_penalty_term -
+        entropy_composite_parent_entropy_penalty_term -
+        entropy_composite_margin_penalty_term
+    )
+    primary_lag_term = primary_causal_lag_weight * float(causal_lag_reverse_minus_forward)
+    primary_soft_tiebreak_term = primary_soft_tiebreak_weight * (agreement_soft_score - 0.5)
+    primary_skeleton_tiebreak_term = primary_skeleton_tiebreak_weight * (skeleton_overlap - 0.5)
+    primary_density_tiebreak_term = primary_density_tiebreak_weight * (density_factor - 0.5)
+    primary_score = (
+        primary_lag_term +
+        primary_soft_tiebreak_term +
+        primary_skeleton_tiebreak_term +
+        primary_density_tiebreak_term
+    )
+
+    if score_mode == "legacy":
+        score = legacy_score
+    elif score_mode == "causal_lag_composite":
+        score = composite_score
+    elif score_mode == "causal_lag_entropy_composite":
+        score = entropy_composite_score
+    else:
+        score = primary_score
     return score, {
+        "score_mode": score_mode,
         "agreement": agreement,
         "agreement_score": agreement_score,
         "agreement_soft_score": agreement_soft_score,
@@ -2161,6 +2361,50 @@ def compute_epoch_quality(
         "fixed_support_mask_active": int(fixed_support_mask_active),
         "global_asymmetry": global_asymmetry,
         "asymmetry_score": asymmetry_score,
+        "causal_lag_reverse_minus_forward": float(causal_lag_reverse_minus_forward),
+        "score_legacy_total": float(legacy_score),
+        "score_term_legacy_skeleton": float(legacy_skeleton_term),
+        "score_term_legacy_agreement": float(legacy_agreement_term),
+        "score_term_legacy_density": float(legacy_density_term),
+        "score_term_legacy_margin": float(legacy_margin_term),
+        "score_term_legacy_asymmetry": float(legacy_asymmetry_term),
+        "score_composite_total": float(composite_score),
+        "score_term_composite_soft_agreement": float(composite_soft_agreement_term),
+        "score_term_composite_causal_lag": float(composite_causal_lag_term),
+        "score_term_composite_margin_penalty": float(composite_margin_penalty_term),
+        "score_entropy_composite_total": float(entropy_composite_score),
+        "score_term_entropy_composite_soft_agreement": float(composite_soft_agreement_term),
+        "score_term_entropy_composite_causal_lag_mean": float(entropy_composite_lag_term),
+        "score_term_entropy_composite_causal_lag_std_penalty": (
+            float(entropy_composite_lag_std_penalty_term)
+        ),
+        "score_term_entropy_composite_parent_entropy_penalty": (
+            float(entropy_composite_parent_entropy_penalty_term)
+        ),
+        "score_term_entropy_composite_margin_penalty": float(
+            entropy_composite_margin_penalty_term
+        ),
+        "composite_soft_agreement_weight": float(composite_soft_agreement_weight),
+        "composite_causal_lag_weight": float(composite_causal_lag_weight),
+        "composite_margin_penalty_weight": float(composite_margin_penalty_weight),
+        "composite_causal_lag_std_penalty_weight": float(
+            composite_causal_lag_std_penalty_weight
+        ),
+        "composite_parent_entropy_penalty_weight": float(
+            composite_parent_entropy_penalty_weight
+        ),
+        "score_primary_total": float(primary_score),
+        "score_term_primary_causal_lag": float(primary_lag_term),
+        "score_term_primary_soft_tiebreak": float(primary_soft_tiebreak_term),
+        "score_term_primary_skeleton_tiebreak": float(primary_skeleton_tiebreak_term),
+        "score_term_primary_density_tiebreak": float(primary_density_tiebreak_term),
+        "primary_causal_lag_weight": float(primary_causal_lag_weight),
+        "primary_soft_tiebreak_weight": float(primary_soft_tiebreak_weight),
+        "primary_skeleton_tiebreak_weight": float(primary_skeleton_tiebreak_weight),
+        "primary_density_tiebreak_weight": float(primary_density_tiebreak_weight),
+        "selection_causal_lag_delta_mean": float(selection_causal_lag_delta_mean),
+        "selection_causal_lag_delta_std": float(selection_causal_lag_delta_std),
+        "selection_parent_entropy_mean": float(selection_parent_entropy_mean),
         "high_conf_edges": high_conf_count,
         "k": k,
     }
@@ -2255,8 +2499,6 @@ def train_brain_connectivity(
     directional_schedule: str = "cosine_anneal",
     lag_direction_source: str = "raw",
     directional_prior_scope: str = "online_subject",
-    directional_prior_consistency_floor: float = 0.0,
-    directional_prior_consistency_power: float = 0.0,
     directional_prior_lags: Sequence[int] = (1,),
     directional_prior_lag_weights: Sequence[float] = (1.0,),
     directional_kappa_gate: bool = False,
@@ -2266,23 +2508,14 @@ def train_brain_connectivity(
     directional_loss_end_epoch: int = -1,
     direction_lr_multiplier: float = 1.0,
     freeze_direction_after_epoch: int = -1,
+    detach_direction_from_main_after_epoch: int = -1,
     enable_gradient_alignment_probe: bool = False,
     gradient_alignment_probe_seed: int = 0,
-    enable_cross_prediction: bool = False,
-    cross_pred_target_ratio: float = 0.02,
-    cross_pred_schedule: str = "cosine_anneal",
-    cross_pred_aggregation: str = "mean",
-    cross_pred_softmax_temp: float = 1.0,
-    cross_pred_lags: Sequence[int] = (1,),
-    cross_pred_lag_weights: Sequence[float] = (1.0,),
-    cross_pred_fixed_weight: float = 0.0,
-    cross_pred_fixed_warmup_epochs: int = 0,
-    cross_pred_fixed_ramp_epochs: int = 1,
-    anti_collapse_lambda: float = 0.0,
-    anti_collapse_margin: float = 0.0,
-    anti_collapse_mode: str = "unsigned_raw",
-    anti_collapse_warmup_epochs: int = 0,
-    anti_collapse_ramp_epochs: int = 1,
+    causal_lag_main_weight: float = 0.0,
+    causal_lag_main_aggregation: str = "mean",
+    causal_lag_main_softmax_temp: float = 1.0,
+    causal_lag_main_lags: Sequence[int] = (1,),
+    causal_lag_main_lag_weights: Sequence[float] = (1.0,),
     parent_entropy_lambda: float = 0.0,
     parent_entropy_warmup_epochs: int = 0,
     parent_entropy_ramp_epochs: int = 1,
@@ -2295,6 +2528,20 @@ def train_brain_connectivity(
     ungated_symmetry_ramp_epochs: int = 1,
     selection_agreement_weight: float = 0.25,
     selection_agreement_mode: str = "hard_coverage",
+    selection_score_mode: str = "legacy",
+    selection_soft_agreement_weight: float = 0.20,
+    selection_causal_lag_weight: float = 1.0,
+    selection_margin_penalty_weight: float = 0.05,
+    selection_causal_lag_subject_limit: int = -1,
+    selection_causal_lag_std_penalty_weight: float = 0.0,
+    selection_parent_entropy_penalty_weight: float = 0.0,
+    selection_primary_causal_lag_weight: float = 1.0,
+    selection_primary_soft_tiebreak_weight: float = 0.05,
+    selection_primary_skeleton_tiebreak_weight: float = 0.05,
+    selection_primary_density_tiebreak_weight: float = 0.0,
+    post_detach_direction_contrast_weight: float = 0.0,
+    post_detach_direction_variance_weight: float = 0.0,
+    post_detach_direction_parent_entropy_weight: float = 0.0,
     selector_audit_gt_edges: Optional[Set[Tuple[int, int]]] = None,
     selector_audit_strict_margin_eps_values: Sequence[float] = (0.0, 3e-4, 0.1),
 
@@ -2359,6 +2606,10 @@ def train_brain_connectivity(
         )
     if main_loss_weight < 0.0:
         raise ValueError(f"main_loss_weight must be >= 0, got {main_loss_weight}")
+    if causal_lag_main_weight < 0.0:
+        raise ValueError(
+            f"causal_lag_main_weight must be >= 0, got {causal_lag_main_weight}"
+        )
     if direction_lr_multiplier <= 0.0:
         raise ValueError(
             f"direction_lr_multiplier must be > 0, got {direction_lr_multiplier}"
@@ -2367,6 +2618,11 @@ def train_brain_connectivity(
         raise ValueError(
             "freeze_direction_after_epoch must be >= -1, "
             f"got {freeze_direction_after_epoch}"
+        )
+    if detach_direction_from_main_after_epoch < -1:
+        raise ValueError(
+            "detach_direction_from_main_after_epoch must be >= -1, "
+            f"got {detach_direction_from_main_after_epoch}"
         )
     if directional_loss_end_epoch < -1:
         raise ValueError(
@@ -2378,6 +2634,106 @@ def train_brain_connectivity(
             "selection_agreement_mode must be 'hard_coverage' or 'soft_weighted', "
             f"got {selection_agreement_mode}"
         )
+    if selection_score_mode not in {
+        "legacy",
+        "causal_lag_composite",
+        "causal_lag_entropy_composite",
+        "causal_lag_primary",
+    }:
+        raise ValueError(
+            "selection_score_mode must be 'legacy', 'causal_lag_composite', "
+            "'causal_lag_entropy_composite', or 'causal_lag_primary', "
+            f"got {selection_score_mode}"
+        )
+    if selection_soft_agreement_weight < 0.0:
+        raise ValueError(
+            "selection_soft_agreement_weight must be >= 0, "
+            f"got {selection_soft_agreement_weight}"
+        )
+    if selection_causal_lag_weight < 0.0:
+        raise ValueError(
+            "selection_causal_lag_weight must be >= 0, "
+            f"got {selection_causal_lag_weight}"
+        )
+    if selection_margin_penalty_weight < 0.0:
+        raise ValueError(
+            "selection_margin_penalty_weight must be >= 0, "
+            f"got {selection_margin_penalty_weight}"
+        )
+    if selection_causal_lag_subject_limit == 0 or selection_causal_lag_subject_limit < -1:
+        raise ValueError(
+            "selection_causal_lag_subject_limit must be -1 or a positive integer, "
+            f"got {selection_causal_lag_subject_limit}"
+        )
+    if selection_causal_lag_std_penalty_weight < 0.0:
+        raise ValueError(
+            "selection_causal_lag_std_penalty_weight must be >= 0, "
+            f"got {selection_causal_lag_std_penalty_weight}"
+        )
+    if selection_parent_entropy_penalty_weight < 0.0:
+        raise ValueError(
+            "selection_parent_entropy_penalty_weight must be >= 0, "
+            f"got {selection_parent_entropy_penalty_weight}"
+        )
+    if selection_primary_causal_lag_weight < 0.0:
+        raise ValueError(
+            "selection_primary_causal_lag_weight must be >= 0, "
+            f"got {selection_primary_causal_lag_weight}"
+        )
+    if selection_primary_soft_tiebreak_weight < 0.0:
+        raise ValueError(
+            "selection_primary_soft_tiebreak_weight must be >= 0, "
+            f"got {selection_primary_soft_tiebreak_weight}"
+        )
+    if selection_primary_skeleton_tiebreak_weight < 0.0:
+        raise ValueError(
+            "selection_primary_skeleton_tiebreak_weight must be >= 0, "
+            f"got {selection_primary_skeleton_tiebreak_weight}"
+        )
+    if selection_primary_density_tiebreak_weight < 0.0:
+        raise ValueError(
+            "selection_primary_density_tiebreak_weight must be >= 0, "
+            f"got {selection_primary_density_tiebreak_weight}"
+        )
+    if post_detach_direction_contrast_weight < 0.0:
+        raise ValueError(
+            "post_detach_direction_contrast_weight must be >= 0, "
+            f"got {post_detach_direction_contrast_weight}"
+        )
+    if post_detach_direction_variance_weight < 0.0:
+        raise ValueError(
+            "post_detach_direction_variance_weight must be >= 0, "
+            f"got {post_detach_direction_variance_weight}"
+        )
+    if post_detach_direction_parent_entropy_weight < 0.0:
+        raise ValueError(
+            "post_detach_direction_parent_entropy_weight must be >= 0, "
+            f"got {post_detach_direction_parent_entropy_weight}"
+        )
+    post_detach_direction_loss_requested = (
+        post_detach_direction_contrast_weight > 0.0 or
+        post_detach_direction_variance_weight > 0.0 or
+        post_detach_direction_parent_entropy_weight > 0.0
+    )
+    if post_detach_direction_loss_requested and optimizer_step_mode != "batch_mean":
+        raise ValueError(
+            "post-detach direction-only loss requires optimizer_step_mode='batch_mean', "
+            f"got {optimizer_step_mode}"
+        )
+    if post_detach_direction_loss_requested and detach_direction_from_main_after_epoch < 0:
+        raise ValueError(
+            "post-detach direction-only loss requires detach_direction_from_main_after_epoch >= 0"
+        )
+    if causal_lag_main_aggregation not in {"mean", "softmax"}:
+        raise ValueError(
+            "causal_lag_main_aggregation must be 'mean' or 'softmax', "
+            f"got {causal_lag_main_aggregation}"
+        )
+    if causal_lag_main_softmax_temp <= 0.0:
+        raise ValueError(
+            "causal_lag_main_softmax_temp must be > 0, "
+            f"got {causal_lag_main_softmax_temp}"
+        )
     selector_audit_strict_margin_eps_values = tuple(
         normalize_margin_eps_value(v) for v in selector_audit_strict_margin_eps_values
     )
@@ -2387,6 +2743,27 @@ def train_brain_connectivity(
         raise ValueError(
             "selector_audit_strict_margin_eps_values must be non-negative, "
             f"got {selector_audit_strict_margin_eps_values}"
+        )
+    causal_lag_main_lags = tuple(int(v) for v in causal_lag_main_lags)
+    causal_lag_main_lag_weights = tuple(float(v) for v in causal_lag_main_lag_weights)
+    if len(causal_lag_main_lags) != len(causal_lag_main_lag_weights):
+        raise ValueError(
+            "causal_lag_main_lags and causal_lag_main_lag_weights must align, "
+            f"got {len(causal_lag_main_lags)} vs {len(causal_lag_main_lag_weights)}"
+        )
+    if not causal_lag_main_lags:
+        raise ValueError("causal_lag_main_lags must be non-empty")
+    if any(v <= 0 for v in causal_lag_main_lags):
+        raise ValueError(f"causal_lag_main_lags must be positive, got {causal_lag_main_lags}")
+    if any(v < 0.0 for v in causal_lag_main_lag_weights):
+        raise ValueError(
+            "causal_lag_main_lag_weights must be non-negative, "
+            f"got {causal_lag_main_lag_weights}"
+        )
+    if not any(v > 0.0 for v in causal_lag_main_lag_weights):
+        raise ValueError(
+            "causal_lag_main_lag_weights must contain at least one positive value, "
+            f"got {causal_lag_main_lag_weights}"
         )
 
     data_3d = data_3d.to(device)
@@ -2490,19 +2867,46 @@ def train_brain_connectivity(
         f"kappa_logit_bias_scale={getattr(model, 'kappa_logit_bias_scale', 0.0):g} | "
         f"direction_logit_bias_scale={getattr(model, 'direction_logit_bias_scale', 0.0):g}"
     )
-    model.cross_pred_aggregation = cross_pred_aggregation
-    model.cross_pred_softmax_temp = cross_pred_softmax_temp
+    model.causal_lag_main_weight = float(causal_lag_main_weight)
+    model.causal_lag_main_aggregation = causal_lag_main_aggregation
+    model.causal_lag_main_softmax_temp = float(causal_lag_main_softmax_temp)
+    model.causal_lag_main_lags = tuple(int(v) for v in causal_lag_main_lags)
+    model.causal_lag_main_lag_weights = tuple(float(v) for v in causal_lag_main_lag_weights)
+    model.selection_score_mode = selection_score_mode
+    model.selection_soft_agreement_weight = float(selection_soft_agreement_weight)
+    model.selection_causal_lag_weight = float(selection_causal_lag_weight)
+    model.selection_margin_penalty_weight = float(selection_margin_penalty_weight)
+    model.selection_causal_lag_subject_limit = int(selection_causal_lag_subject_limit)
+    model.selection_causal_lag_std_penalty_weight = float(
+        selection_causal_lag_std_penalty_weight
+    )
+    model.selection_parent_entropy_penalty_weight = float(
+        selection_parent_entropy_penalty_weight
+    )
+    model.selection_primary_causal_lag_weight = float(
+        selection_primary_causal_lag_weight
+    )
+    model.selection_primary_soft_tiebreak_weight = float(
+        selection_primary_soft_tiebreak_weight
+    )
+    model.selection_primary_skeleton_tiebreak_weight = float(
+        selection_primary_skeleton_tiebreak_weight
+    )
+    model.selection_primary_density_tiebreak_weight = float(
+        selection_primary_density_tiebreak_weight
+    )
+    model.post_detach_direction_contrast_weight = float(
+        post_detach_direction_contrast_weight
+    )
+    model.post_detach_direction_variance_weight = float(
+        post_detach_direction_variance_weight
+    )
+    model.post_detach_direction_parent_entropy_weight = float(
+        post_detach_direction_parent_entropy_weight
+    )
     model.directional_prior_scope = directional_prior_scope
-    model.directional_prior_consistency_floor = float(directional_prior_consistency_floor)
-    model.directional_prior_consistency_power = float(directional_prior_consistency_power)
     model.directional_prior_lags = tuple(int(v) for v in directional_prior_lags)
     model.directional_prior_lag_weights = tuple(float(v) for v in directional_prior_lag_weights)
-    model.cross_pred_lags = tuple(int(v) for v in cross_pred_lags)
-    model.cross_pred_lag_weights = tuple(float(v) for v in cross_pred_lag_weights)
-    model.cross_pred_fixed_weight = float(cross_pred_fixed_weight)
-    model.anti_collapse_lambda = float(anti_collapse_lambda)
-    model.anti_collapse_margin = float(anti_collapse_margin)
-    model.anti_collapse_mode = anti_collapse_mode
     if directional_kappa_gate:
         print(f"Directional kappa gate: enabled | quantile={directional_kappa_gate_quantile:.2f} | "
               f"threshold={directional_kappa_threshold:.4f} | "
@@ -2511,24 +2915,16 @@ def train_brain_connectivity(
         print(
             "Directional time prior: "
             f"scope={directional_prior_scope} | "
-            f"consistency_floor={directional_prior_consistency_floor:.2f} | "
-            f"consistency_power={directional_prior_consistency_power:.2f} | "
             f"lags={list(model.directional_prior_lags)} | "
             f"weights={[round(v, 4) for v in model.directional_prior_lag_weights]}"
         )
-    if enable_cross_prediction:
+    if causal_lag_main_weight > 0.0:
         print(
-            "Cross-pred lag config: "
-            f"lags={list(model.cross_pred_lags)} | "
-            f"weights={[round(v, 4) for v in model.cross_pred_lag_weights]} | "
-            f"fixed_weight={cross_pred_fixed_weight:g}"
-        )
-    if anti_collapse_lambda > 0.0:
-        print(
-            "Anti-collapse: enabled | "
-            f"lambda={anti_collapse_lambda:g} | "
-            f"margin={anti_collapse_margin:g} | "
-            f"mode={anti_collapse_mode}"
+            "Causal-lag main: enabled | "
+            f"weight={causal_lag_main_weight:g} | "
+            f"aggregation={causal_lag_main_aggregation} | "
+            f"lags={list(model.causal_lag_main_lags)} | "
+            f"weights={[round(v, 4) for v in model.causal_lag_main_lag_weights]}"
         )
     if selector_audit_gt_edges is not None:
         print(
@@ -2537,9 +2933,29 @@ def train_brain_connectivity(
             f"strict_margin_eps={list(selector_audit_strict_margin_eps_values)}"
         )
     print(
-        "Selection agreement: "
-        f"weight={selection_agreement_weight:.4f} | mode={selection_agreement_mode}"
+        "Selection proxy: "
+        f"mode={selection_score_mode} | "
+        f"agreement_weight={selection_agreement_weight:.4f} | "
+        f"agreement_mode={selection_agreement_mode} | "
+        f"soft_agreement_weight={selection_soft_agreement_weight:.4f} | "
+        f"causal_lag_weight={selection_causal_lag_weight:.4f} | "
+        f"margin_penalty_weight={selection_margin_penalty_weight:.4f} | "
+        f"subject_limit={selection_causal_lag_subject_limit} | "
+        f"causal_lag_std_penalty_weight={selection_causal_lag_std_penalty_weight:.4f} | "
+        f"parent_entropy_penalty_weight={selection_parent_entropy_penalty_weight:.4f} | "
+        f"primary_lag_weight={selection_primary_causal_lag_weight:.4f} | "
+        f"primary_soft_tiebreak_weight={selection_primary_soft_tiebreak_weight:.4f} | "
+        f"primary_skeleton_tiebreak_weight={selection_primary_skeleton_tiebreak_weight:.4f} | "
+        f"primary_density_tiebreak_weight={selection_primary_density_tiebreak_weight:.4f}"
     )
+    if post_detach_direction_loss_requested:
+        print(
+            "Post-detach direction-only loss: "
+            f"contrast_weight={post_detach_direction_contrast_weight:.4f} | "
+            f"variance_weight={post_detach_direction_variance_weight:.4f} | "
+            f"parent_entropy_weight={post_detach_direction_parent_entropy_weight:.4f} | "
+            f"uses_causal_lag_settings={list(causal_lag_main_lags)}"
+        )
 
     # ---- Autoregressive Causal Pretraining ----
     if model.use_temporal_encoder and not skip_pretrain and pretrain_epochs > 0:
@@ -2596,58 +3012,20 @@ def train_brain_connectivity(
     print(f"Main DDM loss weight: {main_loss_weight:g}")
 
     fixed_direction_prior_matrix: Optional[torch.Tensor] = None
-    fixed_direction_prior_consistency: Optional[torch.Tensor] = None
-    fixed_direction_prior_reliability: Optional[torch.Tensor] = None
     if (
-        (enable_directional_loss or anti_collapse_lambda > 0.0)
+        enable_directional_loss
         and directional_prior_mode == "lag_corr"
         and directional_prior_scope == "global_dataset"
     ):
-        fixed_direction_prior_matrix, fixed_direction_prior_consistency = compute_dataset_direction_prior_components(
+        fixed_direction_prior_matrix, _ = compute_dataset_direction_prior_components(
             model,
             data_3d,
             mode=directional_prior_mode,
             patel_direction_matrix=patel_direction_matrix,
             lag_direction_source=lag_direction_source,
         )
-        if directional_prior_consistency_floor > 0.0:
-            consistency_keep = (
-                fixed_direction_prior_consistency >= float(directional_prior_consistency_floor)
-            ).float()
-            fixed_direction_prior_matrix = fixed_direction_prior_matrix * consistency_keep
-        if directional_prior_consistency_power > 0.0:
-            fixed_direction_prior_reliability = torch.clamp(
-                fixed_direction_prior_consistency,
-                min=0.0,
-            ).pow(float(directional_prior_consistency_power))
-            if directional_prior_consistency_floor > 0.0:
-                fixed_direction_prior_reliability = fixed_direction_prior_reliability * consistency_keep
-            fixed_direction_prior_reliability.fill_diagonal_(0.0)
         fixed_delta = fixed_direction_prior_matrix - fixed_direction_prior_matrix.t()
         fixed_delta_abs = fixed_delta[~torch.eye(num_nodes, dtype=torch.bool, device=fixed_delta.device)].abs()
-        if fixed_direction_prior_consistency is not None:
-            fixed_consistency_vals = fixed_direction_prior_consistency[
-                ~torch.eye(num_nodes, dtype=torch.bool, device=fixed_direction_prior_consistency.device)
-            ]
-            kept_frac = float((fixed_delta_abs > 0).float().mean().item())
-            print(
-                "Directional prior consistency: "
-                f"floor={directional_prior_consistency_floor:.2f} | "
-                f"median={float(torch.quantile(fixed_consistency_vals, 0.50).item()):.4f} | "
-                f"p90={float(torch.quantile(fixed_consistency_vals, 0.90).item()):.4f} | "
-                f"kept_frac={kept_frac:.2%}"
-            )
-        if fixed_direction_prior_reliability is not None:
-            fixed_reliability_vals = fixed_direction_prior_reliability[
-                ~torch.eye(num_nodes, dtype=torch.bool, device=fixed_direction_prior_reliability.device)
-            ]
-            print(
-                "Directional prior soft weighting: "
-                f"power={directional_prior_consistency_power:.2f} | "
-                f"mean={float(fixed_reliability_vals.mean().item()):.4f} | "
-                f"p10={float(torch.quantile(fixed_reliability_vals, 0.10).item()):.4f} | "
-                f"p90={float(torch.quantile(fixed_reliability_vals, 0.90).item()):.4f}"
-            )
         print(
             "Directional prior cache: global_dataset | "
             f"abs_delta_median={float(torch.quantile(fixed_delta_abs, 0.50).item()):.4f} | "
@@ -2660,9 +3038,15 @@ def train_brain_connectivity(
         direction_lr_multiplier=direction_lr_multiplier,
     )
     direction_branch_has_separate_params = bool(optimizer_stats["has_direction_group"])
+    if post_detach_direction_loss_requested and not direction_branch_has_separate_params:
+        raise ValueError(
+            "post-detach direction-only loss requires support_direction parameterization "
+            "with separate direction parameters"
+        )
     direction_branch_frozen = False
     direction_branch_frozen_from_epoch = -1
     directional_loss_deactivated_from_epoch = -1
+    direction_from_main_detached_from_epoch = -1
     if direction_branch_has_separate_params:
         print(
             "Optimizer groups: "
@@ -2670,7 +3054,8 @@ def train_brain_connectivity(
             f"({optimizer_stats['base_param_count']:,} params) | "
             f"direction_lr={optimizer_stats['direction_lr']:.4e} "
             f"(x{direction_lr_multiplier:g}, {optimizer_stats['direction_param_count']:,} params) | "
-            f"freeze_after_epoch={freeze_direction_after_epoch}"
+            f"freeze_after_epoch={freeze_direction_after_epoch} | "
+            f"detach_main_after_epoch={detach_direction_from_main_after_epoch}"
         )
     else:
         print(
@@ -2707,7 +3092,6 @@ def train_brain_connectivity(
     # Lambda smoothing state (EMA + step-change cap)
     prev_lambda_dir = 0.0
     prev_lambda_ortho = 0.0
-    prev_lambda_cross = 0.0
 
     
 
@@ -2744,6 +3128,21 @@ def train_brain_connectivity(
                 f"(after epoch {freeze_direction_after_epoch}, "
                 f"params={frozen_param_count:,})"
             )
+        detach_direction_from_main_active = (
+            direction_branch_has_separate_params and
+            detach_direction_from_main_after_epoch >= 0 and
+            (epoch + 1) > detach_direction_from_main_after_epoch
+        )
+        if (
+            detach_direction_from_main_active and
+            direction_from_main_detached_from_epoch < 0
+        ):
+            direction_from_main_detached_from_epoch = epoch + 1
+            print(
+                "[DirectionDetach] Detaching direction gate from main denoising path "
+                f"from epoch {epoch + 1} onward "
+                f"(after epoch {detach_direction_from_main_after_epoch})"
+            )
 
         model.train()
 
@@ -2755,25 +3154,28 @@ def train_brain_connectivity(
 
         epoch_ortho_loss = 0.0
 
-        epoch_cross_loss = 0.0
-
-        epoch_anti_collapse_loss = 0.0
-
         epoch_parent_entropy_loss = 0.0
 
         epoch_parent_cap_loss = 0.0
 
         epoch_ungated_symmetry_loss = 0.0
 
+        epoch_causal_lag_main_loss = 0.0
+
+        epoch_post_detach_direction_loss = 0.0
+        epoch_post_detach_direction_forward_mean = 0.0
+        epoch_post_detach_direction_reverse_mean = 0.0
+        epoch_post_detach_direction_delta_mean = 0.0
+        epoch_post_detach_direction_delta_var = 0.0
+        epoch_post_detach_direction_parent_entropy = 0.0
+        epoch_post_detach_direction_subject_count = 0.0
+        post_detach_direction_batch_count = 0
+
         current_parent_entropy_weight = 0.0
 
         current_parent_cap_weight = 0.0
 
         current_ungated_symmetry_weight = 0.0
-
-        current_cross_fixed_weight = 0.0
-
-        current_anti_collapse_weight = 0.0
 
         num_batches = 0
 
@@ -2846,13 +3248,19 @@ def train_brain_connectivity(
 
                 # Forward pass - model uses learned structure internally
 
-                loss, loss_dict = model(g=None, x=x)
+                loss, loss_dict = model(
+                    g=None,
+                    x=x,
+                    detach_direction_from_main=detach_direction_from_main_active,
+                )
 
                 
 
                 # L1 sparsity regularization on learned adjacency.
                 # Reuse the exact same clamped logits/sigmoid path used for export.
-                adj_weights = model.get_structure_adj()  # [N, N], diag already zeroed
+                adj_weights = model.get_structure_adj(
+                    detach_direction_gate=detach_direction_from_main_active
+                )  # [N, N], diag already zeroed
                 adj_weights_causal = to_causal_matrix_torch(adj_weights)
 
                 n_off_diag = num_nodes * num_nodes - num_nodes
@@ -2869,17 +3277,15 @@ def train_brain_connectivity(
                 receiver_norms = torch.norm(model.node_emb_receiver, dim=1)
                 hub_loss = 0.01 * (sender_norms.var() + receiver_norms.var())
 
-                # DDM main loss (diffusion + sparsity + hub)
-                loss_ddm_main = loss + sparsity_loss + hub_loss
+                # Base main loss before any mechanism-line reconstruction add-ons.
+                loss_ddm_base = loss + sparsity_loss + hub_loss
 
                 # --- Directional margin loss & feature orthogonality loss ---
                 causal_logits = get_current_directional_logits(model, causal=True)
                 direction_prior_matrix = None
-                if directional_loss_active or anti_collapse_lambda > 0.0:
-                    direction_prior_reliability_matrix = None
+                if directional_loss_active:
                     if fixed_direction_prior_matrix is not None:
                         direction_prior_matrix = fixed_direction_prior_matrix
-                        direction_prior_reliability_matrix = fixed_direction_prior_reliability
                     else:
                         direction_prior_matrix = compute_online_direction_prior_matrix(
                             model=model,
@@ -2892,25 +3298,31 @@ def train_brain_connectivity(
                         causal_logits,
                         direction_prior_matrix,
                         pair_gate_matrix=directional_pair_gate_matrix,
-                        pair_reliability_matrix=direction_prior_reliability_matrix,
                     )
                 else:
                     raw_loss_dir = torch.tensor(0.0, device=device)
-                if anti_collapse_lambda > 0.0 and direction_prior_matrix is not None:
-                    raw_loss_anti_collapse = compute_directional_anti_collapse_loss(
-                        causal_logits,
-                        direction_prior_matrix,
-                        margin_floor=anti_collapse_margin,
-                        pair_gate_matrix=directional_pair_gate_matrix,
-                        pair_reliability_matrix=direction_prior_reliability_matrix,
-                        mode=anti_collapse_mode,
+                if causal_lag_main_weight > 0.0:
+                    clean_target = model.prepare_clean_target(x)
+                    if model.uniform_timestep:
+                        t_val = torch.randint(model.T, size=(1,), device=clean_target.device)
+                        t_main = t_val.expand(clean_target.shape[0])
+                    else:
+                        t_main = torch.randint(
+                            model.T, size=(clean_target.shape[0],), device=clean_target.device,
+                        )
+                    noisy_source, _, _ = model.sample_q(t_main, clean_target, g=None)
+                    raw_loss_causal_lag_main = compute_causal_lag_main_loss(
+                        model,
+                        noisy_source,
+                        clean_target,
+                        aggregation=causal_lag_main_aggregation,
+                        softmax_temp=causal_lag_main_softmax_temp,
+                        lags=causal_lag_main_lags,
+                        lag_weights=causal_lag_main_lag_weights,
+                        detach_direction_gate=detach_direction_from_main_active,
                     )
                 else:
-                    raw_loss_anti_collapse = torch.tensor(0.0, device=device)
-                if enable_cross_prediction:
-                    raw_loss_cross = compute_cross_prediction_loss(model, x)
-                else:
-                    raw_loss_cross = torch.tensor(0.0, device=device)
+                    raw_loss_causal_lag_main = torch.tensor(0.0, device=device)
                 if parent_entropy_lambda > 0.0:
                     raw_loss_parent_entropy = compute_incoming_entropy_loss(adj_weights_causal)
                 else:
@@ -2933,20 +3345,16 @@ def train_brain_connectivity(
                     model.node_emb_sender, model.node_emb_receiver,
                 )
 
-                lambda_dir, lambda_ortho, lambda_cross = compute_auxiliary_lambdas(
+                lambda_dir, lambda_ortho = compute_auxiliary_lambdas(
                     epoch=epoch,
                     num_epochs=num_epochs,
-                    loss_ddm_main=loss_ddm_main,
+                    loss_ddm_main=loss_ddm_base,
                     raw_loss_dir=raw_loss_dir,
                     raw_loss_ortho=raw_loss_ortho,
-                    raw_loss_cross=raw_loss_cross,
                     prev_lambda_dir=prev_lambda_dir,
                     prev_lambda_ortho=prev_lambda_ortho,
-                    prev_lambda_cross=prev_lambda_cross,
                     dir_target_ratio=directional_target_ratio,
                     dir_schedule=directional_schedule,
-                    cross_target_ratio=cross_pred_target_ratio,
-                    cross_schedule=cross_pred_schedule,
                 )
 
                 if directional_loss_active:
@@ -2955,24 +3363,9 @@ def train_brain_connectivity(
                     lambda_dir = 0.0
                     prev_lambda_dir = 0.0
                 prev_lambda_ortho = lambda_ortho
-                if enable_cross_prediction:
-                    prev_lambda_cross = lambda_cross
-                else:
-                    lambda_cross = 0.0
-                    prev_lambda_cross = 0.0
 
                 weighted_dir = lambda_dir * raw_loss_dir
                 weighted_ortho = lambda_ortho * raw_loss_ortho
-                current_cross_fixed_weight = compute_fixed_aux_weight(
-                    epoch=epoch,
-                    target_weight=cross_pred_fixed_weight,
-                    warmup_epochs=cross_pred_fixed_warmup_epochs,
-                    ramp_epochs=cross_pred_fixed_ramp_epochs,
-                )
-                if current_cross_fixed_weight > 0.0:
-                    weighted_cross = current_cross_fixed_weight * raw_loss_cross
-                else:
-                    weighted_cross = lambda_cross * raw_loss_cross
                 current_parent_entropy_weight = compute_fixed_aux_weight(
                     epoch=epoch,
                     target_weight=parent_entropy_lambda,
@@ -2996,24 +3389,17 @@ def train_brain_connectivity(
                 weighted_ungated_symmetry = (
                     current_ungated_symmetry_weight * raw_loss_ungated_symmetry
                 )
-                current_anti_collapse_weight = compute_fixed_aux_weight(
-                    epoch=epoch,
-                    target_weight=anti_collapse_lambda,
-                    warmup_epochs=anti_collapse_warmup_epochs,
-                    ramp_epochs=anti_collapse_ramp_epochs,
-                )
-                weighted_anti_collapse = (
-                    current_anti_collapse_weight * raw_loss_anti_collapse
-                )
 
+                weighted_causal_lag_main = causal_lag_main_weight * raw_loss_causal_lag_main
+                # Treat causal-lag denoising as part of the main reconstruction path,
+                # not as another side auxiliary stacked beside selection/retention fixes.
+                loss_ddm_main = loss_ddm_base + weighted_causal_lag_main
                 weighted_ddm_main = main_loss_weight * loss_ddm_main
 
                 total_loss = (
                     weighted_ddm_main +
                     weighted_dir +
                     weighted_ortho +
-                    weighted_cross +
-                    weighted_anti_collapse +
                     weighted_parent_entropy +
                     weighted_parent_cap +
                     weighted_ungated_symmetry
@@ -3050,17 +3436,76 @@ def train_brain_connectivity(
 
                 epoch_ortho_loss += weighted_ortho.item()
 
-                epoch_cross_loss += weighted_cross.item()
-
-                epoch_anti_collapse_loss += weighted_anti_collapse.item()
-
                 epoch_parent_entropy_loss += weighted_parent_entropy.item()
 
                 epoch_parent_cap_loss += weighted_parent_cap.item()
 
                 epoch_ungated_symmetry_loss += weighted_ungated_symmetry.item()
 
+                epoch_causal_lag_main_loss += weighted_causal_lag_main.item()
+
                 num_batches += 1
+
+            if (
+                optimizer_step_mode == "batch_mean" and
+                post_detach_direction_loss_requested and
+                detach_direction_from_main_active
+            ):
+                if direction_branch_frozen:
+                    with torch.no_grad():
+                        _, post_detach_direction_stats = (
+                            compute_post_detach_direction_contrast_loss(
+                                model,
+                                batch_data,
+                                aggregation=causal_lag_main_aggregation,
+                                softmax_temp=causal_lag_main_softmax_temp,
+                                lags=causal_lag_main_lags,
+                                lag_weights=causal_lag_main_lag_weights,
+                                contrast_weight=post_detach_direction_contrast_weight,
+                                variance_weight=post_detach_direction_variance_weight,
+                                parent_entropy_weight=post_detach_direction_parent_entropy_weight,
+                            )
+                        )
+                    post_detach_direction_loss = batch_data.new_tensor(0.0)
+                else:
+                    post_detach_direction_loss, post_detach_direction_stats = (
+                        compute_post_detach_direction_contrast_loss(
+                            model,
+                            batch_data,
+                            aggregation=causal_lag_main_aggregation,
+                            softmax_temp=causal_lag_main_softmax_temp,
+                            lags=causal_lag_main_lags,
+                            lag_weights=causal_lag_main_lag_weights,
+                            contrast_weight=post_detach_direction_contrast_weight,
+                            variance_weight=post_detach_direction_variance_weight,
+                            parent_entropy_weight=post_detach_direction_parent_entropy_weight,
+                        )
+                    )
+                    post_detach_direction_loss.backward()
+
+                if post_detach_direction_stats["post_detach_direction_available"] > 0.5:
+                    epoch_post_detach_direction_loss += float(
+                        post_detach_direction_loss.detach().item()
+                    )
+                    epoch_post_detach_direction_forward_mean += float(
+                        post_detach_direction_stats["post_detach_direction_forward_mean"]
+                    )
+                    epoch_post_detach_direction_reverse_mean += float(
+                        post_detach_direction_stats["post_detach_direction_reverse_mean"]
+                    )
+                    epoch_post_detach_direction_delta_mean += float(
+                        post_detach_direction_stats["post_detach_direction_delta_mean"]
+                    )
+                    epoch_post_detach_direction_delta_var += float(
+                        post_detach_direction_stats["post_detach_direction_delta_var"]
+                    )
+                    epoch_post_detach_direction_parent_entropy += float(
+                        post_detach_direction_stats["post_detach_direction_parent_entropy"]
+                    )
+                    epoch_post_detach_direction_subject_count += float(
+                        post_detach_direction_stats["post_detach_direction_subject_count"]
+                    )
+                    post_detach_direction_batch_count += 1
 
             if optimizer_step_mode == "batch_mean":
                 optimizer.step()
@@ -3071,11 +3516,46 @@ def train_brain_connectivity(
         avg_sparsity = epoch_sparsity / num_batches
         avg_dir_loss = epoch_dir_loss / num_batches
         avg_ortho_loss = epoch_ortho_loss / num_batches
-        avg_cross_loss = epoch_cross_loss / num_batches
-        avg_anti_collapse_loss = epoch_anti_collapse_loss / num_batches
         avg_parent_entropy_loss = epoch_parent_entropy_loss / num_batches
         avg_parent_cap_loss = epoch_parent_cap_loss / num_batches
         avg_ungated_symmetry_loss = epoch_ungated_symmetry_loss / num_batches
+        avg_causal_lag_main_loss = epoch_causal_lag_main_loss / num_batches
+        if post_detach_direction_batch_count > 0:
+            avg_post_detach_direction_loss = (
+                epoch_post_detach_direction_loss / post_detach_direction_batch_count
+            )
+            post_detach_direction_epoch_stats = {
+                "post_detach_direction_available": 1.0,
+                "post_detach_direction_batch_count": float(post_detach_direction_batch_count),
+                "post_detach_direction_subject_count": float(epoch_post_detach_direction_subject_count),
+                "post_detach_direction_forward_mean": (
+                    epoch_post_detach_direction_forward_mean / post_detach_direction_batch_count
+                ),
+                "post_detach_direction_reverse_mean": (
+                    epoch_post_detach_direction_reverse_mean / post_detach_direction_batch_count
+                ),
+                "post_detach_direction_delta_mean": (
+                    epoch_post_detach_direction_delta_mean / post_detach_direction_batch_count
+                ),
+                "post_detach_direction_delta_var": (
+                    epoch_post_detach_direction_delta_var / post_detach_direction_batch_count
+                ),
+                "post_detach_direction_parent_entropy": (
+                    epoch_post_detach_direction_parent_entropy / post_detach_direction_batch_count
+                ),
+            }
+        else:
+            avg_post_detach_direction_loss = 0.0
+            post_detach_direction_epoch_stats = {
+                "post_detach_direction_available": 0.0,
+                "post_detach_direction_batch_count": 0.0,
+                "post_detach_direction_subject_count": 0.0,
+                "post_detach_direction_forward_mean": 0.0,
+                "post_detach_direction_reverse_mean": 0.0,
+                "post_detach_direction_delta_mean": 0.0,
+                "post_detach_direction_delta_var": 0.0,
+                "post_detach_direction_parent_entropy": 0.0,
+            }
 
         grad_probe_lambda_dir = float(prev_lambda_dir) if directional_loss_active else 0.0
         if enable_gradient_alignment_probe:
@@ -3090,7 +3570,6 @@ def train_brain_connectivity(
                 directional_pair_gate_matrix=directional_pair_gate_matrix,
                 lambda_dir_effective=grad_probe_lambda_dir,
                 fixed_direction_prior_matrix=fixed_direction_prior_matrix,
-                direction_prior_reliability_matrix=fixed_direction_prior_reliability,
                 seed=gradient_alignment_probe_seed,
             )
         else:
@@ -3108,11 +3587,9 @@ def train_brain_connectivity(
         with torch.no_grad():
             causal_logits = get_current_directional_logits(model, causal=True)
             probe_direction_prior = None
-            if directional_loss_active or anti_collapse_lambda > 0.0:
-                probe_direction_prior_reliability = None
+            if directional_loss_active:
                 if fixed_direction_prior_matrix is not None:
                     probe_direction_prior = fixed_direction_prior_matrix
-                    probe_direction_prior_reliability = fixed_direction_prior_reliability
                 else:
                     probe_direction_prior = compute_online_direction_prior_matrix(
                         model=model,
@@ -3125,7 +3602,6 @@ def train_brain_connectivity(
                     causal_logits,
                     probe_direction_prior,
                     pair_gate_matrix=directional_pair_gate_matrix,
-                    pair_reliability_matrix=probe_direction_prior_reliability,
                 )
             else:
                 direction_margin_stats = {
@@ -3144,27 +3620,51 @@ def train_brain_connectivity(
                     causal_logits,
                     probe_direction_prior,
                     pair_gate_matrix=directional_pair_gate_matrix,
-                    pair_reliability_matrix=probe_direction_prior_reliability,
                 ).item()
             else:
                 raw_dir_snap = 0.0
-            if anti_collapse_lambda > 0.0 and probe_direction_prior is not None:
-                raw_anti_collapse_snap = compute_directional_anti_collapse_loss(
-                    causal_logits,
-                    probe_direction_prior,
-                    margin_floor=anti_collapse_margin,
-                    pair_gate_matrix=directional_pair_gate_matrix,
-                    pair_reliability_matrix=probe_direction_prior_reliability,
-                    mode=anti_collapse_mode,
-                ).item()
+            if causal_lag_main_weight > 0.0:
+                clean_probe = model.prepare_clean_target(probe_x)
+                if clean_probe.shape[-1] > max(causal_lag_main_lags):
+                    raw_causal_lag_main_snap = compute_causal_lag_main_loss(
+                        model,
+                        clean_probe,
+                        clean_probe,
+                        aggregation=causal_lag_main_aggregation,
+                        softmax_temp=causal_lag_main_softmax_temp,
+                        lags=causal_lag_main_lags,
+                        lag_weights=causal_lag_main_lag_weights,
+                    ).item()
+                    causal_lag_diag_stats = compute_causal_lag_main_diagnostics(
+                        model,
+                        probe_x,
+                        aggregation=causal_lag_main_aggregation,
+                        softmax_temp=causal_lag_main_softmax_temp,
+                        lags=causal_lag_main_lags,
+                        lag_weights=causal_lag_main_lag_weights,
+                    )
+                else:
+                    raw_causal_lag_main_snap = 0.0
+                    causal_lag_diag_stats = {
+                        "causal_lag_diag_available": 0.0,
+                        "causal_lag_diag_forward_loss": 0.0,
+                        "causal_lag_diag_reverse_loss": 0.0,
+                        "causal_lag_diag_reverse_minus_forward": 0.0,
+                        "causal_lag_diag_forward_over_reverse": 0.0,
+                        "causal_lag_diag_prefers_forward": 0.0,
+                        "causal_lag_diag_num_lags": float(len(causal_lag_main_lags)),
+                    }
             else:
-                raw_anti_collapse_snap = 0.0
-            if enable_cross_prediction:
-                raw_cross_snap = compute_cross_prediction_loss(model, probe_x).item()
-                cross_diag_stats = compute_cross_prediction_diagnostics(model, probe_x)
-            else:
-                raw_cross_snap = 0.0
-                cross_diag_stats = {}
+                raw_causal_lag_main_snap = 0.0
+                causal_lag_diag_stats = {
+                    "causal_lag_diag_available": 0.0,
+                    "causal_lag_diag_forward_loss": 0.0,
+                    "causal_lag_diag_reverse_loss": 0.0,
+                    "causal_lag_diag_reverse_minus_forward": 0.0,
+                    "causal_lag_diag_forward_over_reverse": 0.0,
+                    "causal_lag_diag_prefers_forward": 0.0,
+                    "causal_lag_diag_num_lags": 0.0,
+                }
             noise_guide_probe_stats = compute_noise_guide_probe_diagnostics(model, probe_x)
             message_dir_stats = compute_message_graph_direction_diagnostics(model, probe_x)
             raw_ortho_snap = compute_feature_ortho_loss(
@@ -3187,6 +3687,29 @@ def train_brain_connectivity(
                 adj_sigmoid_causal,
                 pair_gate_matrix=directional_pair_gate_matrix,
             )
+            selector_dataset_stats = {
+                "selection_causal_lag_subject_count": 0.0,
+                "selection_causal_lag_forward_mean": 0.0,
+                "selection_causal_lag_forward_std": 0.0,
+                "selection_causal_lag_reverse_mean": 0.0,
+                "selection_causal_lag_reverse_std": 0.0,
+                "selection_causal_lag_delta_mean": 0.0,
+                "selection_causal_lag_delta_std": 0.0,
+                "selection_causal_lag_delta_min": 0.0,
+                "selection_causal_lag_delta_max": 0.0,
+                "selection_causal_lag_prefers_forward_frac": 0.0,
+                "selection_causal_lag_num_lags": float(len(causal_lag_main_lags)),
+            }
+            if selection_score_mode == "causal_lag_entropy_composite":
+                selector_dataset_stats = compute_dataset_causal_lag_selector_diagnostics(
+                    model,
+                    data_3d,
+                    aggregation=causal_lag_main_aggregation,
+                    softmax_temp=causal_lag_main_softmax_temp,
+                    lags=causal_lag_main_lags,
+                    lag_weights=causal_lag_main_lag_weights,
+                    subject_limit=selection_causal_lag_subject_limit,
+                )
             adj_mean = adj_sigmoid_raw.mean().item()
             sparsity_ratio = (adj_sigmoid_raw < 0.5).float().mean().item()
 
@@ -3200,6 +3723,32 @@ def train_brain_connectivity(
             agreement_weight=selection_agreement_weight,
             fixed_support_mask_active=bool(fixed_support_mask is not None),
             agreement_mode=selection_agreement_mode,
+            score_mode=selection_score_mode,
+            causal_lag_reverse_minus_forward=float(
+                causal_lag_diag_stats["causal_lag_diag_reverse_minus_forward"]
+            ),
+            selection_causal_lag_delta_mean=float(
+                selector_dataset_stats["selection_causal_lag_delta_mean"]
+            ),
+            selection_causal_lag_delta_std=float(
+                selector_dataset_stats["selection_causal_lag_delta_std"]
+            ),
+            selection_parent_entropy_mean=float(
+                parent_profile_stats["adj_parent_entropy_mean"]
+            ),
+            composite_soft_agreement_weight=selection_soft_agreement_weight,
+            composite_causal_lag_weight=selection_causal_lag_weight,
+            composite_margin_penalty_weight=selection_margin_penalty_weight,
+            composite_causal_lag_std_penalty_weight=(
+                selection_causal_lag_std_penalty_weight
+            ),
+            composite_parent_entropy_penalty_weight=(
+                selection_parent_entropy_penalty_weight
+            ),
+            primary_causal_lag_weight=selection_primary_causal_lag_weight,
+            primary_soft_tiebreak_weight=selection_primary_soft_tiebreak_weight,
+            primary_skeleton_tiebreak_weight=selection_primary_skeleton_tiebreak_weight,
+            primary_density_tiebreak_weight=selection_primary_density_tiebreak_weight,
         )
         if selector_audit_gt_edges is not None:
             selector_audit_metrics = compute_selector_audit_metrics(
@@ -3244,7 +3793,6 @@ def train_brain_connectivity(
             **parent_profile_stats,
             **ungated_asym_stats,
             **direction_margin_stats,
-            **cross_diag_stats,
             **noise_guide_probe_stats,
             **message_dir_stats,
             "directional_kappa_gate_enabled": int(directional_kappa_gate),
@@ -3267,15 +3815,25 @@ def train_brain_connectivity(
             "direction_branch_frozen": int(direction_branch_frozen),
             "freeze_direction_after_epoch": int(freeze_direction_after_epoch),
             "direction_branch_frozen_from_epoch": int(direction_branch_frozen_from_epoch),
-            "cross_loss_raw": float(raw_cross_snap),
-            "cross_loss_weighted": float(avg_cross_loss),
-            "cross_lambda_current": float(current_cross_fixed_weight if current_cross_fixed_weight > 0.0 else prev_lambda_cross),
-            "cross_fixed_weight_target": float(cross_pred_fixed_weight),
-            "anti_collapse_raw": float(raw_anti_collapse_snap),
-            "anti_collapse_weighted": float(avg_anti_collapse_loss),
-            "anti_collapse_lambda_current": float(current_anti_collapse_weight),
-            "anti_collapse_margin": float(anti_collapse_margin),
-            "anti_collapse_mode": anti_collapse_mode,
+            "detach_direction_from_main_active": int(detach_direction_from_main_active),
+            "detach_direction_from_main_after_epoch": int(detach_direction_from_main_after_epoch),
+            "direction_from_main_detached_from_epoch": int(direction_from_main_detached_from_epoch),
+            "causal_lag_main_raw": float(raw_causal_lag_main_snap),
+            "causal_lag_main_weight": float(causal_lag_main_weight),
+            "causal_lag_main_weighted": float(avg_causal_lag_main_loss),
+            "post_detach_direction_loss_requested": int(post_detach_direction_loss_requested),
+            "post_detach_direction_active": int(post_detach_direction_batch_count > 0),
+            "post_detach_direction_contrast_weight": float(
+                post_detach_direction_contrast_weight
+            ),
+            "post_detach_direction_variance_weight": float(
+                post_detach_direction_variance_weight
+            ),
+            "post_detach_direction_parent_entropy_weight": float(
+                post_detach_direction_parent_entropy_weight
+            ),
+            "post_detach_direction_raw": float(avg_post_detach_direction_loss),
+            "post_detach_direction_weighted": float(avg_post_detach_direction_loss),
             "ortho_loss_raw": float(raw_ortho_snap),
             "ortho_loss_weighted": float(avg_ortho_loss),
             "parent_entropy_raw": raw_parent_entropy_snap,
@@ -3292,6 +3850,9 @@ def train_brain_connectivity(
             "gradient_alignment_probe_seed": int(gradient_alignment_probe_seed),
             "selector_audit_enabled": int(selector_audit_gt_edges is not None),
             **grad_probe_stats,
+            **causal_lag_diag_stats,
+            **post_detach_direction_epoch_stats,
+            **selector_dataset_stats,
             **selector_audit_metrics,
         })
         marker_parts = []
@@ -3328,9 +3889,8 @@ def train_brain_connectivity(
                   f"{0.0 if direction_branch_frozen or not direction_branch_has_separate_params else learning_rate * direction_lr_multiplier:.4e}/"
                   f"{int(direction_branch_frozen)} | "
                   f"Dir Loss(raw/w): {raw_dir_snap:.4f}/{avg_dir_loss:.4f} | "
-                  f"Cross Loss(raw/w): {raw_cross_snap:.4f}/{avg_cross_loss:.4f} | "
-                  f"AntiCollapse(raw/w): {raw_anti_collapse_snap:.4f}/{avg_anti_collapse_loss:.4f} "
-                  f"(lambda={current_anti_collapse_weight:.4f}) | "
+                  f"CausalLagMain(raw/w): {raw_causal_lag_main_snap:.4f}/{avg_causal_lag_main_loss:.4f} | "
+                  f"PostDetach(active/loss): {int(post_detach_direction_batch_count > 0)}/{avg_post_detach_direction_loss:.4f} | "
                   f"Parent Ent(raw/w): {raw_parent_entropy_snap:.4f}/{avg_parent_entropy_loss:.4f} "
                   f"(lambda={current_parent_entropy_weight:.4f}) | "
                   f"Parent Cap(raw/w): {raw_parent_cap_snap:.4f}/{avg_parent_cap_loss:.4f} "
@@ -3382,19 +3942,32 @@ def train_brain_connectivity(
                   f"ungated_asym={ungated_asym_stats['adj_ungated_asym_mean']:.3f}"
                   f"/med={ungated_asym_stats['adj_ungated_asym_median']:.3f}"
                   f"/p90={ungated_asym_stats['adj_ungated_asym_p90']:.3f}")
-            if enable_cross_prediction:
-                print(f"  [CrossDiag] h_cos={cross_diag_stats['cross_source_mean_cos']:.3f}"
-                      f"/p90={cross_diag_stats['cross_source_p90_cos']:.3f}"
-                      f"/>0.7={cross_diag_stats['cross_source_gt_0p7_frac']:.2%} | "
-                      f"pred_cos={cross_diag_stats['cross_pred_mean_cos']:.3f} | "
-                      f"target_cos={cross_diag_stats['cross_target_mean_cos']:.3f} | "
-                      f"agg_max={cross_diag_stats['cross_agg_max_mean']:.3f}"
-                      f"/p90={cross_diag_stats['cross_agg_max_p90']:.3f} | "
-                      f"agg_eff_par={cross_diag_stats['cross_agg_eff_parents_mean']:.3f} | "
-                      f"pred->target diag/off/gap="
-                      f"{cross_diag_stats['cross_pred_target_diag_mean']:.3f}/"
-                      f"{cross_diag_stats['cross_pred_target_offdiag_mean']:.3f}/"
-                      f"{cross_diag_stats['cross_pred_target_diag_gap']:.3f}")
+            if causal_lag_main_weight > 0.0:
+                print(f"  [CausalLag] clean_fwd={causal_lag_diag_stats['causal_lag_diag_forward_loss']:.4f} | "
+                      f"clean_rev={causal_lag_diag_stats['causal_lag_diag_reverse_loss']:.4f} | "
+                      f"delta(rev-fwd)={causal_lag_diag_stats['causal_lag_diag_reverse_minus_forward']:+.4f} | "
+                      f"prefers_forward={int(causal_lag_diag_stats['causal_lag_diag_prefers_forward'])}")
+            if post_detach_direction_epoch_stats["post_detach_direction_available"] > 0.5:
+                print(
+                    f"  [PostDetach] batches={int(post_detach_direction_epoch_stats['post_detach_direction_batch_count'])} | "
+                    f"subj={int(post_detach_direction_epoch_stats['post_detach_direction_subject_count'])} | "
+                    f"fwd={post_detach_direction_epoch_stats['post_detach_direction_forward_mean']:.4f} | "
+                    f"rev={post_detach_direction_epoch_stats['post_detach_direction_reverse_mean']:.4f} | "
+                    f"delta={post_detach_direction_epoch_stats['post_detach_direction_delta_mean']:+.4f} | "
+                    f"var={post_detach_direction_epoch_stats['post_detach_direction_delta_var']:.4f} | "
+                    f"parent_ent={post_detach_direction_epoch_stats['post_detach_direction_parent_entropy']:.4f}"
+                )
+            if selector_dataset_stats.get("selection_causal_lag_subject_count", 0.0) > 0.0:
+                print(
+                    f"  [SelLag] subj={int(selector_dataset_stats['selection_causal_lag_subject_count'])} | "
+                    f"fwd={selector_dataset_stats['selection_causal_lag_forward_mean']:.4f}"
+                    f"±{selector_dataset_stats['selection_causal_lag_forward_std']:.4f} | "
+                    f"rev={selector_dataset_stats['selection_causal_lag_reverse_mean']:.4f}"
+                    f"±{selector_dataset_stats['selection_causal_lag_reverse_std']:.4f} | "
+                    f"delta={selector_dataset_stats['selection_causal_lag_delta_mean']:+.4f}"
+                    f"±{selector_dataset_stats['selection_causal_lag_delta_std']:.4f} | "
+                    f"prefers_forward={selector_dataset_stats['selection_causal_lag_prefers_forward_frac']:.2%}"
+                )
             if noise_guide_probe_stats.get("noise_probe_available", 0.0) > 0.5:
                 print(f"  [NoiseProbe] t={int(noise_guide_probe_stats['noise_probe_timestep'])} | "
                       f"patel={noise_guide_probe_stats['noise_probe_patel_loss']:.4f} | "
@@ -3549,6 +4122,8 @@ def train_brain_connectivity(
     model.direction_lr_multiplier = float(direction_lr_multiplier)
     model.freeze_direction_after_epoch = int(freeze_direction_after_epoch)
     model.direction_branch_frozen_from_epoch = int(direction_branch_frozen_from_epoch)
+    model.detach_direction_from_main_after_epoch = int(detach_direction_from_main_after_epoch)
+    model.direction_from_main_detached_from_epoch = int(direction_from_main_detached_from_epoch)
     model.gradient_alignment_probe_enabled = int(enable_gradient_alignment_probe)
     model.gradient_alignment_probe_seed = int(gradient_alignment_probe_seed)
 
@@ -3604,10 +4179,6 @@ def main():
     parser.add_argument('--optimizer_step_mode', type=str, default='subject',
                         choices=['subject', 'batch_mean'],
                         help='subject: one optimizer step per subject; batch_mean: average gradients across the subject minibatch before stepping')
-
-    parser.add_argument('--save_path', type=str, default='./learned_brain_network.npy',
-
-                        help='Path to save learned adjacency matrix')
 
     parser.add_argument('--device', type=str, default='cuda',
 
@@ -3683,6 +4254,29 @@ def main():
     parser.add_argument('--selection_agreement_mode', type=str, default='hard_coverage',
                         choices=['hard_coverage', 'soft_weighted'],
                         help='Patel-agreement scoring mode for best-epoch selection')
+    parser.add_argument('--selection_score_mode', type=str, default='legacy',
+                        choices=['legacy', 'causal_lag_composite', 'causal_lag_entropy_composite', 'causal_lag_primary'],
+                        help='Checkpoint selector score mode: legacy keeps the original proxy; causal_lag_composite uses soft agreement + causal-lag delta - dir_margin; causal_lag_entropy_composite adds cross-subject causal-lag mean/std and parent-entropy penalties; causal_lag_primary makes single-subject causal-lag delta dominant with weak tie-break terms')
+    parser.add_argument('--selection_soft_agreement_weight', type=float, default=0.20,
+                        help='Soft Patel-agreement weight used by the causal-lag selector score modes')
+    parser.add_argument('--selection_causal_lag_weight', type=float, default=1.0,
+                        help='Causal-lag weight used by the causal-lag selector score modes')
+    parser.add_argument('--selection_margin_penalty_weight', type=float, default=0.05,
+                        help='dir_margin penalty weight used by the causal-lag selector score modes')
+    parser.add_argument('--selection_causal_lag_subject_limit', type=int, default=-1,
+                        help='Subject limit for cross-subject causal-lag selector diagnostics; -1 uses all subjects')
+    parser.add_argument('--selection_causal_lag_std_penalty_weight', type=float, default=0.0,
+                        help='Cross-subject causal-lag std penalty weight used by selection_score_mode=causal_lag_entropy_composite')
+    parser.add_argument('--selection_parent_entropy_penalty_weight', type=float, default=0.0,
+                        help='Parent-entropy penalty weight used by selection_score_mode=causal_lag_entropy_composite')
+    parser.add_argument('--selection_primary_causal_lag_weight', type=float, default=1.0,
+                        help='Primary causal-lag delta weight used by selection_score_mode=causal_lag_primary')
+    parser.add_argument('--selection_primary_soft_tiebreak_weight', type=float, default=0.05,
+                        help='Soft-agreement tie-break weight used by selection_score_mode=causal_lag_primary')
+    parser.add_argument('--selection_primary_skeleton_tiebreak_weight', type=float, default=0.05,
+                        help='Skeleton-overlap tie-break weight used by selection_score_mode=causal_lag_primary')
+    parser.add_argument('--selection_primary_density_tiebreak_weight', type=float, default=0.0,
+                        help='Density-factor tie-break weight used by selection_score_mode=causal_lag_primary')
     parser.add_argument('--selector_audit_gt_path', type=str, default=None,
                         help='Optional GT edge file used only for per-epoch selector audit; never used for training or checkpoint selection')
     parser.add_argument('--selector_audit_strict_margin_eps_values', type=str, default='0,3e-4,0.1',
@@ -3697,10 +4291,6 @@ def main():
                         help='Number of encoder pretrain epochs')
     parser.add_argument('--pretrain_lr', type=float, default=1e-3,
                         help='Learning rate for encoder pretraining')
-    # --pretrain_split_ratio 已废弃（新因果编码器使用自回归预训练，不需要 split）
-    # parser.add_argument('--pretrain_split_ratio', type=float, default=0.75)
-    # --skip_pretrain 已废弃（使用 --pretrain_epochs 0 代替）
-    # parser.add_argument('--skip_pretrain', action='store_true', default=False)
     parser.add_argument('--skip_pretrain', action='store_true', default=False,
                         help='Skip encoder pretraining entirely (equivalent to --pretrain_epochs 0)')
     parser.add_argument('--pretrain_checkpoint', type=str, default=None,
@@ -3709,9 +4299,7 @@ def main():
     parser.add_argument('--disable_temporal_encoder', action='store_true', default=False,
                         help='Disable temporal encoder and work directly on raw time series')
 
-    # === Fix 4: Uniform timestep ===
-    parser.add_argument('--uniform_timestep', action='store_true', default=True,
-                        help='All nodes share the same timestep per forward pass (default)')
+    # === Timestep sampling mode ===
     parser.add_argument('--per_node_timestep', action='store_true', default=False,
                         help='Each node samples an independent timestep (legacy behavior)')
 
@@ -3721,9 +4309,7 @@ def main():
                         help='Noise normalization: global (preserve node differences), '
                              'layernorm (legacy), none')
 
-    # === Fix 3: Zero-mean noise ===
-    parser.add_argument('--noise_zero_mean', action='store_true', default=True,
-                        help='Drop neighbor mean from noise (reduce signal correlation, default)')
+    # === Noise mean mode ===
     parser.add_argument('--noise_with_mean', action='store_true', default=False,
                         help='Include neighbor mean in noise (legacy behavior)')
 
@@ -3747,10 +4333,6 @@ def main():
     parser.add_argument('--directional_prior_scope', type=str, default='online_subject',
                         choices=['online_subject', 'global_dataset'],
                         help='Whether lag_corr directional prior is recomputed per subject or fixed once from the full dataset')
-    parser.add_argument('--directional_prior_consistency_floor', type=float, default=0.0,
-                        help='Optional cross-subject sign-consistency floor applied only to cached global_dataset lag priors')
-    parser.add_argument('--directional_prior_consistency_power', type=float, default=0.0,
-                        help='Optional soft weighting power applied to cached global_dataset lag priors using cross-subject sign consistency')
     parser.add_argument('--directional_prior_lags', type=str, default='1',
                         help='Comma-separated lag steps used by lag_corr directional prior')
     parser.add_argument('--directional_prior_lag_weights', type=str, default='',
@@ -3769,43 +4351,29 @@ def main():
                         help='LR multiplier applied only to the separate direction branch in support_direction mode')
     parser.add_argument('--freeze_direction_after_epoch', type=int, default=-1,
                         help='Freeze the separate direction branch after this many full epochs; -1 disables')
+    parser.add_argument('--detach_direction_from_main_after_epoch', type=int, default=-1,
+                        help='Detach the direction gate from main denoising/causal-lag gradients after this many full epochs; -1 disables')
+    parser.add_argument('--post_detach_direction_contrast_weight', type=float, default=0.0,
+                        help='After detach, reward larger reverse-minus-forward causal-lag contrast on the direction branch only')
+    parser.add_argument('--post_detach_direction_variance_weight', type=float, default=0.0,
+                        help='After detach, penalize cross-subject variance of the reverse-minus-forward contrast')
+    parser.add_argument('--post_detach_direction_parent_entropy_weight', type=float, default=0.0,
+                        help='After detach, apply an optional parent-entropy term through detached support and live direction gate')
     parser.add_argument('--enable_gradient_alignment_probe', action='store_true', default=False,
                         help='Record end-of-epoch gradient alignment diagnostics on the direction branch')
     parser.add_argument('--gradient_alignment_probe_seed', type=int, default=0,
                         help='RNG seed used by the fixed gradient-alignment probe forward pass')
-    parser.add_argument('--enable_cross_prediction', action='store_true', default=False,
-                        help='Enable online cross-prediction auxiliary loss for directionality')
-    parser.add_argument('--cross_pred_target_ratio', type=float, default=0.02,
-                        help='Target ratio of cross-prediction loss relative to main loss')
-    parser.add_argument('--cross_pred_schedule', type=str, default='cosine_anneal',
-                        choices=['cosine_anneal', 'plateau'],
-                        help='Cross-pred auxiliary schedule after warmup: cosine_anneal or plateau')
-    parser.add_argument('--cross_pred_aggregation', type=str, default='mean',
+    parser.add_argument('--causal_lag_main_weight', type=float, default=0.0,
+                        help='Weight of the lagged candidate-parent reconstruction term inside the main denoising branch; 0 disables')
+    parser.add_argument('--causal_lag_main_aggregation', type=str, default='mean',
                         choices=['mean', 'softmax'],
-                        help='Cross-pred aggregation inside the auxiliary loss')
-    parser.add_argument('--cross_pred_softmax_temp', type=float, default=1.0,
-                        help='Temperature for softmax cross-pred aggregation')
-    parser.add_argument('--cross_pred_lags', type=str, default='1',
-                        help='Comma-separated lag steps used by cross-prediction supervision')
-    parser.add_argument('--cross_pred_lag_weights', type=str, default='',
-                        help='Optional comma-separated lag weights for cross-prediction; defaults to inverse-lag weighting')
-    parser.add_argument('--cross_pred_fixed_weight', type=float, default=0.0,
-                        help='Fixed weight for cross-prediction supervision; if > 0 it overrides adaptive cross weighting')
-    parser.add_argument('--cross_pred_fixed_warmup_epochs', type=int, default=0,
-                        help='Warmup epochs before fixed cross-prediction weight activates')
-    parser.add_argument('--cross_pred_fixed_ramp_epochs', type=int, default=1,
-                        help='Linear ramp epochs for fixed cross-prediction weight')
-    parser.add_argument('--anti_collapse_lambda', type=float, default=0.0,
-                        help='Fixed weight for direct anti-collapse loss on directional contrasts')
-    parser.add_argument('--anti_collapse_margin', type=float, default=0.0,
-                        help='Minimum absolute directional contrast encouraged on active pairs')
-    parser.add_argument('--anti_collapse_mode', type=str, default='unsigned_raw',
-                        choices=['unsigned_raw', 'signed_raw', 'signed_gate'],
-                        help='Anti-collapse space: unsigned raw logit gap, signed raw gap, or signed gate skew')
-    parser.add_argument('--anti_collapse_warmup_epochs', type=int, default=0,
-                        help='Warmup epochs before anti-collapse loss activates')
-    parser.add_argument('--anti_collapse_ramp_epochs', type=int, default=1,
-                        help='Linear ramp epochs for anti-collapse loss')
+                        help='Aggregation used by the causal-lag main reconstruction path')
+    parser.add_argument('--causal_lag_main_softmax_temp', type=float, default=1.0,
+                        help='Temperature for softmax causal-lag main aggregation')
+    parser.add_argument('--causal_lag_main_lags', type=str, default='1',
+                        help='Comma-separated lag steps used by the causal-lag main reconstruction path')
+    parser.add_argument('--causal_lag_main_lag_weights', type=str, default='',
+                        help='Optional comma-separated lag weights for causal-lag main reconstruction; defaults to inverse-lag weighting')
     parser.add_argument('--parent_entropy_lambda', type=float, default=0.0,
                         help='Weight for incoming-parent entropy regularization on the main graph')
     parser.add_argument('--parent_entropy_warmup_epochs', type=int, default=0,
@@ -3851,45 +4419,72 @@ def main():
         parser.error('--direction_lr_multiplier must be > 0')
     if args.freeze_direction_after_epoch < -1:
         parser.error('--freeze_direction_after_epoch must be >= -1')
+    if args.detach_direction_from_main_after_epoch < -1:
+        parser.error('--detach_direction_from_main_after_epoch must be >= -1')
     if args.directional_loss_end_epoch < -1:
         parser.error('--directional_loss_end_epoch must be >= -1')
+    if args.post_detach_direction_contrast_weight < 0.0:
+        parser.error('--post_detach_direction_contrast_weight must be >= 0')
+    if args.post_detach_direction_variance_weight < 0.0:
+        parser.error('--post_detach_direction_variance_weight must be >= 0')
+    if args.post_detach_direction_parent_entropy_weight < 0.0:
+        parser.error('--post_detach_direction_parent_entropy_weight must be >= 0')
+    post_detach_direction_loss_requested = (
+        args.post_detach_direction_contrast_weight > 0.0 or
+        args.post_detach_direction_variance_weight > 0.0 or
+        args.post_detach_direction_parent_entropy_weight > 0.0
+    )
+    if post_detach_direction_loss_requested and args.optimizer_step_mode != 'batch_mean':
+        parser.error('--post_detach_direction_* requires --optimizer_step_mode batch_mean')
+    if post_detach_direction_loss_requested and args.detach_direction_from_main_after_epoch < 0:
+        parser.error('--post_detach_direction_* requires --detach_direction_from_main_after_epoch >= 0')
+    if post_detach_direction_loss_requested and args.structure_parameterization != 'support_direction':
+        parser.error('--post_detach_direction_* requires --structure_parameterization support_direction')
     if args.disable_directional_loss and args.directional_loss_end_epoch >= 0:
         parser.error('--directional_loss_end_epoch cannot be used with --disable_directional_loss')
     if args.gradient_alignment_probe_seed < 0:
         parser.error('--gradient_alignment_probe_seed must be >= 0')
     if (
-        (abs(args.direction_lr_multiplier - 1.0) > 1e-12 or args.freeze_direction_after_epoch >= 0) and
+        (
+            abs(args.direction_lr_multiplier - 1.0) > 1e-12 or
+            args.freeze_direction_after_epoch >= 0 or
+            args.detach_direction_from_main_after_epoch >= 0
+        ) and
         args.structure_parameterization != 'support_direction'
     ):
         parser.error(
-            '--direction_lr_multiplier and --freeze_direction_after_epoch require '
+            '--direction_lr_multiplier, --freeze_direction_after_epoch, and '
+            '--detach_direction_from_main_after_epoch require '
             '--structure_parameterization support_direction'
         )
     if args.enable_gradient_alignment_probe and args.structure_parameterization != 'support_direction':
         parser.error(
             '--enable_gradient_alignment_probe requires --structure_parameterization support_direction'
         )
-    if args.cross_pred_fixed_weight < 0.0:
-        parser.error('--cross_pred_fixed_weight must be >= 0')
-    if args.cross_pred_fixed_warmup_epochs < 0 or args.cross_pred_fixed_ramp_epochs < 1:
-        parser.error('--cross_pred_fixed_warmup_epochs must be >= 0 and --cross_pred_fixed_ramp_epochs must be >= 1')
-    if args.anti_collapse_lambda < 0.0:
-        parser.error('--anti_collapse_lambda must be >= 0')
-    if args.anti_collapse_margin < 0.0:
-        parser.error('--anti_collapse_margin must be >= 0')
-    if args.anti_collapse_mode == 'signed_gate' and args.anti_collapse_margin >= 1.0:
-        parser.error('--anti_collapse_margin must be < 1 when --anti_collapse_mode signed_gate')
-    if not 0.0 <= args.directional_prior_consistency_floor <= 1.0:
-        parser.error('--directional_prior_consistency_floor must be in [0, 1]')
-    if args.directional_prior_consistency_power < 0.0:
-        parser.error('--directional_prior_consistency_power must be >= 0')
-    if args.anti_collapse_lambda > 0.0:
-        if args.disable_directional_loss:
-            parser.error('--anti_collapse_lambda requires directional supervision to remain enabled')
-        if not args.directional_kappa_gate:
-            parser.error('--anti_collapse_lambda requires --directional_kappa_gate')
-    if args.anti_collapse_warmup_epochs < 0 or args.anti_collapse_ramp_epochs < 1:
-        parser.error('--anti_collapse_warmup_epochs must be >= 0 and --anti_collapse_ramp_epochs must be >= 1')
+    if args.causal_lag_main_weight < 0.0:
+        parser.error('--causal_lag_main_weight must be >= 0')
+    if args.causal_lag_main_softmax_temp <= 0.0:
+        parser.error('--causal_lag_main_softmax_temp must be > 0')
+    if args.selection_soft_agreement_weight < 0.0:
+        parser.error('--selection_soft_agreement_weight must be >= 0')
+    if args.selection_causal_lag_weight < 0.0:
+        parser.error('--selection_causal_lag_weight must be >= 0')
+    if args.selection_margin_penalty_weight < 0.0:
+        parser.error('--selection_margin_penalty_weight must be >= 0')
+    if args.selection_causal_lag_subject_limit == 0 or args.selection_causal_lag_subject_limit < -1:
+        parser.error('--selection_causal_lag_subject_limit must be -1 or a positive integer')
+    if args.selection_causal_lag_std_penalty_weight < 0.0:
+        parser.error('--selection_causal_lag_std_penalty_weight must be >= 0')
+    if args.selection_parent_entropy_penalty_weight < 0.0:
+        parser.error('--selection_parent_entropy_penalty_weight must be >= 0')
+    if args.selection_primary_causal_lag_weight < 0.0:
+        parser.error('--selection_primary_causal_lag_weight must be >= 0')
+    if args.selection_primary_soft_tiebreak_weight < 0.0:
+        parser.error('--selection_primary_soft_tiebreak_weight must be >= 0')
+    if args.selection_primary_skeleton_tiebreak_weight < 0.0:
+        parser.error('--selection_primary_skeleton_tiebreak_weight must be >= 0')
+    if args.selection_primary_density_tiebreak_weight < 0.0:
+        parser.error('--selection_primary_density_tiebreak_weight must be >= 0')
 
     try:
         directional_prior_lags, directional_prior_lag_weights = resolve_lag_weight_spec(
@@ -3900,11 +4495,14 @@ def main():
                 else None
             ),
         )
-        cross_pred_lags, cross_pred_lag_weights = resolve_lag_weight_spec(
-            parse_int_csv_arg(args.cross_pred_lags, name='--cross_pred_lags'),
+        causal_lag_main_lags, causal_lag_main_lag_weights = resolve_lag_weight_spec(
+            parse_int_csv_arg(args.causal_lag_main_lags, name='--causal_lag_main_lags'),
             (
-                parse_float_csv_arg(args.cross_pred_lag_weights, name='--cross_pred_lag_weights')
-                if args.cross_pred_lag_weights.strip()
+                parse_float_csv_arg(
+                    args.causal_lag_main_lag_weights,
+                    name='--causal_lag_main_lag_weights',
+                )
+                if args.causal_lag_main_lag_weights.strip()
                 else None
             ),
         )
@@ -3951,11 +4549,25 @@ def main():
     print(f"Direction logit bias scale: {args.direction_logit_bias_scale}")
     print(f"Main DDM loss weight: {args.main_loss_weight}")
     print(f"Directional prior lags/weights: {list(directional_prior_lags)} / {[round(v, 4) for v in directional_prior_lag_weights]}")
-    print(f"Directional prior consistency floor: {args.directional_prior_consistency_floor}")
-    print(f"Directional prior consistency power: {args.directional_prior_consistency_power}")
-    print(f"Cross-pred lags/weights: {list(cross_pred_lags)} / {[round(v, 4) for v in cross_pred_lag_weights]}")
-    print(f"Cross-pred fixed weight: {args.cross_pred_fixed_weight}")
-    print(f"Anti-collapse lambda/margin/mode: {args.anti_collapse_lambda} / {args.anti_collapse_margin} / {args.anti_collapse_mode}")
+    print(f"Causal-lag main lags/weights: {list(causal_lag_main_lags)} / {[round(v, 4) for v in causal_lag_main_lag_weights]}")
+    print(f"Causal-lag main weight: {args.causal_lag_main_weight}")
+    print(f"Selection score mode: {args.selection_score_mode}")
+    print(
+        "Selection composite weights: "
+        f"soft={args.selection_soft_agreement_weight} / "
+        f"lag={args.selection_causal_lag_weight} / "
+        f"margin_penalty={args.selection_margin_penalty_weight} / "
+        f"lag_std_penalty={args.selection_causal_lag_std_penalty_weight} / "
+        f"parent_entropy_penalty={args.selection_parent_entropy_penalty_weight}"
+    )
+    print(
+        "Selection primary weights: "
+        f"lag={args.selection_primary_causal_lag_weight} / "
+        f"soft_tiebreak={args.selection_primary_soft_tiebreak_weight} / "
+        f"skeleton_tiebreak={args.selection_primary_skeleton_tiebreak_weight} / "
+        f"density_tiebreak={args.selection_primary_density_tiebreak_weight}"
+    )
+    print(f"Selection causal-lag subject_limit: {args.selection_causal_lag_subject_limit}")
     print(f"Selection agreement mode: {args.selection_agreement_mode}")
     print(f"Selector audit GT path: {args.selector_audit_gt_path}")
     print(f"Selector audit strict eps: {list(selector_audit_strict_margin_eps_values)}")
@@ -4048,14 +4660,12 @@ def main():
             f"scale={args.direction_logit_bias_scale} | "
             f"contrast_range=[{tau_contrast.min():.4f}, {tau_contrast.max():.4f}]"
         )
-    if args.enable_cross_prediction:
-        print(f"Cross-prediction: enabled | target_ratio={args.cross_pred_target_ratio} | "
-              f"schedule={args.cross_pred_schedule} | "
-              f"aggregation={args.cross_pred_aggregation} | "
-              f"softmax_temp={args.cross_pred_softmax_temp} | "
-              f"lags={list(cross_pred_lags)} | "
-              f"lag_weights={[round(v, 4) for v in cross_pred_lag_weights]} | "
-              f"fixed_weight={args.cross_pred_fixed_weight:g}")
+    if args.causal_lag_main_weight > 0.0:
+        print(f"Causal-lag main: enabled | weight={args.causal_lag_main_weight:g} | "
+              f"aggregation={args.causal_lag_main_aggregation} | "
+              f"softmax_temp={args.causal_lag_main_softmax_temp} | "
+              f"lags={list(causal_lag_main_lags)} | "
+              f"lag_weights={[round(v, 4) for v in causal_lag_main_lag_weights]}")
     if args.parent_entropy_lambda > 0.0:
         print(f"Parent concentration: enabled | entropy_lambda={args.parent_entropy_lambda} | "
               f"warmup={args.parent_entropy_warmup_epochs} | "
@@ -4076,21 +4686,21 @@ def main():
               f"end_epoch={args.directional_loss_end_epoch} | "
               f"lag_source={args.lag_direction_source} | "
               f"scope={args.directional_prior_scope} | "
-              f"consistency_floor={args.directional_prior_consistency_floor:.2f} | "
-              f"consistency_power={args.directional_prior_consistency_power:.2f} | "
               f"lags={list(directional_prior_lags)} | "
               f"lag_weights={[round(v, 4) for v in directional_prior_lag_weights]}")
         if args.directional_kappa_gate:
             print(f"Directional kappa gate requested | quantile={args.directional_kappa_gate_quantile}")
-    if args.anti_collapse_lambda > 0.0:
-        print(f"Anti-collapse: enabled | lambda={args.anti_collapse_lambda} | "
-              f"margin={args.anti_collapse_margin} | "
-              f"mode={args.anti_collapse_mode} | "
-              f"warmup={args.anti_collapse_warmup_epochs} | "
-              f"ramp={args.anti_collapse_ramp_epochs}")
     if args.structure_parameterization == 'support_direction':
         print(f"Direction retention: lr_multiplier={args.direction_lr_multiplier:g} | "
-              f"freeze_after_epoch={args.freeze_direction_after_epoch}")
+              f"freeze_after_epoch={args.freeze_direction_after_epoch} | "
+              f"detach_main_after_epoch={args.detach_direction_from_main_after_epoch}")
+    if post_detach_direction_loss_requested:
+        print(
+            "Post-detach direction-only loss: "
+            f"contrast={args.post_detach_direction_contrast_weight} | "
+            f"variance={args.post_detach_direction_variance_weight} | "
+            f"parent_entropy={args.post_detach_direction_parent_entropy_weight}"
+        )
     if args.enable_gradient_alignment_probe:
         print(f"Gradient alignment probe: enabled | seed={args.gradient_alignment_probe_seed}")
 
@@ -4216,8 +4826,6 @@ def main():
         directional_schedule=args.directional_schedule,
         lag_direction_source=args.lag_direction_source,
         directional_prior_scope=args.directional_prior_scope,
-        directional_prior_consistency_floor=args.directional_prior_consistency_floor,
-        directional_prior_consistency_power=args.directional_prior_consistency_power,
         directional_prior_lags=directional_prior_lags,
         directional_prior_lag_weights=directional_prior_lag_weights,
         directional_kappa_gate=args.directional_kappa_gate,
@@ -4227,23 +4835,17 @@ def main():
         directional_loss_end_epoch=args.directional_loss_end_epoch,
         direction_lr_multiplier=args.direction_lr_multiplier,
         freeze_direction_after_epoch=args.freeze_direction_after_epoch,
+        detach_direction_from_main_after_epoch=args.detach_direction_from_main_after_epoch,
+        post_detach_direction_contrast_weight=args.post_detach_direction_contrast_weight,
+        post_detach_direction_variance_weight=args.post_detach_direction_variance_weight,
+        post_detach_direction_parent_entropy_weight=args.post_detach_direction_parent_entropy_weight,
         enable_gradient_alignment_probe=args.enable_gradient_alignment_probe,
         gradient_alignment_probe_seed=args.gradient_alignment_probe_seed,
-        enable_cross_prediction=args.enable_cross_prediction,
-        cross_pred_target_ratio=args.cross_pred_target_ratio,
-        cross_pred_schedule=args.cross_pred_schedule,
-        cross_pred_aggregation=args.cross_pred_aggregation,
-        cross_pred_softmax_temp=args.cross_pred_softmax_temp,
-        cross_pred_lags=cross_pred_lags,
-        cross_pred_lag_weights=cross_pred_lag_weights,
-        cross_pred_fixed_weight=args.cross_pred_fixed_weight,
-        cross_pred_fixed_warmup_epochs=args.cross_pred_fixed_warmup_epochs,
-        cross_pred_fixed_ramp_epochs=args.cross_pred_fixed_ramp_epochs,
-        anti_collapse_lambda=args.anti_collapse_lambda,
-        anti_collapse_margin=args.anti_collapse_margin,
-        anti_collapse_mode=args.anti_collapse_mode,
-        anti_collapse_warmup_epochs=args.anti_collapse_warmup_epochs,
-        anti_collapse_ramp_epochs=args.anti_collapse_ramp_epochs,
+        causal_lag_main_weight=args.causal_lag_main_weight,
+        causal_lag_main_aggregation=args.causal_lag_main_aggregation,
+        causal_lag_main_softmax_temp=args.causal_lag_main_softmax_temp,
+        causal_lag_main_lags=causal_lag_main_lags,
+        causal_lag_main_lag_weights=causal_lag_main_lag_weights,
         parent_entropy_lambda=args.parent_entropy_lambda,
         parent_entropy_warmup_epochs=args.parent_entropy_warmup_epochs,
         parent_entropy_ramp_epochs=args.parent_entropy_ramp_epochs,
@@ -4256,6 +4858,17 @@ def main():
         ungated_symmetry_ramp_epochs=args.ungated_symmetry_ramp_epochs,
         selection_agreement_weight=args.selection_agreement_weight,
         selection_agreement_mode=args.selection_agreement_mode,
+        selection_score_mode=args.selection_score_mode,
+        selection_soft_agreement_weight=args.selection_soft_agreement_weight,
+        selection_causal_lag_weight=args.selection_causal_lag_weight,
+        selection_margin_penalty_weight=args.selection_margin_penalty_weight,
+        selection_causal_lag_subject_limit=args.selection_causal_lag_subject_limit,
+        selection_causal_lag_std_penalty_weight=args.selection_causal_lag_std_penalty_weight,
+        selection_parent_entropy_penalty_weight=args.selection_parent_entropy_penalty_weight,
+        selection_primary_causal_lag_weight=args.selection_primary_causal_lag_weight,
+        selection_primary_soft_tiebreak_weight=args.selection_primary_soft_tiebreak_weight,
+        selection_primary_skeleton_tiebreak_weight=args.selection_primary_skeleton_tiebreak_weight,
+        selection_primary_density_tiebreak_weight=args.selection_primary_density_tiebreak_weight,
         selector_audit_gt_edges=selector_audit_gt_edges,
         selector_audit_strict_margin_eps_values=selector_audit_strict_margin_eps_values,
         ddm_kwargs={
@@ -4425,7 +5038,18 @@ def main():
     config['exported_epoch'] = int(best_epoch)
     config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
     config['best_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+    config['selection_score_mode'] = str(args.selection_score_mode)
     config['selection_agreement_mode'] = str(args.selection_agreement_mode)
+    config['selection_soft_agreement_weight'] = float(args.selection_soft_agreement_weight)
+    config['selection_causal_lag_weight'] = float(args.selection_causal_lag_weight)
+    config['selection_margin_penalty_weight'] = float(args.selection_margin_penalty_weight)
+    config['selection_causal_lag_subject_limit'] = int(args.selection_causal_lag_subject_limit)
+    config['selection_causal_lag_std_penalty_weight'] = float(args.selection_causal_lag_std_penalty_weight)
+    config['selection_parent_entropy_penalty_weight'] = float(args.selection_parent_entropy_penalty_weight)
+    config['selection_primary_causal_lag_weight'] = float(args.selection_primary_causal_lag_weight)
+    config['selection_primary_soft_tiebreak_weight'] = float(args.selection_primary_soft_tiebreak_weight)
+    config['selection_primary_skeleton_tiebreak_weight'] = float(args.selection_primary_skeleton_tiebreak_weight)
+    config['selection_primary_density_tiebreak_weight'] = float(args.selection_primary_density_tiebreak_weight)
     config['best_epoch_guarded'] = int(getattr(model, 'best_epoch_guarded', -1))
     config['best_epoch_guarded_score'] = float(getattr(model, 'best_epoch_guarded_score', -1.0))
     config['best_epoch_score_only'] = int(getattr(model, 'best_epoch_score_only', -1))
@@ -4441,26 +5065,32 @@ def main():
     config['kappa_logit_bias_scale'] = float(getattr(model, 'kappa_logit_bias_scale', args.kappa_logit_bias_scale))
     config['direction_logit_bias_scale'] = float(getattr(model, 'direction_logit_bias_scale', args.direction_logit_bias_scale))
     config['directional_prior_scope'] = args.directional_prior_scope
-    config['directional_prior_consistency_floor'] = float(args.directional_prior_consistency_floor)
-    config['directional_prior_consistency_power'] = float(args.directional_prior_consistency_power)
     config['directional_prior_lags'] = ",".join(str(v) for v in directional_prior_lags)
     config['directional_prior_lag_weights'] = ",".join(f"{v:.8f}" for v in directional_prior_lag_weights)
-    config['cross_pred_lags'] = ",".join(str(v) for v in cross_pred_lags)
-    config['cross_pred_lag_weights'] = ",".join(f"{v:.8f}" for v in cross_pred_lag_weights)
+    config['causal_lag_main_weight'] = float(args.causal_lag_main_weight)
+    config['causal_lag_main_aggregation'] = args.causal_lag_main_aggregation
+    config['causal_lag_main_softmax_temp'] = float(args.causal_lag_main_softmax_temp)
+    config['causal_lag_main_lags'] = ",".join(str(v) for v in causal_lag_main_lags)
+    config['causal_lag_main_lag_weights'] = ",".join(f"{v:.8f}" for v in causal_lag_main_lag_weights)
+    config['detach_direction_from_main_after_epoch'] = int(args.detach_direction_from_main_after_epoch)
+    config['post_detach_direction_contrast_weight'] = float(
+        args.post_detach_direction_contrast_weight
+    )
+    config['post_detach_direction_variance_weight'] = float(
+        args.post_detach_direction_variance_weight
+    )
+    config['post_detach_direction_parent_entropy_weight'] = float(
+        args.post_detach_direction_parent_entropy_weight
+    )
     config['selector_audit_gt_path'] = args.selector_audit_gt_path
     config['selector_audit_strict_margin_eps_values'] = ",".join(
         np.format_float_positional(v, trim='-') for v in selector_audit_strict_margin_eps_values
     )
-    config['cross_pred_fixed_weight'] = float(args.cross_pred_fixed_weight)
-    config['cross_pred_fixed_warmup_epochs'] = int(args.cross_pred_fixed_warmup_epochs)
-    config['cross_pred_fixed_ramp_epochs'] = int(args.cross_pred_fixed_ramp_epochs)
-    config['anti_collapse_lambda'] = float(args.anti_collapse_lambda)
-    config['anti_collapse_margin'] = float(args.anti_collapse_margin)
-    config['anti_collapse_mode'] = args.anti_collapse_mode
-    config['anti_collapse_warmup_epochs'] = int(args.anti_collapse_warmup_epochs)
-    config['anti_collapse_ramp_epochs'] = int(args.anti_collapse_ramp_epochs)
     config['directional_loss_deactivated_from_epoch'] = int(getattr(model, 'directional_loss_deactivated_from_epoch', -1))
     config['direction_branch_frozen_from_epoch'] = int(getattr(model, 'direction_branch_frozen_from_epoch', -1))
+    config['direction_from_main_detached_from_epoch'] = int(
+        getattr(model, 'direction_from_main_detached_from_epoch', -1)
+    )
     final_adj_diag = getattr(model, 'last_epoch_adj_diagnostics', None)
     if final_adj_diag is not None:
         for key, value in final_adj_diag.items():
