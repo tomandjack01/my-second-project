@@ -403,16 +403,24 @@ class DDM(nn.Module):
             )
         return torch.clamp(direction_logits, -6.0, 6.0)
 
-    def get_structure_adj(self):
+    def get_structure_adj(
+        self,
+        detach_direction_gate: bool = False,
+        detach_support_weights: bool = False,
+    ):
         """Return the masked adjacency matrix used for graph weights and export."""
         if self.structure_parameterization == 'support_direction':
             support_logits = self.get_structure_logits()
             support_weights = torch.sigmoid(support_logits)
+            if detach_support_weights:
+                support_weights = support_weights.detach()
             support_weights = support_weights * self.diag_mask.to(support_weights.device)
             if self.fixed_support_mask is not None:
                 support_weights = support_weights * self.fixed_support_mask.to(support_weights.device)
             direction_logits = self.get_direction_logits()
             direction_gate = torch.sigmoid(direction_logits - direction_logits.transpose(0, 1))
+            if detach_direction_gate:
+                direction_gate = direction_gate.detach()
             adj_weights = support_weights * direction_gate
         else:
             adj_logits = self.get_structure_logits()
@@ -428,7 +436,11 @@ class DDM(nn.Module):
         self.learned_adj_weights = adj_weights
         return adj_weights
 
-    def get_structure_message_adj(self):
+    def get_structure_message_adj(
+        self,
+        detach_direction_gate: bool = False,
+        detach_support_weights: bool = False,
+    ):
         """
         Return the adjacency used for graph message passing.
 
@@ -436,19 +448,37 @@ class DDM(nn.Module):
         `causal` transposes into A_msg[cause, effect] so message edges follow
         cause -> effect semantics.
         """
-        adj_weights = self.get_structure_adj()
+        adj_weights = self.get_structure_adj(
+            detach_direction_gate=detach_direction_gate,
+            detach_support_weights=detach_support_weights,
+        )
         if self.structure_message_graph_mode == 'causal':
             return adj_weights.transpose(0, 1)
         return adj_weights
 
-    def _get_structure_graph(self, device):
+    def _get_structure_graph(
+        self,
+        device,
+        detach_direction_gate: bool = False,
+        detach_support_weights: bool = False,
+    ):
         """Create fully connected graph and compute edge weights from sender/receiver embeddings."""
         g = dgl.graph((self.full_g_src, self.full_g_dst), num_nodes=self.num_nodes)
         g = g.to(device)
-        edge_weights = self.get_structure_message_adj().flatten()
+        edge_weights = self.get_structure_message_adj(
+            detach_direction_gate=detach_direction_gate,
+            detach_support_weights=detach_support_weights,
+        ).flatten()
         return g, edge_weights
 
-    def forward(self, g, x):
+    def forward(
+        self,
+        g,
+        x,
+        detach_direction_from_main: bool = False,
+        detach_support_from_main: bool = False,
+        noise_guide_adj_override: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass with optional temporal encoding.
 
@@ -456,6 +486,12 @@ class DDM(nn.Module):
             g: DGL graph (can be None if using structure learning mode)
             x: Raw time series input [N, T] or [B, N, T]
                where T = in_dim (time points, e.g., 200)
+            detach_direction_from_main: When True, the main denoising path reads
+                a detached direction gate so it does not update the direction branch.
+            detach_support_from_main: When True, the main denoising path reads
+                detached support weights so it does not update the support branch.
+            noise_guide_adj_override: Optional detached adjacency overriding the
+                default training noise guide for this forward pass only.
 
         Returns:
             loss: Diffusion loss
@@ -475,16 +511,32 @@ class DDM(nn.Module):
 
         # Step 3: Get graph structure
         if self.structure_learning_mode:
-            g, edge_weight = self._get_structure_graph(x_processed.device)
+            g, edge_weight = self._get_structure_graph(
+                x_processed.device,
+                detach_direction_gate=detach_direction_from_main,
+                detach_support_weights=detach_support_from_main,
+            )
         else:
             edge_weight = None
 
         # Step 4: Diffusion forward process (add noise)
-        x_t, time_embed, g = self.sample_q(t, x_processed, g)
+        x_t, time_embed, g = self.sample_q(
+            t,
+            x_processed,
+            g,
+            noise_guide_adj_override=noise_guide_adj_override,
+        )
 
         # Step 5: Denoise and compute loss
-        loss = self.node_denoising(x_processed, x_t, time_embed, g, edge_weight=edge_weight)
-        loss_item = {"loss": loss.item()}
+        loss, denoised_output = self.node_denoising(
+            x_processed, x_t, time_embed, g, edge_weight=edge_weight
+        )
+        loss_item = {
+            "loss": loss.item(),
+            "denoised_output": denoised_output,
+            "clean_target": x_processed,
+            "noisy_input": x_t,
+        }
         return loss, loss_item
 
     def prepare_clean_target(self, x):
@@ -623,7 +675,7 @@ class DDM(nn.Module):
             loss = F.mse_loss(out, x)
         else:  # 'cosine' or legacy default
             loss = loss_fn(out, x, self.alpha_l)
-        return loss
+        return loss, out
 
     def embed(self, g, x, T):
         """

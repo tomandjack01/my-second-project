@@ -61,11 +61,13 @@ Given one subject `x` with shape `[N, T]`:
 ## Validation Plan
 
 Smoke test:
+
 - 1 epoch CPU run with `--enable_cross_prediction`
 - Follow-up smoke test with `epochs >= 4` so cross-loss warmup ends and the
   weighted term becomes active
 
 First proper experiment:
+
 - final-only evaluation
 - `selection_agreement_weight=0`
 - `disable_directional_loss=True`
@@ -976,7 +978,7 @@ Interpretation:
   - collapse persists
   - effective parent count stays near the maximum
 - The 50-node smoke suggests the unchanged `mean`-aggregation v1 may actually
-  scale *worse* in terms of averaging, not better.
+  scale _worse_ in terms of averaging, not better.
 
 Current best interpretation:
 
@@ -1652,7 +1654,7 @@ Legacy aggregate summary:
     - GT reverse weights shrink substantially
   - revised conclusion:
     - entropy alone is not a viable direction-learning mechanism
-    - but entropy is a useful *precision-improving structural companion* to
+    - but entropy is a useful _precision-improving structural companion_ to
       Patel margin under symmetric initialization
 - Next step:
   - continue on the Patel branch only
@@ -1934,7 +1936,7 @@ Per-condition snapshot:
   - working interpretation:
     - the main-graph competition mechanism is real
     - the Patel supervision mechanism is also real
-    - whether they truly *synergize* is still unresolved from one seed
+    - whether they truly _synergize_ is still unresolved from one seed
 - Next step:
   - proceed to the matching multi-seed formal run
   - keep the same `patel_kappa` / `plateau` / delayed-entropy setup
@@ -2592,7 +2594,7 @@ Paired comparison against the GPU `0.30` anchor:
 - Interpretation / Thoughts:
   - this smoke gives a very specific result:
     - `kappa` gating does **not** improve strict F1 yet
-    - but it clearly changes the *kind* of false positives the model makes
+    - but it clearly changes the _kind_ of false positives the model makes
   - the good news:
     - the very-high-confidence hallucination regime is strongly weakened
     - GT margins stay intact at the current moderate cap level
@@ -3419,7 +3421,7 @@ Paired comparison against the GPU `0.30` anchor:
   - this means:
     - "causal message flow is semantically better" and
     - "causal message flow is currently the best strict operating point"
-    are not the same statement
+      are not the same statement
   - right now the pilot supports the first statement much more strongly than
     the second
 - Practical conclusion:
@@ -3578,7 +3580,7 @@ Paired comparison against the GPU `0.30` anchor:
   - this means the architecture/data-use idea
     - "treat subjects as a batch so the shared structure gets more stable
       gradients"
-    has not actually been tested yet
+      has not actually been tested yet
 - Why this is the right next step:
   - it directly targets a real implementation gap, not a hypothetical one
   - it preserves the current best raw branch instead of opening a new loss
@@ -4600,9 +4602,9 @@ Paired comparison against the GPU `0.30` anchor:
   - continuous `kappa` bias is at best a small margin-shaping helper
   - it is **not** a substitute for explicit skeleton selection
   - the next mechanism should therefore be more structural:
-      - either explicit support selection from `kappa`
-      - or a support/direction factorization where pair existence and direction
-        no longer interfere
+    - either explicit support selection from `kappa`
+    - or a support/direction factorization where pair existence and direction
+      no longer interfere
 
 #### `sim4` support/direction factorization smoke with fixed top-`k` support
 

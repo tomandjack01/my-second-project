@@ -1980,6 +1980,261 @@ Everything for this Option B branch should be recorded in **this file**:
 - This avoids paying for two extra hybrid conditions that are not part of the
   current experimental question.
 
+### 2026-04-04 - Selector Formalization Update For `random structure init + kappa gate on`
+
+- Fixed training trajectory under discussion:
+  - `run_20260403_222030`
+  - best/export/final strict:
+    - `0.885246 / 0.770492 / 0.852459`
+- New selector-only read:
+  - the remaining gap on this branch is now specifically selector-side
+  - within the current code, `causal_lag_composite` is the cleanest next
+    formalization target because it already exposes:
+    - `selection_soft_agreement_weight`
+    - `selection_causal_lag_weight`
+    - `selection_margin_penalty_weight`
+- Important correction to the earlier Phase-B starting point:
+  - do not assume that forcing Patel-shaped agreement weights to `0.0` is by
+    itself the best next move on this branch
+  - the current offline replay indicates a better first validation point is:
+    - `selection_score_mode = causal_lag_composite`
+    - `selection_soft_agreement_weight = 0.03`
+    - `selection_causal_lag_weight = 1.0`
+    - `selection_margin_penalty_weight = 0.10`
+- Reason:
+  - on the fixed audited trajectory, this existing-CLI selector setting moves
+    the chosen epoch to `34` and matches the GT-best strict score `0.885246`
+  - the current weakness is better described as:
+    - `soft_agreement` overweight
+    - plus insufficient `dir_margin` penalty
+  - not as:
+    - causal-lag signal being unusable
+- Discipline:
+  - keep GT audit-only
+  - first validate the selector on a real rerun with training held fixed
+  - only after that decide whether a new `primary + margin` style selector is
+    worth adding to the code
+
+### 2026-04-04 - Result Of The First Real Selector Validation Rerun
+
+- Executed rerun:
+  - `run_20260404_111017`
+  - selector setting:
+    - `selection_score_mode = causal_lag_composite`
+    - `selection_soft_agreement_weight = 0.03`
+    - `selection_causal_lag_weight = 1.0`
+    - `selection_margin_penalty_weight = 0.10`
+- Result:
+  - best/export/final strict:
+    - `0.885246 / 0.852459 / 0.868852`
+- Interpretation:
+  - the selector-only direction is still validated
+  - but the exact `0.03 / 0.10` point is not yet stable enough to freeze as a
+    default
+  - the stronger conclusion is now:
+    - lower `soft_agreement`
+    - plus higher `dir_margin` penalty
+    helps this branch
+  - the weaker conclusion is:
+    - one exact weight pair has already been solved
+- Updated next step:
+  - if continuing selector-only controls on this branch, prioritize a narrower
+    low-soft / high-margin window before adding a new selector mode:
+    - `selection_soft_agreement_weight = 0.00` to `0.01`
+    - `selection_margin_penalty_weight = 0.12` to `0.15`
+  - keep training backbone fixed while doing that check
+
+### Current Active References
+
+- After the 2026-04-03 four-dataset replay of the two retained models:
+  - keep two explicit references only
+  - do not reopen removed `lag_corr` / `directed_noise` / `post_detach_direction`
+    branches in the main program
+- Score-leading reference:
+  - `patel_assisted`
+  - empirical result:
+    - strongest GT best score on all four datasets:
+      - `fMRI`
+      - `sim2`
+      - `sim3`
+      - `sim4`
+  - limitation:
+    - best/export mismatch still persists on multiple datasets
+- Cleaner mechanism reference:
+  - `patel_free`
+  - empirical result:
+    - lower ceiling than `patel_assisted`
+    - but cleaner late-phase interpretation because `direction` is no longer
+      taught by Patel tau
+    - on `sim4`, best/export/final are aligned at `0.770492`
+- Mainline planning consequence:
+  - if the immediate goal is highest current score:
+    - compare against `patel_assisted`
+  - if the immediate goal is cleaner architectural redesign:
+    - build on `patel_free`
+  - do not claim that the current Patel-free branch has already replaced the
+    Patel-assisted branch across the dataset suite
+
+## 2026-04-02 - Next-stage plan after routing refactor
+
+### Goal Reset
+
+- The next stage should stop optimizing around a partially Patel-shaped answer.
+- The main question is now:
+  - can `support / direction` routing stay useful after Patel stops acting as
+    the direction teacher and after checkpoint selection stops depending on
+    Patel agreement?
+
+### Fixed Anchors To Keep
+
+- Retention anchor:
+  - `gradient_routing_mode = warmup_then_orthogonal`
+  - `detach_direction_from_main_after_epoch = 23`
+  - reason:
+    - best and final stay aligned on the recent `sim4` timing window
+- Ceiling anchor:
+  - same routing with `detach_direction_from_main_after_epoch = 24`
+  - reason:
+    - this is the current strongest observed GT-best point in the same window
+
+### Phase A - Remove Patel As Direction Teacher
+
+- Keep the routing refactor fixed.
+- Keep the current support backbone fixed for this phase so only the direction
+  target changes.
+- Proposed delta from the current anchor:
+  - switch `directional_prior_mode` from `patel` to `lag_corr`
+  - keep `lag_direction_source = raw`
+  - keep `causal_lag_main` on
+  - keep `fixed_support_mask_mode = maxgap_kappa`
+- Purpose:
+  - test whether the explicit routing design still holds when direction is
+    supervised by lag evidence instead of Patel tau
+- Readouts:
+  - final GT audit
+  - best GT audit
+  - export/final gap
+  - collapse mode
+
+### Phase A Status
+
+- First anchor check completed on `sim4`, `seed = 11`, `detach = 23`.
+- Outcome:
+  - `directional_prior_mode = lag_corr` under the current backbone is not yet a
+    viable replacement for Patel direction supervision
+  - `disable_directional_loss` performs materially better than `lag_corr`, but
+    still below the Patel-teacher anchor
+- Current conclusion:
+  - do **not** move the mainline to `lag_corr`
+  - do **not** prioritize selector ablations on top of this weakened branch
+  - treat `lag_corr` as experimental-only, not mainline
+- Immediate next mechanism question:
+  - why is the current `lag_corr` teacher worse than having no explicit
+    direction teacher at all?
+  - completed diagnostics:
+    - `directional_prior_scope = global_dataset`
+      - no meaningful recovery
+    - lower `directional_target_ratio`
+      - slight best-epoch recovery, weak final effect
+    - removing `directional_kappa_gate`
+      - strongest single-variable improvement
+  - updated read:
+    - the largest current incompatibility is likely the mix of
+      `lag_corr teacher + Patel-kappa supervision gate`
+    - after combining:
+      - `directional_kappa_gate = off`
+      - `directional_target_ratio = 0.003`
+      the best `lag_corr` rescue point only ties the
+      `disable_directional_loss` reference instead of beating it
+    - this means the current `lag_corr` implementation can be made non-harmful,
+      but not beneficial
+  - next likely mechanism checks:
+    - no further mainline work on the current `lag_corr` formulation
+    - if revisited later, it should be treated as a redesign problem rather than
+      a tuning problem
+    - Phase B selector work should continue only on branches that are at least
+      as strong as the current preferred Patel-free reference:
+      - `disable_directional_loss`
+
+### Architecture Boundary
+
+- Current shared conclusion before any deeper redesign:
+  - the routing refactor solved a stability problem, not a theory problem
+  - the current denoising objective does not appear to be a reliable source of
+    directional learning
+  - the practical late-phase winner is:
+    - denoising updates `support`
+    - another objective updates `direction`
+- Therefore:
+  - do not frame the current system as if the diffusion loss itself were now
+    learning directed causal structure cleanly
+  - future redesign discussion should begin from this explicit boundary rather
+    than from the assumption that only hyperparameters remain to be fixed
+- Preferred temporary interpretation:
+  - treat the current mainline as:
+    - diffusion-for-support
+    - auxiliary temporal objective-for-direction
+- Before new architectural implementation work:
+  - first finish the conceptual analysis of whether the direction objective
+    should become:
+    - a principled lagged predictive / Granger-like target
+    - or remain an explicitly pragmatic auxiliary term
+
+### Terminology Boundary
+
+- Use the following distinction consistently in later analysis:
+  - `lag_corr`:
+    - directional teacher / prior
+  - `causal_lag_main`:
+    - graph-conditioned lagged prediction task
+- Do not describe Patel-free runs with active `causal_lag_main` as if they had
+  no directional signal at all.
+- The more accurate phrasing is:
+  - no explicit direction teacher
+  - but still a task-driven temporal direction objective
+
+### Phase B - Remove Patel From Checkpoint Selection
+
+- After Phase A produces a **competitive** Patel-free branch, stop using
+  Patel-shaped selection as the export decision rule.
+- Proposed selector starting point:
+  - `selection_score_mode = causal_lag_primary`
+  - `selection_soft_agreement_weight = 0.0`
+  - `selection_primary_soft_tiebreak_weight = 0.0`
+  - `selection_primary_skeleton_tiebreak_weight = 0.0`
+  - `selection_primary_density_tiebreak_weight = 0.0`
+- Purpose:
+  - make checkpoint choice depend on causal-lag behavior instead of Patel
+    agreement / skeleton overlap
+- Important rule:
+  - GT remains audit-only and must not be fed back into export selection
+
+### Phase C - Ablate Patel Support Constraints
+
+- Only after direction target and selector are cleaned up:
+  - test whether `fixed_support_mask_mode = maxgap_kappa` is still needed
+  - then separately test whether the Patel-based noise guide should remain
+- Purpose:
+  - separate "Patel as weak support prior" from "Patel as answer key"
+- Reason for ordering:
+  - removing every Patel component at once would make failures uninterpretable
+
+### Experiment Discipline
+
+- Do not resume detach-window tuning as the main activity unless a later phase
+  explicitly shows the routing split is still sensitive to switch timing.
+- For each new run, record:
+  - exact config delta
+  - whether Patel enters:
+    - direction target
+    - direction gate
+    - support mask
+    - selector
+  - result:
+    - exported / best / final
+    - failure mode
+    - whether the conclusion is about mechanism, selector, or support prior
+
 ## 2026-03-29 Readout Recheck And Follow-Up Probes
 
 ### `sim4` Readout Recheck On Existing `signed_gate + global_dataset`
@@ -3536,3 +3791,213 @@ Everything for this Option B branch should be recorded in **this file**:
   - compare the two aggregate files directly
 - This avoids paying for two extra hybrid conditions that are not part of the
   current experimental question.
+
+## 2026-04-05 Direction-Side Patel Boundary
+
+- On the current `sim4` random-support backbone, the direction-side Patel
+  question is now better localized than the support-side question.
+- Important implementation note:
+  - the current code does **not** expose a meaningful literal `teacher off +
+    gate on` branch
+  - once `--disable_directional_loss` is used, the practical comparison
+    collapses to a `3`-way control:
+    - `teacher on + gate on`
+    - `teacher on + gate off`
+    - `teacher off`
+- Formal `3`-seed result on:
+  - `support_direction`
+  - `fixed_support_mask_mode = maxgap_kappa`
+  - `support_prior_mode = patel_kappa`
+  - `structure_init_mode = random`
+  - `direction_init_mode = random`
+  - `gradient_routing_mode = warmup_then_orthogonal`
+  - `detach_direction_from_main_after_epoch = 23`
+  - `causal_lag_main_weight = 0.25`
+  - `selection_score_mode = legacy`
+  - dataset:
+    - `sim4`
+  - aggregate strict-F1:
+    - `teacher on + gate on`
+      - best/export/final:
+        - `0.857924 / 0.819672 / 0.808743`
+    - `teacher on + gate off`
+      - best/export/final:
+        - `0.857923 / 0.765027 / 0.825137`
+    - `teacher off`
+      - best/export/final:
+        - `0.715847 / 0.704918 / 0.704918`
+- Architecture read:
+  - Patel tau teacher is still supplying real direction signal on the current
+    branch
+  - removing the teacher causes a clear drop in both:
+    - strict-F1
+    - GT signed-margin separation
+  - Patel kappa gate is not the same thing:
+    - it is not the primary source of directional signal
+    - it changes export/final behavior more than GT-best ceiling
+- Practical implication:
+  - support-side Patel removal is no longer the main open question
+  - the highest-value next direction-side question is:
+    - what can replace the Patel tau teacher?
+  - a secondary question after that is:
+    - whether any gate is still needed once the teacher is replaced
+- Artifacts:
+  - summary:
+    - `GraphExp/results/direction_patelside_randombackbone_sim4_3way_20260405_summary.csv`
+  - aggregate:
+    - `GraphExp/results/direction_patelside_randombackbone_sim4_3way_20260405_aggregate.csv`
+
+## 2026-04-05 Support Learning Boundary Under Fixed Mask
+
+- `fixed_support_mask_mode = maxgap_kappa` changes the meaning of "support
+  learning" in the current architecture.
+- Once that mode is enabled:
+  - the admissible undirected skeleton is chosen before training from the
+    support prior
+  - pairs outside the mask are permanently zeroed by the model
+  - the support branch cannot discover new undirected pairs outside that
+    skeleton later
+- Therefore the current support branch is **not** doing full support discovery.
+- What it still learns is:
+  - continuous support reweighting **within** the fixed skeleton
+  - i.e. how strong each allowed pair should be for message passing / denoising
+  - plus whether some allowed pairs get shrunk close to zero by the learned
+    logits and L1 pressure
+- Accurate wording for future notes:
+  - do not say:
+    - diffusion is learning the full support structure
+  - say:
+    - diffusion is learning support reweighting inside a prior-fixed hard
+      support carrier
+- Consequence for architecture judgment:
+  - the current mainline is now better described as:
+    - prior-fixed support skeleton
+    - learned support weights within that skeleton
+    - separate direction branch on top
+  - not as:
+    - unconstrained structure discovery from diffusion alone
+
+## 2026-04-05 Scheduled-Blend Noise-Guide Smoke
+
+- Status:
+  - implemented a conservative training-time `scheduled_blend` branch
+  - this upgrades dynamic noise-guide mixing from a probe-only idea to a real
+    trainable code path
+- Code boundary:
+  - `DDM.forward(...)` now supports `noise_guide_adj_override`
+  - `main_structure_learning.py` adds:
+    - `build_training_noise_guide_override(...)`
+    - CLI flags:
+      - `--training_noise_guide_mode`
+      - `--training_noise_guide_blend_target`
+      - `--training_noise_guide_warmup_epochs`
+      - `--training_noise_guide_ramp_epochs`
+  - the override is used only during training
+  - the model's stored/exported Patel noise guide remains unchanged
+- Logging boundary:
+  - `quality_history.csv` now records:
+    - `training_noise_guide_mode`
+    - `training_noise_guide_active`
+    - `training_noise_guide_blend_weight`
+    - `training_noise_guide_guide_l1_mean`
+  - `config.npy` also records the scheduled-blend settings
+- Smoke config:
+  - run dir:
+    - `GraphExp/results/run_20260405_202707`
+  - dataset:
+    - `sim4`
+  - seed:
+    - `11`
+  - branch:
+    - `support_direction`
+    - `fixed_support_mask_mode = maxgap_kappa`
+    - `structure_init_mode = random`
+    - `direction_init_mode = random`
+    - `directional_kappa_gate = on`
+    - `gradient_routing_mode = warmup_then_orthogonal`
+    - `detach_direction_from_main_after_epoch = 23`
+    - `causal_lag_main_weight = 0.25`
+  - scheduled blend:
+    - target `0.5`
+    - warmup `5`
+    - ramp `5`
+  - smoke duration:
+    - `10` epochs
+- Smoke result:
+  - branch ran end-to-end without crashes
+  - `quality_history.csv` shows the intended activation pattern:
+    - epochs `1-5`:
+      - inactive
+      - blend weight `0.0`
+    - epochs `6-10`:
+      - active
+      - blend weight `0.1 -> 0.5`
+  - selector audit:
+    - best GT epoch `7`
+      - strict `0.8525`
+    - exported epoch `8`
+      - strict `0.8361`
+    - final epoch `10`
+      - strict `0.8197`
+- Current conclusion:
+  - the scheduled-blend mechanism is now available for controlled experiments
+  - this smoke is still **plumbing validation**, not evidence of gain
+  - do not claim improvement until a paired `fixed_patel` control is run on the
+    same branch
+- Recommended next step:
+  - run `fixed_patel` vs `scheduled_blend` on the same backbone
+  - reuse:
+    - `GraphExp/results/run_20260405_202707/pretrained_encoder.pt`
+  - so the comparison isolates noise-guide dynamics rather than repeating full
+    encoder pretraining
+
+## 2026-04-05 Scheduled-Blend Paired Control
+
+- Completed paired control on the same backbone using the same reused encoder
+  checkpoint from:
+  - `GraphExp/results/run_20260405_202707/pretrained_encoder.pt`
+- Shared config:
+  - `sim4`
+  - `seed = 11`
+  - `support_direction`
+  - `fixed_support_mask_mode = maxgap_kappa`
+  - `structure_init_mode = random`
+  - `direction_init_mode = random`
+  - `directional_kappa_gate = on`
+  - `gradient_routing_mode = warmup_then_orthogonal`
+  - `detach_direction_from_main_after_epoch = 23`
+  - `causal_lag_main_weight = 0.25`
+- Runs:
+  - `fixed_patel`
+    - `GraphExp/results/run_20260405_205715`
+  - `scheduled_blend`
+    - `GraphExp/results/run_20260405_211525`
+  - summary csv:
+    - `GraphExp/results/noise_guide_paired_control_sim4_seed11_20260405_summary.csv`
+- Result:
+  - both variants reached the same selector-audit ceiling:
+    - best GT strict F1:
+      - `0.8197`
+  - both exported/final models also matched:
+    - exported strict F1:
+      - `0.7377`
+    - final strict F1:
+      - `0.7377`
+    - export/final gap vs GT-best:
+      - `-0.0820`
+- Structural side-effect:
+  - `scheduled_blend` made the final adjacency notably less spiky:
+    - offdiag max:
+      - `0.6317 -> 0.1946`
+    - offdiag std:
+      - `0.0184 -> 0.0099`
+    - parent entropy mean:
+      - `0.1084 -> 0.1231`
+- Updated judgment:
+  - current evidence does **not** support promoting `scheduled_blend` as a
+    performance-improving mainline change
+  - it is better described as:
+    - a support-side collapse-shape regularizer
+  - not as:
+    - a demonstrated fix for best/export mismatch
+    - or a demonstrated GT-quality improvement

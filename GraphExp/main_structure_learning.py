@@ -19,6 +19,7 @@ using DDM (Directional Diffusion Models) with L1 sparsity regularization.
 import argparse
 import math
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -373,6 +374,23 @@ def build_structure_init_matrix(
     return init_matrix
 
 
+def build_support_prior_matrix(
+    mode: str,
+    patel_kappa_matrix: torch.Tensor,
+    pearson_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """Build the symmetric non-negative support prior used by mask/noise-guide paths."""
+    if mode == 'patel_kappa':
+        support_prior = torch.clamp(patel_kappa_matrix, min=0.0).clone()
+    elif mode == 'pearson_abs':
+        support_prior = torch.abs(pearson_matrix).clone()
+    else:
+        raise ValueError(f"Unsupported support prior mode: {mode}")
+
+    support_prior.fill_diagonal_(0.0)
+    return support_prior
+
+
 def to_causal_matrix_torch(matrix: torch.Tensor) -> torch.Tensor:
     """
     Convert model-internal adjacency/logit convention to causal convention.
@@ -395,7 +413,7 @@ def build_undirected_kappa_skeleton(
     top_k_pairs: int,
     selection_mode: str = 'topk',
 ):
-    """Select an undirected kappa skeleton by either fixed top-k or max-gap cutoff."""
+    """Select an undirected skeleton by either fixed top-k or max-gap cutoff."""
     if selection_mode not in {'topk', 'maxgap'}:
         raise ValueError(f"selection_mode must be 'topk' or 'maxgap', got {selection_mode}")
 
@@ -457,8 +475,9 @@ def build_noise_guide_adjacency(
     """
     Build a symmetric row-normalized adjacency for neighbor-based noise.
 
-    `patel_strength_matrix` should encode undirected skeleton strength. In practice
-    we pass positive Patel kappa so skeleton selection is decoupled from direction.
+    `patel_strength_matrix` should encode an undirected support-prior strength
+    matrix. In the current code path this can come from Patel kappa or
+    `abs(Pearson)`.
     """
     num_nodes = patel_strength_matrix.shape[0]
     device = patel_strength_matrix.device
@@ -473,58 +492,6 @@ def build_noise_guide_adjacency(
     degree = adj_with_self.sum(dim=1, keepdim=True)
     noise_guide_adj = adj_with_self / (degree + 1e-9)
     return noise_guide_adj, adj_binary, k_pairs, threshold, selection_gap
-
-
-def build_directed_noise_guide_adjacency(
-    patel_kappa: torch.Tensor,
-    patel_tau: torch.Tensor,
-    top_k_pairs: int,
-    direction_alpha: float = 0.5,
-):
-    """
-    Build a direction-biased row-normalized adjacency for neighbor-based noise.
-
-    Unlike `build_noise_guide_adjacency` which symmetrizes, this version uses
-    Patel tau to assign asymmetric weights: the causal direction gets higher weight.
-
-    Args:
-        patel_kappa: Symmetric association strength [N, N]
-        patel_tau: Directional prior [N, N] (Pate.m convention: -tau returned)
-        top_k_pairs: Number of undirected pairs to keep
-        direction_alpha: Bias strength (0=symmetric, 1=max asymmetry)
-    """
-    num_nodes = patel_kappa.shape[0]
-    device = patel_kappa.device
-    dtype = patel_kappa.dtype
-
-    eye = torch.eye(num_nodes, device=device, dtype=dtype)
-    # Skeleton selection: symmetric kappa, same as undirected version
-    sym_kappa = torch.maximum(patel_kappa, patel_kappa.t())
-    sym_kappa = torch.clamp(sym_kappa, min=0.0) * (1.0 - eye)
-
-    triu_i, triu_j = torch.triu_indices(num_nodes, num_nodes, offset=1, device=device)
-    flat_strength = sym_kappa[triu_i, triu_j]
-    num_pairs = flat_strength.numel()
-    k_pairs = min(max(int(top_k_pairs), 0), num_pairs)
-
-    adj = eye.clone()  # Start with self-loops
-    if k_pairs > 0 and num_pairs > 0:
-        top_idx = torch.topk(flat_strength, k_pairs).indices
-        for idx_t in top_idx:
-            idx_val = idx_t.item()
-            i = triu_i[idx_val].item()
-            j = triu_j[idx_val].item()
-            tau_val = patel_tau[i, j].item()
-            bias = direction_alpha * abs(tau_val)
-            # tau_val > 0 → i→j stronger; tau_val < 0 → j→i stronger
-            adj[i, j] += 1.0 + bias * (1.0 if tau_val > 0 else -1.0)
-            adj[j, i] += 1.0 + bias * (1.0 if tau_val < 0 else -1.0)
-
-    # Clamp to non-negative before row normalization
-    adj = torch.clamp(adj, min=0.0)
-    row_sum = adj.sum(dim=1, keepdim=True)
-    noise_guide_adj = adj / (row_sum + 1e-9)
-    return noise_guide_adj
 
 
 def row_normalize_noise_guide_adjacency(
@@ -555,6 +522,66 @@ def build_detached_learned_noise_guide_adjacency(model: DDM) -> Optional[torch.T
         return None
     learned_adj_raw = model.get_structure_adj().detach()
     return row_normalize_noise_guide_adjacency(learned_adj_raw, add_self_loops=True)
+
+
+@torch.no_grad()
+def build_training_noise_guide_override(
+    model: DDM,
+    epoch: int,
+    mode: str = "fixed_patel",
+    blend_target: float = 0.5,
+    warmup_epochs: int = 5,
+    ramp_epochs: int = 5,
+) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+    """
+    Optionally replace the fixed training noise guide with a conservative
+    Patel/learned detached blend.
+
+    The model's exported/default `noise_guide_adj` remains untouched. This helper
+    only builds a detached per-forward override used during training.
+    """
+    default_stats = {
+        "training_noise_guide_active": 0.0,
+        "training_noise_guide_blend_weight": 0.0,
+        "training_noise_guide_guide_l1_mean": 0.0,
+    }
+    if mode == "fixed_patel":
+        return None, default_stats
+    if mode != "scheduled_blend":
+        raise ValueError(f"Unsupported training_noise_guide_mode: {mode}")
+
+    base_noise_guide_adj = getattr(model, "noise_guide_adj", None)
+    if base_noise_guide_adj is None:
+        return None, default_stats
+
+    learned_noise_guide_adj = build_detached_learned_noise_guide_adjacency(model)
+    if learned_noise_guide_adj is None:
+        return None, default_stats
+
+    blend_weight = compute_fixed_aux_weight(
+        epoch=epoch,
+        target_weight=blend_target,
+        warmup_epochs=warmup_epochs,
+        ramp_epochs=ramp_epochs,
+    )
+    guide_l1_mean = float(
+        torch.abs(learned_noise_guide_adj - base_noise_guide_adj.detach()).mean().item()
+    )
+    stats = {
+        "training_noise_guide_active": 0.0,
+        "training_noise_guide_blend_weight": float(blend_weight),
+        "training_noise_guide_guide_l1_mean": guide_l1_mean,
+    }
+    if blend_weight <= 0.0:
+        return None, stats
+
+    blended_noise_guide_adj = row_normalize_noise_guide_adjacency(
+        (1.0 - blend_weight) * base_noise_guide_adj.detach() +
+        blend_weight * learned_noise_guide_adj,
+        add_self_loops=False,
+    )
+    stats["training_noise_guide_active"] = 1.0
+    return blended_noise_guide_adj.detach(), stats
 
 
 @torch.no_grad()
@@ -715,18 +742,121 @@ def freeze_direction_branch(model: DDM) -> int:
     return frozen_param_count
 
 
+@dataclass(frozen=True)
+class AdjacencyGradRouting:
+    """Describe which branch receives gradients through an adjacency-dependent path."""
+
+    detach_direction_gate: bool = False
+    detach_support_weights: bool = False
+
+    @property
+    def updates_support(self) -> bool:
+        return not self.detach_support_weights
+
+    @property
+    def updates_direction(self) -> bool:
+        return not self.detach_direction_gate
+
+
+@dataclass(frozen=True)
+class EpochGradientRouting:
+    """Loss-to-branch routing used by the current training epoch."""
+
+    mode: str
+    label: str
+    main: AdjacencyGradRouting
+    structure_regularizers: AdjacencyGradRouting
+    causal_lag_main: AdjacencyGradRouting
+    direction_isolation_active: bool
+
+
+def build_epoch_gradient_routing(
+    *,
+    epoch: int,
+    direction_branch_has_separate_params: bool,
+    gradient_routing_mode: str,
+    detach_direction_from_main_after_epoch: int,
+) -> EpochGradientRouting:
+    """
+    Make the loss-to-branch routing explicit.
+
+    `legacy` preserves the old behavior:
+    - before detach: main / structure regularizers / causal-lag main all update
+      both support and direction
+    - after detach: the same paths stop updating direction
+
+    `orthogonal` enforces the split from epoch 1:
+    - main denoising + structure regularizers update support only
+    - causal-lag main updates direction only
+
+    `warmup_then_orthogonal` keeps joint updates through the warmup epoch and
+    then switches to the orthogonal split.
+    """
+    joint = AdjacencyGradRouting()
+    support_only = AdjacencyGradRouting(detach_direction_gate=True)
+    direction_only = AdjacencyGradRouting(detach_support_weights=True)
+
+    if not direction_branch_has_separate_params:
+        return EpochGradientRouting(
+            mode=gradient_routing_mode,
+            label="shared_parameters",
+            main=joint,
+            structure_regularizers=joint,
+            causal_lag_main=joint,
+            direction_isolation_active=False,
+        )
+
+    legacy_detach_active = (
+        detach_direction_from_main_after_epoch >= 0 and
+        (epoch + 1) > detach_direction_from_main_after_epoch
+    )
+    if gradient_routing_mode == "legacy":
+        route = support_only if legacy_detach_active else joint
+        return EpochGradientRouting(
+            mode=gradient_routing_mode,
+            label="legacy_detached" if legacy_detach_active else "legacy_joint",
+            main=route,
+            structure_regularizers=route,
+            causal_lag_main=route,
+            direction_isolation_active=legacy_detach_active,
+        )
+    if gradient_routing_mode == "orthogonal":
+        return EpochGradientRouting(
+            mode=gradient_routing_mode,
+            label="orthogonal",
+            main=support_only,
+            structure_regularizers=support_only,
+            causal_lag_main=direction_only,
+            direction_isolation_active=True,
+        )
+    if gradient_routing_mode == "warmup_then_orthogonal":
+        if detach_direction_from_main_after_epoch < 0:
+            raise ValueError(
+                "warmup_then_orthogonal requires detach_direction_from_main_after_epoch >= 0"
+            )
+        orthogonal_active = (epoch + 1) > detach_direction_from_main_after_epoch
+        return EpochGradientRouting(
+            mode=gradient_routing_mode,
+            label="orthogonal_after_warmup" if orthogonal_active else "warmup_joint",
+            main=support_only if orthogonal_active else joint,
+            structure_regularizers=support_only if orthogonal_active else joint,
+            causal_lag_main=direction_only if orthogonal_active else joint,
+            direction_isolation_active=orthogonal_active,
+        )
+    raise ValueError(f"Unsupported gradient_routing_mode: {gradient_routing_mode}")
+
+
 def compute_direction_grad_alignment_diagnostics(
     model: DDM,
     x: torch.Tensor,
     num_nodes: int,
     lambda_l1: float,
-    directional_prior_mode: str,
-    lag_direction_source: str,
     patel_direction_matrix: torch.Tensor,
     directional_pair_gate_matrix: Optional[torch.Tensor],
     lambda_dir_effective: float,
-    fixed_direction_prior_matrix: Optional[torch.Tensor] = None,
     direction_prior_reliability_matrix: Optional[torch.Tensor] = None,
+    main_routing: AdjacencyGradRouting = AdjacencyGradRouting(),
+    structure_regularizer_routing: AdjacencyGradRouting = AdjacencyGradRouting(),
     seed: int = 0,
 ) -> Dict[str, float]:
     """Compare diffusion-vs-directional gradients on the separate direction branch."""
@@ -757,8 +887,16 @@ def compute_direction_grad_alignment_diagnostics(
             if cuda_devices:
                 torch.cuda.manual_seed_all(seed)
 
-            loss, _ = model(g=None, x=x)
-            adj_weights = model.get_structure_adj()
+            loss, _ = model(
+                g=None,
+                x=x,
+                detach_direction_from_main=main_routing.detach_direction_gate,
+                detach_support_from_main=main_routing.detach_support_weights,
+            )
+            adj_weights = model.get_structure_adj(
+                detach_direction_gate=structure_regularizer_routing.detach_direction_gate,
+                detach_support_weights=structure_regularizer_routing.detach_support_weights,
+            )
             n_off_diag = num_nodes * num_nodes - num_nodes
             l1_norm = torch.norm(adj_weights, p=1)
             if n_off_diag > 0:
@@ -770,16 +908,7 @@ def compute_direction_grad_alignment_diagnostics(
             hub_loss = 0.01 * (sender_norms.var() + receiver_norms.var())
             loss_ddm_main = loss + sparsity_loss + hub_loss
 
-            if fixed_direction_prior_matrix is not None:
-                direction_prior_matrix = fixed_direction_prior_matrix
-            else:
-                direction_prior_matrix = compute_online_direction_prior_matrix(
-                    model=model,
-                    x=x,
-                    mode=directional_prior_mode,
-                    patel_direction_matrix=patel_direction_matrix,
-                    lag_direction_source=lag_direction_source,
-                )
+            direction_prior_matrix = patel_direction_matrix
             causal_logits = get_current_directional_logits(model, causal=True)
             raw_loss_dir = compute_directional_margin_loss(
                 causal_logits,
@@ -1530,107 +1659,6 @@ def validate_lag_against_series(source_node_time: torch.Tensor, target_node_time
         raise ValueError(f"lag={lag} is invalid for time length {time_len}")
 
 
-@torch.no_grad()
-def compute_pairwise_lagged_score_matrix(
-    source_node_time: torch.Tensor,
-    target_node_time: torch.Tensor,
-    lag: int = 1,
-) -> torch.Tensor:
-    """Compute pairwise lagged similarity scores for all ordered node pairs."""
-    validate_lag_against_series(source_node_time, target_node_time, lag)
-    source_past_z = zscore_per_node_time(source_node_time[:, :-lag])
-    target_future_z = zscore_per_node_time(target_node_time[:, lag:])
-    num_steps = max(source_past_z.shape[-1], 1)
-    return torch.einsum('nt,mt->nm', source_past_z, target_future_z) / float(num_steps)
-
-
-@torch.no_grad()
-def compute_pairwise_multilag_score_matrix(
-    source_node_time: torch.Tensor,
-    target_node_time: torch.Tensor,
-    lags: Sequence[int],
-    lag_weights: Sequence[float],
-) -> torch.Tensor:
-    """Aggregate ordered-pair lagged scores across multiple lags."""
-    if len(lags) != len(lag_weights):
-        raise ValueError(f"lags and lag_weights must align, got {len(lags)} vs {len(lag_weights)}")
-
-    score = source_node_time.new_zeros((source_node_time.shape[0], target_node_time.shape[0]))
-    for lag, weight in zip(lags, lag_weights):
-        score = score + float(weight) * compute_pairwise_lagged_score_matrix(
-            source_node_time,
-            target_node_time,
-            lag=int(lag),
-        )
-    return score
-
-
-@torch.no_grad()
-def compute_online_direction_prior_matrix(
-    model: DDM,
-    x: torch.Tensor,
-    mode: str,
-    patel_direction_matrix: torch.Tensor,
-    lag_direction_source: str = "raw",
-) -> torch.Tensor:
-    """Build the directional-prior matrix used by the margin loss."""
-    if mode == "patel":
-        return patel_direction_matrix
-    if mode != "lag_corr":
-        raise ValueError(f"Unsupported directional_prior_mode: {mode}")
-
-    if lag_direction_source == "raw":
-        source = x
-    elif lag_direction_source == "encoder":
-        source = model.prepare_clean_target(x)
-    else:
-        raise ValueError(f"Unsupported lag_direction_source: {lag_direction_source}")
-    lags = getattr(model, "directional_prior_lags", (1,))
-    lag_weights = getattr(model, "directional_prior_lag_weights", (1.0,))
-    return compute_pairwise_multilag_score_matrix(source, x, lags=lags, lag_weights=lag_weights)
-
-
-@torch.no_grad()
-def compute_dataset_direction_prior_components(
-    model: DDM,
-    data_3d: torch.Tensor,
-    mode: str,
-    patel_direction_matrix: torch.Tensor,
-    lag_direction_source: str = "raw",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build one fixed dataset prior plus per-pair sign-consistency diagnostics."""
-    if mode == "patel":
-        consistency = torch.ones_like(patel_direction_matrix)
-        consistency.fill_diagonal_(0.0)
-        return patel_direction_matrix, consistency
-    if mode != "lag_corr":
-        raise ValueError(f"Unsupported directional_prior_mode: {mode}")
-    if data_3d.dim() != 3:
-        raise ValueError(f"Expected [subjects, nodes, time], got {tuple(data_3d.shape)}")
-
-    subject_priors = [
-        compute_online_direction_prior_matrix(
-            model,
-            data_3d[s_idx],
-            mode=mode,
-            patel_direction_matrix=patel_direction_matrix,
-            lag_direction_source=lag_direction_source,
-        )
-        for s_idx in range(int(data_3d.shape[0]))
-    ]
-    stacked_priors = torch.stack(subject_priors, dim=0)
-    mean_prior = stacked_priors.mean(dim=0)
-    stacked_delta = stacked_priors - stacked_priors.transpose(-1, -2)
-    mean_delta = mean_prior - mean_prior.t()
-    mean_sign = torch.sign(mean_delta)
-    stacked_sign = torch.sign(stacked_delta)
-    consistency = (stacked_sign == mean_sign.unsqueeze(0)).float().mean(dim=0)
-    consistency = 0.5 * (consistency + consistency.t())
-    consistency = torch.where(mean_sign != 0, consistency, torch.zeros_like(consistency))
-    consistency.fill_diagonal_(0.0)
-    return mean_prior, consistency
-
-
 def build_causal_lag_aggregation_weights(
     model: DDM,
     aggregation: str = "mean",
@@ -1973,125 +2001,6 @@ def compute_dataset_causal_lag_selector_diagnostics(
         "selection_causal_lag_num_lags": float(len(lags)),
     })
     return stats
-
-
-def compute_post_detach_direction_contrast_loss(
-    model: DDM,
-    batch_x: torch.Tensor,
-    *,
-    aggregation: str = "mean",
-    softmax_temp: float = 1.0,
-    lags: Sequence[int] = (1,),
-    lag_weights: Sequence[float] = (1.0,),
-    contrast_weight: float = 0.0,
-    variance_weight: float = 0.0,
-    parent_entropy_weight: float = 0.0,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Direction-only post-detach objective.
-
-    After the main denoising path has been detached from the direction gate,
-    this loss keeps optimizing only the directional branch by:
-    - rewarding forward-vs-reverse causal-lag separation across subjects
-    - penalizing cross-subject variance of that separation
-    - optionally applying a light parent-entropy term through the direction gate
-
-    Support weights are detached so this objective does not reshape the support
-    branch while acting as a direction-specific late-phase teacher.
-    """
-    stats = {
-        "post_detach_direction_available": 0.0,
-        "post_detach_direction_batch_count": 0.0,
-        "post_detach_direction_subject_count": 0.0,
-        "post_detach_direction_forward_mean": 0.0,
-        "post_detach_direction_reverse_mean": 0.0,
-        "post_detach_direction_delta_mean": 0.0,
-        "post_detach_direction_delta_var": 0.0,
-        "post_detach_direction_parent_entropy": 0.0,
-    }
-    zero = batch_x.new_tensor(0.0)
-    if batch_x.dim() != 3 or batch_x.shape[0] <= 0:
-        return zero, stats
-    if (
-        contrast_weight <= 0.0 and
-        variance_weight <= 0.0 and
-        parent_entropy_weight <= 0.0
-    ):
-        return zero, stats
-
-    forward_values: List[torch.Tensor] = []
-    reverse_values: List[torch.Tensor] = []
-    delta_values: List[torch.Tensor] = []
-    for subj_idx in range(batch_x.shape[0]):
-        clean = model.prepare_clean_target(batch_x[subj_idx])
-        forward_loss = compute_causal_lag_main_loss(
-            model,
-            clean,
-            clean,
-            aggregation=aggregation,
-            softmax_temp=softmax_temp,
-            lags=lags,
-            lag_weights=lag_weights,
-            reverse_causal=False,
-            detach_direction_gate=False,
-            detach_support_weights=True,
-        )
-        reverse_loss = compute_causal_lag_main_loss(
-            model,
-            clean,
-            clean,
-            aggregation=aggregation,
-            softmax_temp=softmax_temp,
-            lags=lags,
-            lag_weights=lag_weights,
-            reverse_causal=True,
-            detach_direction_gate=False,
-            detach_support_weights=True,
-        )
-        delta = reverse_loss - forward_loss
-        forward_values.append(forward_loss)
-        reverse_values.append(reverse_loss)
-        delta_values.append(delta)
-
-    if not delta_values:
-        return zero, stats
-
-    forward_tensor = torch.stack(forward_values)
-    reverse_tensor = torch.stack(reverse_values)
-    delta_tensor = torch.stack(delta_values)
-    delta_mean = delta_tensor.mean()
-    delta_var = (
-        delta_tensor.var(unbiased=False)
-        if delta_tensor.numel() > 1
-        else delta_tensor.new_tensor(0.0)
-    )
-    if parent_entropy_weight > 0.0:
-        adj_causal = to_causal_matrix_torch(
-            model.get_structure_adj(
-                detach_direction_gate=False,
-                detach_support_weights=True,
-            )
-        )
-        parent_entropy = compute_incoming_entropy_loss(adj_causal)
-    else:
-        parent_entropy = delta_tensor.new_tensor(0.0)
-
-    loss = (
-        - float(contrast_weight) * delta_mean +
-        float(variance_weight) * delta_var +
-        float(parent_entropy_weight) * parent_entropy
-    )
-    stats.update({
-        "post_detach_direction_available": 1.0,
-        "post_detach_direction_batch_count": 1.0,
-        "post_detach_direction_subject_count": float(delta_tensor.shape[0]),
-        "post_detach_direction_forward_mean": float(forward_tensor.mean().detach().item()),
-        "post_detach_direction_reverse_mean": float(reverse_tensor.mean().detach().item()),
-        "post_detach_direction_delta_mean": float(delta_mean.detach().item()),
-        "post_detach_direction_delta_var": float(delta_var.detach().item()),
-        "post_detach_direction_parent_entropy": float(parent_entropy.detach().item()),
-    })
-    return loss, stats
 
 
 @torch.no_grad()
@@ -2495,20 +2404,20 @@ def train_brain_connectivity(
     selection_min_density_factor: float = 0.65,
     selection_max_density_ratio: float = 2.50,
     enable_directional_loss: bool = True,
-    directional_prior_mode: str = "patel",
     directional_schedule: str = "cosine_anneal",
-    lag_direction_source: str = "raw",
-    directional_prior_scope: str = "online_subject",
-    directional_prior_lags: Sequence[int] = (1,),
-    directional_prior_lag_weights: Sequence[float] = (1.0,),
     directional_kappa_gate: bool = False,
     directional_kappa_gate_quantile: float = 0.5,
     directional_target_ratio: float = 0.01,
     main_loss_weight: float = 1.0,
+    training_noise_guide_mode: str = "fixed_patel",
+    training_noise_guide_blend_target: float = 0.5,
+    training_noise_guide_warmup_epochs: int = 5,
+    training_noise_guide_ramp_epochs: int = 5,
     directional_loss_end_epoch: int = -1,
     direction_lr_multiplier: float = 1.0,
     freeze_direction_after_epoch: int = -1,
     detach_direction_from_main_after_epoch: int = -1,
+    gradient_routing_mode: str = "legacy",
     enable_gradient_alignment_probe: bool = False,
     gradient_alignment_probe_seed: int = 0,
     causal_lag_main_weight: float = 0.0,
@@ -2539,9 +2448,6 @@ def train_brain_connectivity(
     selection_primary_soft_tiebreak_weight: float = 0.05,
     selection_primary_skeleton_tiebreak_weight: float = 0.05,
     selection_primary_density_tiebreak_weight: float = 0.0,
-    post_detach_direction_contrast_weight: float = 0.0,
-    post_detach_direction_variance_weight: float = 0.0,
-    post_detach_direction_parent_entropy_weight: float = 0.0,
     selector_audit_gt_edges: Optional[Set[Tuple[int, int]]] = None,
     selector_audit_strict_margin_eps_values: Sequence[float] = (0.0, 3e-4, 0.1),
 
@@ -2624,6 +2530,11 @@ def train_brain_connectivity(
             "detach_direction_from_main_after_epoch must be >= -1, "
             f"got {detach_direction_from_main_after_epoch}"
         )
+    if gradient_routing_mode not in {"legacy", "orthogonal", "warmup_then_orthogonal"}:
+        raise ValueError(
+            "gradient_routing_mode must be 'legacy', 'orthogonal', or "
+            f"'warmup_then_orthogonal', got {gradient_routing_mode}"
+        )
     if directional_loss_end_epoch < -1:
         raise ValueError(
             "directional_loss_end_epoch must be >= -1, "
@@ -2695,34 +2606,12 @@ def train_brain_connectivity(
             "selection_primary_density_tiebreak_weight must be >= 0, "
             f"got {selection_primary_density_tiebreak_weight}"
         )
-    if post_detach_direction_contrast_weight < 0.0:
+    if (
+        gradient_routing_mode == "warmup_then_orthogonal" and
+        detach_direction_from_main_after_epoch < 0
+    ):
         raise ValueError(
-            "post_detach_direction_contrast_weight must be >= 0, "
-            f"got {post_detach_direction_contrast_weight}"
-        )
-    if post_detach_direction_variance_weight < 0.0:
-        raise ValueError(
-            "post_detach_direction_variance_weight must be >= 0, "
-            f"got {post_detach_direction_variance_weight}"
-        )
-    if post_detach_direction_parent_entropy_weight < 0.0:
-        raise ValueError(
-            "post_detach_direction_parent_entropy_weight must be >= 0, "
-            f"got {post_detach_direction_parent_entropy_weight}"
-        )
-    post_detach_direction_loss_requested = (
-        post_detach_direction_contrast_weight > 0.0 or
-        post_detach_direction_variance_weight > 0.0 or
-        post_detach_direction_parent_entropy_weight > 0.0
-    )
-    if post_detach_direction_loss_requested and optimizer_step_mode != "batch_mean":
-        raise ValueError(
-            "post-detach direction-only loss requires optimizer_step_mode='batch_mean', "
-            f"got {optimizer_step_mode}"
-        )
-    if post_detach_direction_loss_requested and detach_direction_from_main_after_epoch < 0:
-        raise ValueError(
-            "post-detach direction-only loss requires detach_direction_from_main_after_epoch >= 0"
+            "warmup_then_orthogonal requires detach_direction_from_main_after_epoch >= 0"
         )
     if causal_lag_main_aggregation not in {"mean", "softmax"}:
         raise ValueError(
@@ -2872,6 +2761,10 @@ def train_brain_connectivity(
     model.causal_lag_main_softmax_temp = float(causal_lag_main_softmax_temp)
     model.causal_lag_main_lags = tuple(int(v) for v in causal_lag_main_lags)
     model.causal_lag_main_lag_weights = tuple(float(v) for v in causal_lag_main_lag_weights)
+    model.training_noise_guide_mode = str(training_noise_guide_mode)
+    model.training_noise_guide_blend_target = float(training_noise_guide_blend_target)
+    model.training_noise_guide_warmup_epochs = int(training_noise_guide_warmup_epochs)
+    model.training_noise_guide_ramp_epochs = int(training_noise_guide_ramp_epochs)
     model.selection_score_mode = selection_score_mode
     model.selection_soft_agreement_weight = float(selection_soft_agreement_weight)
     model.selection_causal_lag_weight = float(selection_causal_lag_weight)
@@ -2895,29 +2788,10 @@ def train_brain_connectivity(
     model.selection_primary_density_tiebreak_weight = float(
         selection_primary_density_tiebreak_weight
     )
-    model.post_detach_direction_contrast_weight = float(
-        post_detach_direction_contrast_weight
-    )
-    model.post_detach_direction_variance_weight = float(
-        post_detach_direction_variance_weight
-    )
-    model.post_detach_direction_parent_entropy_weight = float(
-        post_detach_direction_parent_entropy_weight
-    )
-    model.directional_prior_scope = directional_prior_scope
-    model.directional_prior_lags = tuple(int(v) for v in directional_prior_lags)
-    model.directional_prior_lag_weights = tuple(float(v) for v in directional_prior_lag_weights)
     if directional_kappa_gate:
         print(f"Directional kappa gate: enabled | quantile={directional_kappa_gate_quantile:.2f} | "
               f"threshold={directional_kappa_threshold:.4f} | "
               f"pair_frac={directional_kappa_gate_pair_frac:.2%}")
-    if enable_directional_loss and directional_prior_mode == "lag_corr":
-        print(
-            "Directional time prior: "
-            f"scope={directional_prior_scope} | "
-            f"lags={list(model.directional_prior_lags)} | "
-            f"weights={[round(v, 4) for v in model.directional_prior_lag_weights]}"
-        )
     if causal_lag_main_weight > 0.0:
         print(
             "Causal-lag main: enabled | "
@@ -2948,15 +2822,6 @@ def train_brain_connectivity(
         f"primary_skeleton_tiebreak_weight={selection_primary_skeleton_tiebreak_weight:.4f} | "
         f"primary_density_tiebreak_weight={selection_primary_density_tiebreak_weight:.4f}"
     )
-    if post_detach_direction_loss_requested:
-        print(
-            "Post-detach direction-only loss: "
-            f"contrast_weight={post_detach_direction_contrast_weight:.4f} | "
-            f"variance_weight={post_detach_direction_variance_weight:.4f} | "
-            f"parent_entropy_weight={post_detach_direction_parent_entropy_weight:.4f} | "
-            f"uses_causal_lag_settings={list(causal_lag_main_lags)}"
-        )
-
     # ---- Autoregressive Causal Pretraining ----
     if model.use_temporal_encoder and not skip_pretrain and pretrain_epochs > 0:
         if pretrain_checkpoint and os.path.exists(pretrain_checkpoint):
@@ -3010,27 +2875,16 @@ def train_brain_connectivity(
 
     print(f"Learning adjacency matrix of shape [{num_nodes}, {num_nodes}]")
     print(f"Main DDM loss weight: {main_loss_weight:g}")
-
-    fixed_direction_prior_matrix: Optional[torch.Tensor] = None
-    if (
-        enable_directional_loss
-        and directional_prior_mode == "lag_corr"
-        and directional_prior_scope == "global_dataset"
-    ):
-        fixed_direction_prior_matrix, _ = compute_dataset_direction_prior_components(
-            model,
-            data_3d,
-            mode=directional_prior_mode,
-            patel_direction_matrix=patel_direction_matrix,
-            lag_direction_source=lag_direction_source,
-        )
-        fixed_delta = fixed_direction_prior_matrix - fixed_direction_prior_matrix.t()
-        fixed_delta_abs = fixed_delta[~torch.eye(num_nodes, dtype=torch.bool, device=fixed_delta.device)].abs()
+    if training_noise_guide_mode == "scheduled_blend":
         print(
-            "Directional prior cache: global_dataset | "
-            f"abs_delta_median={float(torch.quantile(fixed_delta_abs, 0.50).item()):.4f} | "
-            f"abs_delta_p90={float(torch.quantile(fixed_delta_abs, 0.90).item()):.4f}"
+            "Training noise guide: "
+            f"mode={training_noise_guide_mode} | "
+            f"blend_target={training_noise_guide_blend_target:.4f} | "
+            f"warmup={training_noise_guide_warmup_epochs} | "
+            f"ramp={training_noise_guide_ramp_epochs}"
         )
+    else:
+        print(f"Training noise guide: mode={training_noise_guide_mode}")
 
     optimizer, optimizer_stats = build_training_optimizer(
         model,
@@ -3038,11 +2892,6 @@ def train_brain_connectivity(
         direction_lr_multiplier=direction_lr_multiplier,
     )
     direction_branch_has_separate_params = bool(optimizer_stats["has_direction_group"])
-    if post_detach_direction_loss_requested and not direction_branch_has_separate_params:
-        raise ValueError(
-            "post-detach direction-only loss requires support_direction parameterization "
-            "with separate direction parameters"
-        )
     direction_branch_frozen = False
     direction_branch_frozen_from_epoch = -1
     directional_loss_deactivated_from_epoch = -1
@@ -3061,6 +2910,14 @@ def train_brain_connectivity(
         print(
             f"Optimizer groups: single_lr={optimizer_stats['base_lr']:.4e} "
             f"({optimizer_stats['base_param_count']:,} params)"
+        )
+    if direction_branch_has_separate_params:
+        print(
+            "Gradient routing: "
+            f"mode={gradient_routing_mode} | "
+            f"switch_epoch={detach_direction_from_main_after_epoch} | "
+            "main=denoising/graph path | struct=adjacency regularizers | "
+            "lag=causal-lag reconstruction"
         )
 
     
@@ -3128,10 +2985,14 @@ def train_brain_connectivity(
                 f"(after epoch {freeze_direction_after_epoch}, "
                 f"params={frozen_param_count:,})"
             )
-        detach_direction_from_main_active = (
-            direction_branch_has_separate_params and
-            detach_direction_from_main_after_epoch >= 0 and
-            (epoch + 1) > detach_direction_from_main_after_epoch
+        epoch_gradient_routing = build_epoch_gradient_routing(
+            epoch=epoch,
+            direction_branch_has_separate_params=direction_branch_has_separate_params,
+            gradient_routing_mode=gradient_routing_mode,
+            detach_direction_from_main_after_epoch=detach_direction_from_main_after_epoch,
+        )
+        detach_direction_from_main_active = bool(
+            epoch_gradient_routing.direction_isolation_active
         )
         if (
             detach_direction_from_main_active and
@@ -3139,9 +3000,10 @@ def train_brain_connectivity(
         ):
             direction_from_main_detached_from_epoch = epoch + 1
             print(
-                "[DirectionDetach] Detaching direction gate from main denoising path "
+                "[GradientRouting] Isolating direction updates from main-path gradients "
                 f"from epoch {epoch + 1} onward "
-                f"(after epoch {detach_direction_from_main_after_epoch})"
+                f"(mode={gradient_routing_mode}, label={epoch_gradient_routing.label}, "
+                f"switch_epoch={detach_direction_from_main_after_epoch})"
             )
 
         model.train()
@@ -3161,15 +3023,9 @@ def train_brain_connectivity(
         epoch_ungated_symmetry_loss = 0.0
 
         epoch_causal_lag_main_loss = 0.0
-
-        epoch_post_detach_direction_loss = 0.0
-        epoch_post_detach_direction_forward_mean = 0.0
-        epoch_post_detach_direction_reverse_mean = 0.0
-        epoch_post_detach_direction_delta_mean = 0.0
-        epoch_post_detach_direction_delta_var = 0.0
-        epoch_post_detach_direction_parent_entropy = 0.0
-        epoch_post_detach_direction_subject_count = 0.0
-        post_detach_direction_batch_count = 0
+        epoch_training_noise_guide_active = 0.0
+        epoch_training_noise_guide_blend_weight = 0.0
+        epoch_training_noise_guide_guide_l1_mean = 0.0
 
         current_parent_entropy_weight = 0.0
 
@@ -3214,6 +3070,25 @@ def train_brain_connectivity(
                 # Get subject data: [N, TIME_POINTS]
 
                 x = batch_data[subj_idx]  # [N, TIME_POINTS]
+                training_noise_guide_override, training_noise_guide_stats = (
+                    build_training_noise_guide_override(
+                        model,
+                        epoch=epoch,
+                        mode=training_noise_guide_mode,
+                        blend_target=training_noise_guide_blend_target,
+                        warmup_epochs=training_noise_guide_warmup_epochs,
+                        ramp_epochs=training_noise_guide_ramp_epochs,
+                    )
+                )
+                epoch_training_noise_guide_active += (
+                    training_noise_guide_stats["training_noise_guide_active"]
+                )
+                epoch_training_noise_guide_blend_weight += (
+                    training_noise_guide_stats["training_noise_guide_blend_weight"]
+                )
+                epoch_training_noise_guide_guide_l1_mean += (
+                    training_noise_guide_stats["training_noise_guide_guide_l1_mean"]
+                )
 
                 if debug_checks and epoch == 0 and i == 0 and subj_idx == 0:
 
@@ -3229,7 +3104,12 @@ def train_brain_connectivity(
 
                             g_dbg, _ = model._get_structure_graph(x_encoded.device)
 
-                        x_t, _, _ = model.sample_q(t, x_encoded, g_dbg)
+                        x_t, _, _ = model.sample_q(
+                            t,
+                            x_encoded,
+                            g_dbg,
+                            noise_guide_adj_override=training_noise_guide_override,
+                        )
                         cos_xt_x = F.cosine_similarity(x_t, x_encoded, dim=-1).mean().item()
                         abs_delta = (x_t - x_encoded).abs()
                         abs_delta_mean = abs_delta.mean().item()
@@ -3251,7 +3131,9 @@ def train_brain_connectivity(
                 loss, loss_dict = model(
                     g=None,
                     x=x,
-                    detach_direction_from_main=detach_direction_from_main_active,
+                    detach_direction_from_main=epoch_gradient_routing.main.detach_direction_gate,
+                    detach_support_from_main=epoch_gradient_routing.main.detach_support_weights,
+                    noise_guide_adj_override=training_noise_guide_override,
                 )
 
                 
@@ -3259,7 +3141,12 @@ def train_brain_connectivity(
                 # L1 sparsity regularization on learned adjacency.
                 # Reuse the exact same clamped logits/sigmoid path used for export.
                 adj_weights = model.get_structure_adj(
-                    detach_direction_gate=detach_direction_from_main_active
+                    detach_direction_gate=(
+                        epoch_gradient_routing.structure_regularizers.detach_direction_gate
+                    ),
+                    detach_support_weights=(
+                        epoch_gradient_routing.structure_regularizers.detach_support_weights
+                    ),
                 )  # [N, N], diag already zeroed
                 adj_weights_causal = to_causal_matrix_torch(adj_weights)
 
@@ -3282,21 +3169,10 @@ def train_brain_connectivity(
 
                 # --- Directional margin loss & feature orthogonality loss ---
                 causal_logits = get_current_directional_logits(model, causal=True)
-                direction_prior_matrix = None
                 if directional_loss_active:
-                    if fixed_direction_prior_matrix is not None:
-                        direction_prior_matrix = fixed_direction_prior_matrix
-                    else:
-                        direction_prior_matrix = compute_online_direction_prior_matrix(
-                            model=model,
-                            x=x,
-                            mode=directional_prior_mode,
-                            patel_direction_matrix=patel_direction_matrix,
-                            lag_direction_source=lag_direction_source,
-                        )
                     raw_loss_dir = compute_directional_margin_loss(
                         causal_logits,
-                        direction_prior_matrix,
+                        patel_direction_matrix,
                         pair_gate_matrix=directional_pair_gate_matrix,
                     )
                 else:
@@ -3310,7 +3186,12 @@ def train_brain_connectivity(
                         t_main = torch.randint(
                             model.T, size=(clean_target.shape[0],), device=clean_target.device,
                         )
-                    noisy_source, _, _ = model.sample_q(t_main, clean_target, g=None)
+                    noisy_source, _, _ = model.sample_q(
+                        t_main,
+                        clean_target,
+                        g=None,
+                        noise_guide_adj_override=training_noise_guide_override,
+                    )
                     raw_loss_causal_lag_main = compute_causal_lag_main_loss(
                         model,
                         noisy_source,
@@ -3319,7 +3200,12 @@ def train_brain_connectivity(
                         softmax_temp=causal_lag_main_softmax_temp,
                         lags=causal_lag_main_lags,
                         lag_weights=causal_lag_main_lag_weights,
-                        detach_direction_gate=detach_direction_from_main_active,
+                        detach_direction_gate=(
+                            epoch_gradient_routing.causal_lag_main.detach_direction_gate
+                        ),
+                        detach_support_weights=(
+                            epoch_gradient_routing.causal_lag_main.detach_support_weights
+                        ),
                     )
                 else:
                     raw_loss_causal_lag_main = torch.tensor(0.0, device=device)
@@ -3446,67 +3332,6 @@ def train_brain_connectivity(
 
                 num_batches += 1
 
-            if (
-                optimizer_step_mode == "batch_mean" and
-                post_detach_direction_loss_requested and
-                detach_direction_from_main_active
-            ):
-                if direction_branch_frozen:
-                    with torch.no_grad():
-                        _, post_detach_direction_stats = (
-                            compute_post_detach_direction_contrast_loss(
-                                model,
-                                batch_data,
-                                aggregation=causal_lag_main_aggregation,
-                                softmax_temp=causal_lag_main_softmax_temp,
-                                lags=causal_lag_main_lags,
-                                lag_weights=causal_lag_main_lag_weights,
-                                contrast_weight=post_detach_direction_contrast_weight,
-                                variance_weight=post_detach_direction_variance_weight,
-                                parent_entropy_weight=post_detach_direction_parent_entropy_weight,
-                            )
-                        )
-                    post_detach_direction_loss = batch_data.new_tensor(0.0)
-                else:
-                    post_detach_direction_loss, post_detach_direction_stats = (
-                        compute_post_detach_direction_contrast_loss(
-                            model,
-                            batch_data,
-                            aggregation=causal_lag_main_aggregation,
-                            softmax_temp=causal_lag_main_softmax_temp,
-                            lags=causal_lag_main_lags,
-                            lag_weights=causal_lag_main_lag_weights,
-                            contrast_weight=post_detach_direction_contrast_weight,
-                            variance_weight=post_detach_direction_variance_weight,
-                            parent_entropy_weight=post_detach_direction_parent_entropy_weight,
-                        )
-                    )
-                    post_detach_direction_loss.backward()
-
-                if post_detach_direction_stats["post_detach_direction_available"] > 0.5:
-                    epoch_post_detach_direction_loss += float(
-                        post_detach_direction_loss.detach().item()
-                    )
-                    epoch_post_detach_direction_forward_mean += float(
-                        post_detach_direction_stats["post_detach_direction_forward_mean"]
-                    )
-                    epoch_post_detach_direction_reverse_mean += float(
-                        post_detach_direction_stats["post_detach_direction_reverse_mean"]
-                    )
-                    epoch_post_detach_direction_delta_mean += float(
-                        post_detach_direction_stats["post_detach_direction_delta_mean"]
-                    )
-                    epoch_post_detach_direction_delta_var += float(
-                        post_detach_direction_stats["post_detach_direction_delta_var"]
-                    )
-                    epoch_post_detach_direction_parent_entropy += float(
-                        post_detach_direction_stats["post_detach_direction_parent_entropy"]
-                    )
-                    epoch_post_detach_direction_subject_count += float(
-                        post_detach_direction_stats["post_detach_direction_subject_count"]
-                    )
-                    post_detach_direction_batch_count += 1
-
             if optimizer_step_mode == "batch_mean":
                 optimizer.step()
 
@@ -3520,43 +3345,13 @@ def train_brain_connectivity(
         avg_parent_cap_loss = epoch_parent_cap_loss / num_batches
         avg_ungated_symmetry_loss = epoch_ungated_symmetry_loss / num_batches
         avg_causal_lag_main_loss = epoch_causal_lag_main_loss / num_batches
-        if post_detach_direction_batch_count > 0:
-            avg_post_detach_direction_loss = (
-                epoch_post_detach_direction_loss / post_detach_direction_batch_count
-            )
-            post_detach_direction_epoch_stats = {
-                "post_detach_direction_available": 1.0,
-                "post_detach_direction_batch_count": float(post_detach_direction_batch_count),
-                "post_detach_direction_subject_count": float(epoch_post_detach_direction_subject_count),
-                "post_detach_direction_forward_mean": (
-                    epoch_post_detach_direction_forward_mean / post_detach_direction_batch_count
-                ),
-                "post_detach_direction_reverse_mean": (
-                    epoch_post_detach_direction_reverse_mean / post_detach_direction_batch_count
-                ),
-                "post_detach_direction_delta_mean": (
-                    epoch_post_detach_direction_delta_mean / post_detach_direction_batch_count
-                ),
-                "post_detach_direction_delta_var": (
-                    epoch_post_detach_direction_delta_var / post_detach_direction_batch_count
-                ),
-                "post_detach_direction_parent_entropy": (
-                    epoch_post_detach_direction_parent_entropy / post_detach_direction_batch_count
-                ),
-            }
-        else:
-            avg_post_detach_direction_loss = 0.0
-            post_detach_direction_epoch_stats = {
-                "post_detach_direction_available": 0.0,
-                "post_detach_direction_batch_count": 0.0,
-                "post_detach_direction_subject_count": 0.0,
-                "post_detach_direction_forward_mean": 0.0,
-                "post_detach_direction_reverse_mean": 0.0,
-                "post_detach_direction_delta_mean": 0.0,
-                "post_detach_direction_delta_var": 0.0,
-                "post_detach_direction_parent_entropy": 0.0,
-            }
-
+        avg_training_noise_guide_active = epoch_training_noise_guide_active / num_batches
+        avg_training_noise_guide_blend_weight = (
+            epoch_training_noise_guide_blend_weight / num_batches
+        )
+        avg_training_noise_guide_guide_l1_mean = (
+            epoch_training_noise_guide_guide_l1_mean / num_batches
+        )
         grad_probe_lambda_dir = float(prev_lambda_dir) if directional_loss_active else 0.0
         if enable_gradient_alignment_probe:
             grad_probe_stats = compute_direction_grad_alignment_diagnostics(
@@ -3564,12 +3359,11 @@ def train_brain_connectivity(
                 x=probe_x,
                 num_nodes=num_nodes,
                 lambda_l1=lambda_l1,
-                directional_prior_mode=directional_prior_mode,
-                lag_direction_source=lag_direction_source,
                 patel_direction_matrix=patel_direction_matrix,
                 directional_pair_gate_matrix=directional_pair_gate_matrix,
                 lambda_dir_effective=grad_probe_lambda_dir,
-                fixed_direction_prior_matrix=fixed_direction_prior_matrix,
+                main_routing=epoch_gradient_routing.main,
+                structure_regularizer_routing=epoch_gradient_routing.structure_regularizers,
                 seed=gradient_alignment_probe_seed,
             )
         else:
@@ -3588,16 +3382,7 @@ def train_brain_connectivity(
             causal_logits = get_current_directional_logits(model, causal=True)
             probe_direction_prior = None
             if directional_loss_active:
-                if fixed_direction_prior_matrix is not None:
-                    probe_direction_prior = fixed_direction_prior_matrix
-                else:
-                    probe_direction_prior = compute_online_direction_prior_matrix(
-                        model=model,
-                        x=probe_x,
-                        mode=directional_prior_mode,
-                        patel_direction_matrix=patel_direction_matrix,
-                        lag_direction_source=lag_direction_source,
-                    )
+                probe_direction_prior = patel_direction_matrix
                 direction_margin_stats = compute_directional_margin_diagnostics(
                     causal_logits,
                     probe_direction_prior,
@@ -3800,6 +3585,17 @@ def train_brain_connectivity(
             "directional_kappa_gate_threshold": float(directional_kappa_threshold),
             "directional_kappa_gate_pair_frac": float(directional_kappa_gate_pair_frac),
             "main_loss_weight": float(main_loss_weight),
+            "training_noise_guide_mode": training_noise_guide_mode,
+            "training_noise_guide_active": float(avg_training_noise_guide_active),
+            "training_noise_guide_blend_weight": float(
+                avg_training_noise_guide_blend_weight
+            ),
+            "training_noise_guide_blend_target": float(training_noise_guide_blend_target),
+            "training_noise_guide_warmup_epochs": int(training_noise_guide_warmup_epochs),
+            "training_noise_guide_ramp_epochs": int(training_noise_guide_ramp_epochs),
+            "training_noise_guide_guide_l1_mean": float(
+                avg_training_noise_guide_guide_l1_mean
+            ),
             "directional_loss_active": int(directional_loss_active),
             "directional_loss_end_epoch": int(directional_loss_end_epoch),
             "directional_loss_deactivated_from_epoch": int(directional_loss_deactivated_from_epoch),
@@ -3815,25 +3611,28 @@ def train_brain_connectivity(
             "direction_branch_frozen": int(direction_branch_frozen),
             "freeze_direction_after_epoch": int(freeze_direction_after_epoch),
             "direction_branch_frozen_from_epoch": int(direction_branch_frozen_from_epoch),
+            "gradient_routing_mode": gradient_routing_mode,
+            "gradient_routing_label": epoch_gradient_routing.label,
+            "routing_main_updates_support": int(epoch_gradient_routing.main.updates_support),
+            "routing_main_updates_direction": int(epoch_gradient_routing.main.updates_direction),
+            "routing_structure_updates_support": int(
+                epoch_gradient_routing.structure_regularizers.updates_support
+            ),
+            "routing_structure_updates_direction": int(
+                epoch_gradient_routing.structure_regularizers.updates_direction
+            ),
+            "routing_causal_lag_updates_support": int(
+                epoch_gradient_routing.causal_lag_main.updates_support
+            ),
+            "routing_causal_lag_updates_direction": int(
+                epoch_gradient_routing.causal_lag_main.updates_direction
+            ),
             "detach_direction_from_main_active": int(detach_direction_from_main_active),
             "detach_direction_from_main_after_epoch": int(detach_direction_from_main_after_epoch),
             "direction_from_main_detached_from_epoch": int(direction_from_main_detached_from_epoch),
             "causal_lag_main_raw": float(raw_causal_lag_main_snap),
             "causal_lag_main_weight": float(causal_lag_main_weight),
             "causal_lag_main_weighted": float(avg_causal_lag_main_loss),
-            "post_detach_direction_loss_requested": int(post_detach_direction_loss_requested),
-            "post_detach_direction_active": int(post_detach_direction_batch_count > 0),
-            "post_detach_direction_contrast_weight": float(
-                post_detach_direction_contrast_weight
-            ),
-            "post_detach_direction_variance_weight": float(
-                post_detach_direction_variance_weight
-            ),
-            "post_detach_direction_parent_entropy_weight": float(
-                post_detach_direction_parent_entropy_weight
-            ),
-            "post_detach_direction_raw": float(avg_post_detach_direction_loss),
-            "post_detach_direction_weighted": float(avg_post_detach_direction_loss),
             "ortho_loss_raw": float(raw_ortho_snap),
             "ortho_loss_weighted": float(avg_ortho_loss),
             "parent_entropy_raw": raw_parent_entropy_snap,
@@ -3851,7 +3650,6 @@ def train_brain_connectivity(
             "selector_audit_enabled": int(selector_audit_gt_edges is not None),
             **grad_probe_stats,
             **causal_lag_diag_stats,
-            **post_detach_direction_epoch_stats,
             **selector_dataset_stats,
             **selector_audit_metrics,
         })
@@ -3884,13 +3682,17 @@ def train_brain_connectivity(
             print(f"Epoch [{epoch+1:3d}/{num_epochs}] | "
                   f"Diff Loss: {avg_loss:.4f} | "
                   f"Sparsity Loss: {avg_sparsity:.4f} | "
+                  f"Route: {epoch_gradient_routing.label} "
+                  f"(main S/D={int(epoch_gradient_routing.main.updates_support)}/"
+                  f"{int(epoch_gradient_routing.main.updates_direction)}, "
+                  f"lag S/D={int(epoch_gradient_routing.causal_lag_main.updates_support)}/"
+                  f"{int(epoch_gradient_routing.causal_lag_main.updates_direction)}) | "
                   f"DirSup(active): {int(directional_loss_active)} | "
                   f"DirBranch(lr/frozen): "
                   f"{0.0 if direction_branch_frozen or not direction_branch_has_separate_params else learning_rate * direction_lr_multiplier:.4e}/"
                   f"{int(direction_branch_frozen)} | "
                   f"Dir Loss(raw/w): {raw_dir_snap:.4f}/{avg_dir_loss:.4f} | "
                   f"CausalLagMain(raw/w): {raw_causal_lag_main_snap:.4f}/{avg_causal_lag_main_loss:.4f} | "
-                  f"PostDetach(active/loss): {int(post_detach_direction_batch_count > 0)}/{avg_post_detach_direction_loss:.4f} | "
                   f"Parent Ent(raw/w): {raw_parent_entropy_snap:.4f}/{avg_parent_entropy_loss:.4f} "
                   f"(lambda={current_parent_entropy_weight:.4f}) | "
                   f"Parent Cap(raw/w): {raw_parent_cap_snap:.4f}/{avg_parent_cap_loss:.4f} "
@@ -3899,7 +3701,11 @@ def train_brain_connectivity(
                   f"(lambda={current_ungated_symmetry_weight:.4f}) | "
                   f"Ortho Loss(raw/w): {raw_ortho_snap:.4f}/{avg_ortho_loss:.4f} | "
                   f"Adj Mean: {adj_mean:.3f} | "
-                  f"Sparsity: {sparsity_ratio:.2%}")
+                  f"Sparsity: {sparsity_ratio:.2%} | "
+                  f"NoiseGuide({training_noise_guide_mode}): "
+                  f"active={avg_training_noise_guide_active:.2f} "
+                  f"blend={avg_training_noise_guide_blend_weight:.3f} "
+                  f"l1={avg_training_noise_guide_guide_l1_mean:.4f}")
 
             if model.use_temporal_encoder:
                 collapse_metrics = diagnose_encoder_collapse(model, data_3d, device)
@@ -3947,16 +3753,6 @@ def train_brain_connectivity(
                       f"clean_rev={causal_lag_diag_stats['causal_lag_diag_reverse_loss']:.4f} | "
                       f"delta(rev-fwd)={causal_lag_diag_stats['causal_lag_diag_reverse_minus_forward']:+.4f} | "
                       f"prefers_forward={int(causal_lag_diag_stats['causal_lag_diag_prefers_forward'])}")
-            if post_detach_direction_epoch_stats["post_detach_direction_available"] > 0.5:
-                print(
-                    f"  [PostDetach] batches={int(post_detach_direction_epoch_stats['post_detach_direction_batch_count'])} | "
-                    f"subj={int(post_detach_direction_epoch_stats['post_detach_direction_subject_count'])} | "
-                    f"fwd={post_detach_direction_epoch_stats['post_detach_direction_forward_mean']:.4f} | "
-                    f"rev={post_detach_direction_epoch_stats['post_detach_direction_reverse_mean']:.4f} | "
-                    f"delta={post_detach_direction_epoch_stats['post_detach_direction_delta_mean']:+.4f} | "
-                    f"var={post_detach_direction_epoch_stats['post_detach_direction_delta_var']:.4f} | "
-                    f"parent_ent={post_detach_direction_epoch_stats['post_detach_direction_parent_entropy']:.4f}"
-                )
             if selector_dataset_stats.get("selection_causal_lag_subject_count", 0.0) > 0.0:
                 print(
                     f"  [SelLag] subj={int(selector_dataset_stats['selection_causal_lag_subject_count'])} | "
@@ -4124,6 +3920,8 @@ def train_brain_connectivity(
     model.direction_branch_frozen_from_epoch = int(direction_branch_frozen_from_epoch)
     model.detach_direction_from_main_after_epoch = int(detach_direction_from_main_after_epoch)
     model.direction_from_main_detached_from_epoch = int(direction_from_main_detached_from_epoch)
+    model.gradient_routing_mode = gradient_routing_mode
+    model.gradient_routing_last_label = epoch_gradient_routing.label
     model.gradient_alignment_probe_enabled = int(enable_gradient_alignment_probe)
     model.gradient_alignment_probe_seed = int(gradient_alignment_probe_seed)
 
@@ -4207,6 +4005,9 @@ def main():
                             'random',
                         ],
                         help='Matrix used only for structure embedding initialization')
+    parser.add_argument('--support_prior_mode', type=str, default='patel_kappa',
+                        choices=['patel_kappa', 'pearson_abs'],
+                        help='Symmetric support-prior source used by fixed support masks and the diffusion noise guide')
     parser.add_argument('--structure_init_scale', type=float, default=1.0,
                         help='Target std of initial structure logits after SVD-based rescaling; 0 disables directional init strength')
     parser.add_argument('--emb_dim', type=int, default=0,
@@ -4313,30 +4114,11 @@ def main():
     parser.add_argument('--noise_with_mean', action='store_true', default=False,
                         help='Include neighbor mean in noise (legacy behavior)')
 
-    # === Fix 1: Directed noise guidance ===
-    parser.add_argument('--directed_noise', action='store_true', default=False,
-                        help='Use direction-biased noise guide adjacency from Patel tau')
-    parser.add_argument('--direction_alpha', type=float, default=0.5,
-                        help='Direction bias strength for directed noise (0=symmetric, 1=max)')
-
     parser.add_argument('--disable_directional_loss', action='store_true', default=False,
                         help='Disable Patel tau directional margin loss during training')
-    parser.add_argument('--directional_prior_mode', type=str, default='patel',
-                        choices=['patel', 'lag_corr'],
-                        help='Directional prior used by the margin loss')
     parser.add_argument('--directional_schedule', type=str, default='cosine_anneal',
                         choices=['cosine_anneal', 'plateau'],
                         help='Directional auxiliary schedule after warmup')
-    parser.add_argument('--lag_direction_source', type=str, default='raw',
-                        choices=['raw', 'encoder'],
-                        help='Signal source for lag_corr directional prior')
-    parser.add_argument('--directional_prior_scope', type=str, default='online_subject',
-                        choices=['online_subject', 'global_dataset'],
-                        help='Whether lag_corr directional prior is recomputed per subject or fixed once from the full dataset')
-    parser.add_argument('--directional_prior_lags', type=str, default='1',
-                        help='Comma-separated lag steps used by lag_corr directional prior')
-    parser.add_argument('--directional_prior_lag_weights', type=str, default='',
-                        help='Optional comma-separated lag weights for lag_corr directional prior; defaults to inverse-lag weighting')
     parser.add_argument('--directional_kappa_gate', action='store_true', default=False,
                         help='Gate directional margin loss to high-kappa pairs only')
     parser.add_argument('--directional_kappa_gate_quantile', type=float, default=0.5,
@@ -4345,6 +4127,15 @@ def main():
                         help='Target ratio of directional margin loss relative to main loss')
     parser.add_argument('--main_loss_weight', type=float, default=1.0,
                         help='Weight applied to the main DDM loss (diffusion + sparsity + hub)')
+    parser.add_argument('--training_noise_guide_mode', type=str, default='fixed_patel',
+                        choices=['fixed_patel', 'scheduled_blend'],
+                        help='Training-time noise-guide mode: fixed_patel keeps the base guide; scheduled_blend mixes in a detached learned guide during training only')
+    parser.add_argument('--training_noise_guide_blend_target', type=float, default=0.5,
+                        help='Final learned-guide blend weight used by --training_noise_guide_mode scheduled_blend')
+    parser.add_argument('--training_noise_guide_warmup_epochs', type=int, default=5,
+                        help='Warmup epochs before scheduled-blend noise guidance activates')
+    parser.add_argument('--training_noise_guide_ramp_epochs', type=int, default=5,
+                        help='Linear ramp epochs for scheduled-blend noise guidance')
     parser.add_argument('--directional_loss_end_epoch', type=int, default=-1,
                         help='Keep directional supervision through this epoch inclusive; -1 keeps it on for the full run')
     parser.add_argument('--direction_lr_multiplier', type=float, default=1.0,
@@ -4353,12 +4144,9 @@ def main():
                         help='Freeze the separate direction branch after this many full epochs; -1 disables')
     parser.add_argument('--detach_direction_from_main_after_epoch', type=int, default=-1,
                         help='Detach the direction gate from main denoising/causal-lag gradients after this many full epochs; -1 disables')
-    parser.add_argument('--post_detach_direction_contrast_weight', type=float, default=0.0,
-                        help='After detach, reward larger reverse-minus-forward causal-lag contrast on the direction branch only')
-    parser.add_argument('--post_detach_direction_variance_weight', type=float, default=0.0,
-                        help='After detach, penalize cross-subject variance of the reverse-minus-forward contrast')
-    parser.add_argument('--post_detach_direction_parent_entropy_weight', type=float, default=0.0,
-                        help='After detach, apply an optional parent-entropy term through detached support and live direction gate')
+    parser.add_argument('--gradient_routing_mode', type=str, default='legacy',
+                        choices=['legacy', 'orthogonal', 'warmup_then_orthogonal'],
+                        help="Explicit loss-to-branch routing: legacy preserves current detach behavior; orthogonal makes main/structure support-only and causal-lag direction-only from epoch 1; warmup_then_orthogonal switches at --detach_direction_from_main_after_epoch")
     parser.add_argument('--enable_gradient_alignment_probe', action='store_true', default=False,
                         help='Record end-of-epoch gradient alignment diagnostics on the direction branch')
     parser.add_argument('--gradient_alignment_probe_seed', type=int, default=0,
@@ -4421,25 +4209,22 @@ def main():
         parser.error('--freeze_direction_after_epoch must be >= -1')
     if args.detach_direction_from_main_after_epoch < -1:
         parser.error('--detach_direction_from_main_after_epoch must be >= -1')
+    if (
+        args.gradient_routing_mode == 'warmup_then_orthogonal' and
+        args.detach_direction_from_main_after_epoch < 0
+    ):
+        parser.error(
+            '--gradient_routing_mode warmup_then_orthogonal requires '
+            '--detach_direction_from_main_after_epoch >= 0'
+        )
     if args.directional_loss_end_epoch < -1:
         parser.error('--directional_loss_end_epoch must be >= -1')
-    if args.post_detach_direction_contrast_weight < 0.0:
-        parser.error('--post_detach_direction_contrast_weight must be >= 0')
-    if args.post_detach_direction_variance_weight < 0.0:
-        parser.error('--post_detach_direction_variance_weight must be >= 0')
-    if args.post_detach_direction_parent_entropy_weight < 0.0:
-        parser.error('--post_detach_direction_parent_entropy_weight must be >= 0')
-    post_detach_direction_loss_requested = (
-        args.post_detach_direction_contrast_weight > 0.0 or
-        args.post_detach_direction_variance_weight > 0.0 or
-        args.post_detach_direction_parent_entropy_weight > 0.0
-    )
-    if post_detach_direction_loss_requested and args.optimizer_step_mode != 'batch_mean':
-        parser.error('--post_detach_direction_* requires --optimizer_step_mode batch_mean')
-    if post_detach_direction_loss_requested and args.detach_direction_from_main_after_epoch < 0:
-        parser.error('--post_detach_direction_* requires --detach_direction_from_main_after_epoch >= 0')
-    if post_detach_direction_loss_requested and args.structure_parameterization != 'support_direction':
-        parser.error('--post_detach_direction_* requires --structure_parameterization support_direction')
+    if args.training_noise_guide_blend_target < 0.0 or args.training_noise_guide_blend_target > 1.0:
+        parser.error('--training_noise_guide_blend_target must be in [0, 1]')
+    if args.training_noise_guide_warmup_epochs < 0:
+        parser.error('--training_noise_guide_warmup_epochs must be >= 0')
+    if args.training_noise_guide_ramp_epochs < 1:
+        parser.error('--training_noise_guide_ramp_epochs must be >= 1')
     if args.disable_directional_loss and args.directional_loss_end_epoch >= 0:
         parser.error('--directional_loss_end_epoch cannot be used with --disable_directional_loss')
     if args.gradient_alignment_probe_seed < 0:
@@ -4448,13 +4233,15 @@ def main():
         (
             abs(args.direction_lr_multiplier - 1.0) > 1e-12 or
             args.freeze_direction_after_epoch >= 0 or
-            args.detach_direction_from_main_after_epoch >= 0
+            args.detach_direction_from_main_after_epoch >= 0 or
+            args.gradient_routing_mode != 'legacy'
         ) and
         args.structure_parameterization != 'support_direction'
     ):
         parser.error(
-            '--direction_lr_multiplier, --freeze_direction_after_epoch, and '
-            '--detach_direction_from_main_after_epoch require '
+            '--direction_lr_multiplier, --freeze_direction_after_epoch, '
+            '--detach_direction_from_main_after_epoch, and '
+            '--gradient_routing_mode require '
             '--structure_parameterization support_direction'
         )
     if args.enable_gradient_alignment_probe and args.structure_parameterization != 'support_direction':
@@ -4487,14 +4274,6 @@ def main():
         parser.error('--selection_primary_density_tiebreak_weight must be >= 0')
 
     try:
-        directional_prior_lags, directional_prior_lag_weights = resolve_lag_weight_spec(
-            parse_int_csv_arg(args.directional_prior_lags, name='--directional_prior_lags'),
-            (
-                parse_float_csv_arg(args.directional_prior_lag_weights, name='--directional_prior_lag_weights')
-                if args.directional_prior_lag_weights.strip()
-                else None
-            ),
-        )
         causal_lag_main_lags, causal_lag_main_lag_weights = resolve_lag_weight_spec(
             parse_int_csv_arg(args.causal_lag_main_lags, name='--causal_lag_main_lags'),
             (
@@ -4537,6 +4316,7 @@ def main():
     print("=" * 60)
 
     print(f"Device: {args.device}")
+    print(f"Support prior mode: {args.support_prior_mode}")
 
     print(f"Time points per subject (raw): {args.time_points}")
     print(f"Requested subject_limit/time_limit: {args.subject_limit}/{args.time_limit}")
@@ -4548,7 +4328,16 @@ def main():
     print(f"Kappa logit bias scale: {args.kappa_logit_bias_scale}")
     print(f"Direction logit bias scale: {args.direction_logit_bias_scale}")
     print(f"Main DDM loss weight: {args.main_loss_weight}")
-    print(f"Directional prior lags/weights: {list(directional_prior_lags)} / {[round(v, 4) for v in directional_prior_lag_weights]}")
+    if args.training_noise_guide_mode == 'scheduled_blend':
+        print(
+            "Training noise guide: "
+            f"mode={args.training_noise_guide_mode} | "
+            f"blend_target={args.training_noise_guide_blend_target} | "
+            f"warmup={args.training_noise_guide_warmup_epochs} | "
+            f"ramp={args.training_noise_guide_ramp_epochs}"
+        )
+    else:
+        print(f"Training noise guide: mode={args.training_noise_guide_mode}")
     print(f"Causal-lag main lags/weights: {list(causal_lag_main_lags)} / {[round(v, 4) for v in causal_lag_main_lag_weights]}")
     print(f"Causal-lag main weight: {args.causal_lag_main_weight}")
     print(f"Selection score mode: {args.selection_score_mode}")
@@ -4640,9 +4429,16 @@ def main():
         pearson_matrix=pearson_matrix.float(),
         seed=args.seed,
     )
+    support_prior_matrix = build_support_prior_matrix(
+        mode=args.support_prior_mode,
+        patel_kappa_matrix=patel_kappa_matrix,
+        pearson_matrix=pearson_matrix.float(),
+    )
     print(f"Structure init mode: {args.structure_init_mode} | "
           f"scale={args.structure_init_scale} | "
           f"range=[{structure_init_matrix.min():.4f}, {structure_init_matrix.max():.4f}]")
+    print(f"Support prior mode: {args.support_prior_mode} | "
+          f"range=[{support_prior_matrix.min():.4f}, {support_prior_matrix.max():.4f}]")
     if args.structure_parameterization == 'support_direction':
         print(f"Support/direction factorization: enabled | direction_init={args.direction_init_mode} | "
               f"fixed_support_mask={args.fixed_support_mask_mode}")
@@ -4680,68 +4476,45 @@ def main():
               f"warmup={args.ungated_symmetry_warmup_epochs} | "
               f"ramp={args.ungated_symmetry_ramp_epochs}")
     if not args.disable_directional_loss:
-        print(f"Directional prior: enabled | mode={args.directional_prior_mode} | "
+        print(f"Directional prior: enabled | source=patel_tau | "
               f"schedule={args.directional_schedule} | "
               f"target_ratio={args.directional_target_ratio} | "
-              f"end_epoch={args.directional_loss_end_epoch} | "
-              f"lag_source={args.lag_direction_source} | "
-              f"scope={args.directional_prior_scope} | "
-              f"lags={list(directional_prior_lags)} | "
-              f"lag_weights={[round(v, 4) for v in directional_prior_lag_weights]}")
+              f"end_epoch={args.directional_loss_end_epoch}")
         if args.directional_kappa_gate:
             print(f"Directional kappa gate requested | quantile={args.directional_kappa_gate_quantile}")
     if args.structure_parameterization == 'support_direction':
         print(f"Direction retention: lr_multiplier={args.direction_lr_multiplier:g} | "
               f"freeze_after_epoch={args.freeze_direction_after_epoch} | "
-              f"detach_main_after_epoch={args.detach_direction_from_main_after_epoch}")
-    if post_detach_direction_loss_requested:
-        print(
-            "Post-detach direction-only loss: "
-            f"contrast={args.post_detach_direction_contrast_weight} | "
-            f"variance={args.post_detach_direction_variance_weight} | "
-            f"parent_entropy={args.post_detach_direction_parent_entropy_weight}"
-        )
+              f"detach_main_after_epoch={args.detach_direction_from_main_after_epoch} | "
+              f"gradient_routing_mode={args.gradient_routing_mode}")
     if args.enable_gradient_alignment_probe:
         print(f"Gradient alignment probe: enabled | seed={args.gradient_alignment_probe_seed}")
 
-    # Step 3: Build noise-guide skeleton
-    if args.directed_noise:
-        noise_guide_adj = build_directed_noise_guide_adjacency(
-            patel_kappa=torch.clamp(patel_kappa_matrix, min=0.0),
-            patel_tau=patel_tau_matrix,
-            top_k_pairs=args.top_k_edges,
-            direction_alpha=args.direction_alpha,
+    # Step 3: Build noise-guide skeleton from the selected symmetric support prior.
+    noise_selection_mode = 'maxgap' if args.fixed_support_mask_mode == 'maxgap_kappa' else 'topk'
+    noise_guide_adj, adj_binary, k_pairs, threshold, selection_gap = build_noise_guide_adjacency(
+        patel_strength_matrix=support_prior_matrix,
+        top_k_pairs=args.top_k_edges,
+        selection_mode=noise_selection_mode,
+    )
+    if noise_selection_mode == 'maxgap':
+        print(
+            f"Keeping max-gap {args.support_prior_mode} skeleton: {k_pairs} undirected pairs "
+            f"(threshold: {threshold:.4f}, gap: {selection_gap:.4f})"
         )
-        adj_binary = None
-        asym_norm = torch.norm(noise_guide_adj - noise_guide_adj.t()).item()
-        print(f"Directed noise guide adj: top {args.top_k_edges} pairs, "
-              f"alpha={args.direction_alpha}, ||A-A^T||_F={asym_norm:.4f}")
-        # For compatibility: estimate k_pairs from non-self-loop entries
-        k_pairs = args.top_k_edges
     else:
-        noise_selection_mode = 'maxgap' if args.fixed_support_mask_mode == 'maxgap_kappa' else 'topk'
-        noise_guide_adj, adj_binary, k_pairs, threshold, selection_gap = build_noise_guide_adjacency(
-            patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),
-            top_k_pairs=args.top_k_edges,
-            selection_mode=noise_selection_mode,
+        print(
+            f"Keeping top {k_pairs} undirected pairs from {args.support_prior_mode} "
+            f"(threshold: {threshold:.4f})"
         )
-        if noise_selection_mode == 'maxgap':
-            print(
-                f"Keeping max-gap kappa skeleton: {k_pairs} undirected pairs "
-                f"(threshold: {threshold:.4f}, gap: {selection_gap:.4f})"
-            )
-        else:
-            print(f"Keeping top {k_pairs} undirected pairs (threshold: {threshold:.4f})")
-        print(f"Noise guide adj: {adj_binary.sum().item() / 2:.0f} undirected pairs + {num_nodes} self-loops")
+    print(f"Noise guide adj: {adj_binary.sum().item() / 2:.0f} undirected pairs + {num_nodes} self-loops")
 
     fixed_support_mask = None
     if args.fixed_support_mask_mode in {'topk_kappa', 'maxgap_kappa'}:
-        if adj_binary is None:
-            raise ValueError(f'--fixed_support_mask_mode {args.fixed_support_mask_mode} requires the undirected kappa skeleton path')
         if args.fixed_support_mask_mode == 'topk_kappa':
-            support_label = 'top-k kappa'
+            support_label = f'top-k {args.support_prior_mode}'
         else:
-            support_label = 'max-gap kappa'
+            support_label = f'max-gap {args.support_prior_mode}'
         fixed_support_mask = adj_binary.clone().float()
         print(f"Fixed support mask: {support_label} | undirected_pairs={fixed_support_mask.sum().item() / 2:.0f}")
 
@@ -4822,23 +4595,20 @@ def main():
         selection_min_density_factor=args.selection_min_density_factor,
         selection_max_density_ratio=args.selection_max_density_ratio,
         enable_directional_loss=not args.disable_directional_loss,
-        directional_prior_mode=args.directional_prior_mode,
         directional_schedule=args.directional_schedule,
-        lag_direction_source=args.lag_direction_source,
-        directional_prior_scope=args.directional_prior_scope,
-        directional_prior_lags=directional_prior_lags,
-        directional_prior_lag_weights=directional_prior_lag_weights,
         directional_kappa_gate=args.directional_kappa_gate,
         directional_kappa_gate_quantile=args.directional_kappa_gate_quantile,
         directional_target_ratio=args.directional_target_ratio,
         main_loss_weight=args.main_loss_weight,
+        training_noise_guide_mode=args.training_noise_guide_mode,
+        training_noise_guide_blend_target=args.training_noise_guide_blend_target,
+        training_noise_guide_warmup_epochs=args.training_noise_guide_warmup_epochs,
+        training_noise_guide_ramp_epochs=args.training_noise_guide_ramp_epochs,
         directional_loss_end_epoch=args.directional_loss_end_epoch,
         direction_lr_multiplier=args.direction_lr_multiplier,
         freeze_direction_after_epoch=args.freeze_direction_after_epoch,
         detach_direction_from_main_after_epoch=args.detach_direction_from_main_after_epoch,
-        post_detach_direction_contrast_weight=args.post_detach_direction_contrast_weight,
-        post_detach_direction_variance_weight=args.post_detach_direction_variance_weight,
-        post_detach_direction_parent_entropy_weight=args.post_detach_direction_parent_entropy_weight,
+        gradient_routing_mode=args.gradient_routing_mode,
         enable_gradient_alignment_probe=args.enable_gradient_alignment_probe,
         gradient_alignment_probe_seed=args.gradient_alignment_probe_seed,
         causal_lag_main_weight=args.causal_lag_main_weight,
@@ -5026,11 +4796,35 @@ def main():
 
     config = dict(vars(args))
 
-    config['num_neighbors_avg'] = float(adj_binary.sum() / num_nodes) if 'adj_binary' in dir() else 0
+    config['num_neighbors_avg'] = float(adj_binary.sum() / num_nodes)
 
     config['num_subjects'] = int(data_3d.shape[0])
     config['effective_time_points'] = int(data_3d.shape[-1])
     config['main_loss_weight'] = float(getattr(model, 'main_loss_weight', args.main_loss_weight))
+    config['training_noise_guide_mode'] = str(
+        getattr(model, 'training_noise_guide_mode', args.training_noise_guide_mode)
+    )
+    config['training_noise_guide_blend_target'] = float(
+        getattr(
+            model,
+            'training_noise_guide_blend_target',
+            args.training_noise_guide_blend_target,
+        )
+    )
+    config['training_noise_guide_warmup_epochs'] = int(
+        getattr(
+            model,
+            'training_noise_guide_warmup_epochs',
+            args.training_noise_guide_warmup_epochs,
+        )
+    )
+    config['training_noise_guide_ramp_epochs'] = int(
+        getattr(
+            model,
+            'training_noise_guide_ramp_epochs',
+            args.training_noise_guide_ramp_epochs,
+        )
+    )
 
     config['num_nodes'] = int(num_nodes)
     config['noise_guide_pairs'] = int(k_pairs)
@@ -5038,6 +4832,7 @@ def main():
     config['exported_epoch'] = int(best_epoch)
     config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
     config['best_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+    config['support_prior_mode'] = str(args.support_prior_mode)
     config['selection_score_mode'] = str(args.selection_score_mode)
     config['selection_agreement_mode'] = str(args.selection_agreement_mode)
     config['selection_soft_agreement_weight'] = float(args.selection_soft_agreement_weight)
@@ -5064,24 +4859,13 @@ def main():
     config['adj_activation'] = str(getattr(model, 'adj_activation', args.adj_activation))
     config['kappa_logit_bias_scale'] = float(getattr(model, 'kappa_logit_bias_scale', args.kappa_logit_bias_scale))
     config['direction_logit_bias_scale'] = float(getattr(model, 'direction_logit_bias_scale', args.direction_logit_bias_scale))
-    config['directional_prior_scope'] = args.directional_prior_scope
-    config['directional_prior_lags'] = ",".join(str(v) for v in directional_prior_lags)
-    config['directional_prior_lag_weights'] = ",".join(f"{v:.8f}" for v in directional_prior_lag_weights)
     config['causal_lag_main_weight'] = float(args.causal_lag_main_weight)
     config['causal_lag_main_aggregation'] = args.causal_lag_main_aggregation
     config['causal_lag_main_softmax_temp'] = float(args.causal_lag_main_softmax_temp)
     config['causal_lag_main_lags'] = ",".join(str(v) for v in causal_lag_main_lags)
     config['causal_lag_main_lag_weights'] = ",".join(f"{v:.8f}" for v in causal_lag_main_lag_weights)
     config['detach_direction_from_main_after_epoch'] = int(args.detach_direction_from_main_after_epoch)
-    config['post_detach_direction_contrast_weight'] = float(
-        args.post_detach_direction_contrast_weight
-    )
-    config['post_detach_direction_variance_weight'] = float(
-        args.post_detach_direction_variance_weight
-    )
-    config['post_detach_direction_parent_entropy_weight'] = float(
-        args.post_detach_direction_parent_entropy_weight
-    )
+    config['gradient_routing_mode'] = args.gradient_routing_mode
     config['selector_audit_gt_path'] = args.selector_audit_gt_path
     config['selector_audit_strict_margin_eps_values'] = ",".join(
         np.format_float_positional(v, trim='-') for v in selector_audit_strict_margin_eps_values
@@ -5091,6 +4875,7 @@ def main():
     config['direction_from_main_detached_from_epoch'] = int(
         getattr(model, 'direction_from_main_detached_from_epoch', -1)
     )
+    config['gradient_routing_last_label'] = getattr(model, 'gradient_routing_last_label', 'unknown')
     final_adj_diag = getattr(model, 'last_epoch_adj_diagnostics', None)
     if final_adj_diag is not None:
         for key, value in final_adj_diag.items():
@@ -5261,4 +5046,3 @@ def main():
 if __name__ == '__main__':
 
     main()
-

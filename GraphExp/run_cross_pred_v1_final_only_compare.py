@@ -113,15 +113,25 @@ BASE_PAIRED_DELTA_METRICS = (
     "best_final_gap_gt_signed_margin_median",
 )
 
-ANTI_COLLAPSE_MODES = ("unsigned_raw", "signed_raw", "signed_gate")
-
-
 def cross_pred_schedule_name(enable_cross_prediction: bool, schedule: str) -> str:
     return schedule if enable_cross_prediction else "disabled"
 
 
 def cross_pred_aggregation_name(enable_cross_prediction: bool, aggregation: str) -> str:
     return aggregation if enable_cross_prediction else "disabled"
+
+
+def resolve_causal_lag_main_weight(
+    enable_cross_prediction: bool,
+    cross_pred_fixed_weight: float,
+    cross_pred_target_ratio: float,
+) -> float:
+    """Backward-compatible mapping from legacy cross-pred knobs to causal_lag_main."""
+    if not enable_cross_prediction:
+        return 0.0
+    if cross_pred_fixed_weight > 0.0:
+        return float(cross_pred_fixed_weight)
+    return max(0.0, float(cross_pred_target_ratio))
 
 
 def parse_float_list(text: str) -> List[float]:
@@ -614,15 +624,17 @@ def build_command(
     parent_cap_target: float,
     ungated_symmetry_lambda: float,
     cross_pred_fixed_weight: float,
-    anti_collapse_lambda: float,
-    anti_collapse_margin: float,
-    anti_collapse_mode: str,
     enable_cross_prediction: bool,
     enable_directional_loss: bool,
     directional_prior_mode: str,
     lag_direction_source: str,
     directional_prior_scope: str,
 ) -> List[str]:
+    causal_lag_main_weight = resolve_causal_lag_main_weight(
+        enable_cross_prediction=enable_cross_prediction,
+        cross_pred_fixed_weight=cross_pred_fixed_weight,
+        cross_pred_target_ratio=args.cross_pred_target_ratio,
+    )
     cmd = [
         sys.executable,
         "main_structure_learning.py",
@@ -694,8 +706,14 @@ def build_command(
         str(args.parent_cap_ramp_epochs),
         "--directional_prior_lags",
         args.directional_prior_lags,
-        "--cross_pred_lags",
+        "--causal_lag_main_lags",
         args.cross_pred_lags,
+        "--causal_lag_main_weight",
+        str(causal_lag_main_weight),
+        "--causal_lag_main_aggregation",
+        args.cross_pred_aggregation,
+        "--causal_lag_main_softmax_temp",
+        str(args.cross_pred_softmax_temp),
     ]
     if args.directional_prior_lag_weights.strip():
         cmd.extend(
@@ -707,7 +725,7 @@ def build_command(
     if args.cross_pred_lag_weights.strip():
         cmd.extend(
             [
-                "--cross_pred_lag_weights",
+                "--causal_lag_main_lag_weights",
                 args.cross_pred_lag_weights,
             ]
         )
@@ -754,48 +772,8 @@ def build_command(
                     str(args.ungated_symmetry_ramp_epochs),
                 ]
             )
-        if anti_collapse_lambda > 0.0:
-            cmd.extend(
-                [
-                    "--anti_collapse_lambda",
-                    str(anti_collapse_lambda),
-                    "--anti_collapse_margin",
-                    str(anti_collapse_margin),
-                    "--anti_collapse_mode",
-                    anti_collapse_mode,
-                    "--anti_collapse_warmup_epochs",
-                    str(args.anti_collapse_warmup_epochs),
-                    "--anti_collapse_ramp_epochs",
-                    str(args.anti_collapse_ramp_epochs),
-                ]
-            )
     if args.disable_temporal_encoder:
         cmd.append("--disable_temporal_encoder")
-    if enable_cross_prediction:
-        cmd.extend(
-            [
-                "--enable_cross_prediction",
-                "--cross_pred_target_ratio",
-                str(args.cross_pred_target_ratio),
-                "--cross_pred_schedule",
-                args.cross_pred_schedule,
-                "--cross_pred_aggregation",
-                args.cross_pred_aggregation,
-                "--cross_pred_softmax_temp",
-                str(args.cross_pred_softmax_temp),
-            ]
-        )
-        if cross_pred_fixed_weight > 0.0:
-            cmd.extend(
-                [
-                    "--cross_pred_fixed_weight",
-                    str(cross_pred_fixed_weight),
-                    "--cross_pred_fixed_warmup_epochs",
-                    str(args.cross_pred_fixed_warmup_epochs),
-                    "--cross_pred_fixed_ramp_epochs",
-                    str(args.cross_pred_fixed_ramp_epochs),
-                ]
-            )
     return cmd
 
 
@@ -816,9 +794,6 @@ def run_single_experiment(
     parent_cap_target: float,
     ungated_symmetry_lambda: float,
     cross_pred_fixed_weight: float,
-    anti_collapse_lambda: float,
-    anti_collapse_margin: float,
-    anti_collapse_mode: str,
     directional_target_ratio: float,
     directional_loss_end_epoch: int,
     lambda_l1: float,
@@ -861,9 +836,6 @@ def run_single_experiment(
         parent_cap_target=parent_cap_target,
         ungated_symmetry_lambda=ungated_symmetry_lambda,
         cross_pred_fixed_weight=cross_pred_fixed_weight,
-        anti_collapse_lambda=anti_collapse_lambda,
-        anti_collapse_margin=anti_collapse_margin,
-        anti_collapse_mode=anti_collapse_mode,
         enable_cross_prediction=enable_cross_prediction,
         enable_directional_loss=enable_directional_loss,
         directional_prior_mode=directional_prior_mode,
@@ -1017,13 +989,6 @@ def run_single_experiment(
         ),
         "directional_target_ratio": directional_target_ratio if enable_directional_loss else 0.0,
         "directional_loss_end_epoch": directional_loss_end_epoch if enable_directional_loss else -1,
-        "anti_collapse_lambda": anti_collapse_lambda if enable_directional_loss else 0.0,
-        "anti_collapse_margin": anti_collapse_margin if enable_directional_loss else 0.0,
-        "anti_collapse_mode": (
-            anti_collapse_mode if enable_directional_loss and anti_collapse_lambda > 0.0 else "disabled"
-        ),
-        "anti_collapse_warmup_epochs": args.anti_collapse_warmup_epochs if enable_directional_loss else 0,
-        "anti_collapse_ramp_epochs": args.anti_collapse_ramp_epochs if enable_directional_loss else 1,
         "parent_entropy_lambda": parent_entropy_lambda,
         "parent_entropy_warmup_epochs": args.parent_entropy_warmup_epochs,
         "parent_entropy_ramp_epochs": args.parent_entropy_ramp_epochs,
@@ -1113,11 +1078,6 @@ def aggregate_rows(
             row["directional_kappa_gate_quantile"],
             row.get("directional_target_ratio", 0.0),
             row.get("directional_loss_end_epoch", -1),
-            row.get("anti_collapse_lambda", 0.0),
-            row.get("anti_collapse_margin", 0.0),
-            row.get("anti_collapse_mode", "disabled"),
-            row.get("anti_collapse_warmup_epochs", 0),
-            row.get("anti_collapse_ramp_epochs", 1),
             row["parent_entropy_lambda"],
             row["parent_entropy_warmup_epochs"],
             row["parent_entropy_ramp_epochs"],
@@ -1178,11 +1138,6 @@ def aggregate_rows(
             "directional_kappa_gate_quantile": sample["directional_kappa_gate_quantile"],
             "directional_target_ratio": sample.get("directional_target_ratio", 0.0),
             "directional_loss_end_epoch": sample.get("directional_loss_end_epoch", -1),
-            "anti_collapse_lambda": sample.get("anti_collapse_lambda", 0.0),
-            "anti_collapse_margin": sample.get("anti_collapse_margin", 0.0),
-            "anti_collapse_mode": sample.get("anti_collapse_mode", "disabled"),
-            "anti_collapse_warmup_epochs": sample.get("anti_collapse_warmup_epochs", 0),
-            "anti_collapse_ramp_epochs": sample.get("anti_collapse_ramp_epochs", 1),
             "parent_entropy_lambda": sample["parent_entropy_lambda"],
             "parent_entropy_warmup_epochs": sample["parent_entropy_warmup_epochs"],
             "parent_entropy_ramp_epochs": sample["parent_entropy_ramp_epochs"],
@@ -1301,11 +1256,6 @@ def build_condition_deltas(
             row.get("directional_kappa_gate_quantile", 0.0),
             row.get("directional_target_ratio", 0.0),
             row.get("directional_loss_end_epoch", -1),
-            row.get("anti_collapse_lambda", 0.0),
-            row.get("anti_collapse_margin", 0.0),
-            row.get("anti_collapse_mode", "disabled"),
-            row.get("anti_collapse_warmup_epochs", 0),
-            row.get("anti_collapse_ramp_epochs", 1),
             row.get("parent_entropy_lambda", 0.0),
             row.get("parent_entropy_warmup_epochs", 0),
             row.get("parent_entropy_ramp_epochs", 1),
@@ -1359,9 +1309,6 @@ def build_condition_deltas(
             "cross_pred_lags": baseline.get("cross_pred_lags", "disabled"),
             "cross_pred_lag_weights": baseline.get("cross_pred_lag_weights", "disabled"),
             "cross_pred_fixed_weight": baseline.get("cross_pred_fixed_weight", 0.0),
-            "anti_collapse_lambda": baseline.get("anti_collapse_lambda", 0.0),
-            "anti_collapse_margin": baseline.get("anti_collapse_margin", 0.0),
-            "anti_collapse_mode": baseline.get("anti_collapse_mode", "disabled"),
             "subject_limit": baseline.get("subject_limit", -1),
             "time_limit": baseline.get("time_limit", -1),
             "baseline_runs": baseline["run_count"],
@@ -1386,9 +1333,6 @@ def build_condition_deltas(
             "treatment_directional_kappa_gate_quantile": treatment.get("directional_kappa_gate_quantile", 0.0),
             "treatment_directional_target_ratio": treatment.get("directional_target_ratio", 0.0),
             "treatment_directional_loss_end_epoch": treatment.get("directional_loss_end_epoch", -1),
-            "treatment_anti_collapse_lambda": treatment.get("anti_collapse_lambda", 0.0),
-            "treatment_anti_collapse_margin": treatment.get("anti_collapse_margin", 0.0),
-            "treatment_anti_collapse_mode": treatment.get("anti_collapse_mode", "disabled"),
             "treatment_parent_entropy_lambda": treatment.get("parent_entropy_lambda", 0.0),
             "treatment_parent_entropy_warmup_epochs": treatment.get("parent_entropy_warmup_epochs", 0),
             "treatment_parent_entropy_ramp_epochs": treatment.get("parent_entropy_ramp_epochs", 1),
@@ -1476,11 +1420,6 @@ def build_paired_seed_deltas(
             row.get("directional_kappa_gate_quantile", 0.0),
             row.get("directional_target_ratio", 0.0),
             row.get("directional_loss_end_epoch", -1),
-            row.get("anti_collapse_lambda", 0.0),
-            row.get("anti_collapse_margin", 0.0),
-            row.get("anti_collapse_mode", "disabled"),
-            row.get("anti_collapse_warmup_epochs", 0),
-            row.get("anti_collapse_ramp_epochs", 1),
             row.get("parent_entropy_lambda", 0.0),
             row.get("parent_entropy_warmup_epochs", 0),
             row.get("parent_entropy_ramp_epochs", 1),
@@ -1535,9 +1474,6 @@ def build_paired_seed_deltas(
             "cross_pred_lags": baseline.get("cross_pred_lags", "disabled"),
             "cross_pred_lag_weights": baseline.get("cross_pred_lag_weights", "disabled"),
             "cross_pred_fixed_weight": baseline.get("cross_pred_fixed_weight", 0.0),
-            "anti_collapse_lambda": baseline.get("anti_collapse_lambda", 0.0),
-            "anti_collapse_margin": baseline.get("anti_collapse_margin", 0.0),
-            "anti_collapse_mode": baseline.get("anti_collapse_mode", "disabled"),
             "subject_limit": baseline.get("subject_limit", -1),
             "time_limit": baseline.get("time_limit", -1),
             "treatment_enable_cross_prediction": treatment["enable_cross_prediction"],
@@ -1560,9 +1496,6 @@ def build_paired_seed_deltas(
             "treatment_directional_kappa_gate_quantile": treatment.get("directional_kappa_gate_quantile", 0.0),
             "treatment_directional_target_ratio": treatment.get("directional_target_ratio", 0.0),
             "treatment_directional_loss_end_epoch": treatment.get("directional_loss_end_epoch", -1),
-            "treatment_anti_collapse_lambda": treatment.get("anti_collapse_lambda", 0.0),
-            "treatment_anti_collapse_margin": treatment.get("anti_collapse_margin", 0.0),
-            "treatment_anti_collapse_mode": treatment.get("anti_collapse_mode", "disabled"),
             "treatment_parent_entropy_lambda": treatment.get("parent_entropy_lambda", 0.0),
             "treatment_parent_entropy_warmup_epochs": treatment.get("parent_entropy_warmup_epochs", 0),
             "treatment_parent_entropy_ramp_epochs": treatment.get("parent_entropy_ramp_epochs", 1),
@@ -1908,36 +1841,6 @@ def main():
         help="Linear ramp epochs for fixed cross-prediction weight.",
     )
     parser.add_argument(
-        "--anti_collapse_lambdas",
-        type=str,
-        default="0.0",
-        help="Comma-separated fixed weights for the gated anti-collapse loss.",
-    )
-    parser.add_argument(
-        "--anti_collapse_margin_values",
-        type=str,
-        default="0.02",
-        help="Comma-separated minimum directional-contrast margins for anti-collapse loss.",
-    )
-    parser.add_argument(
-        "--anti_collapse_modes",
-        type=str,
-        default="unsigned_raw",
-        help="Comma-separated anti-collapse modes: unsigned_raw, signed_raw, signed_gate.",
-    )
-    parser.add_argument(
-        "--anti_collapse_warmup_epochs",
-        type=int,
-        default=0,
-        help="Warmup epochs before anti-collapse loss activates.",
-    )
-    parser.add_argument(
-        "--anti_collapse_ramp_epochs",
-        type=int,
-        default=1,
-        help="Linear ramp epochs for anti-collapse loss.",
-    )
-    parser.add_argument(
         "--parent_entropy_values",
         type=str,
         default="0.0",
@@ -2049,9 +1952,6 @@ def main():
         else []
     )
     cross_pred_fixed_weights = parse_float_list(args.cross_pred_fixed_weights)
-    anti_collapse_lambdas = parse_float_list(args.anti_collapse_lambdas)
-    anti_collapse_margin_values = parse_float_list(args.anti_collapse_margin_values)
-    anti_collapse_modes = parse_text_list(args.anti_collapse_modes)
     lambda_l1_values = parse_float_list(args.lambda_l1_values)
     parent_entropy_values = parse_float_list(args.parent_entropy_values)
     parent_cap_values = parse_float_list(args.parent_cap_values)
@@ -2113,22 +2013,6 @@ def main():
         parser.error("--cross_pred_fixed_weights must include at least one value")
     if any(value < 0.0 for value in cross_pred_fixed_weights):
         parser.error("--cross_pred_fixed_weights must be >= 0")
-    if not anti_collapse_lambdas:
-        parser.error("--anti_collapse_lambdas must include at least one value")
-    if any(value < 0.0 for value in anti_collapse_lambdas):
-        parser.error("--anti_collapse_lambdas must be >= 0")
-    if not anti_collapse_margin_values:
-        parser.error("--anti_collapse_margin_values must include at least one value")
-    if any(value < 0.0 for value in anti_collapse_margin_values):
-        parser.error("--anti_collapse_margin_values must be >= 0")
-    if not anti_collapse_modes:
-        parser.error("--anti_collapse_modes must include at least one value")
-    invalid_anti_collapse_modes = [value for value in anti_collapse_modes if value not in ANTI_COLLAPSE_MODES]
-    if invalid_anti_collapse_modes:
-        parser.error(
-            "--anti_collapse_modes contains unsupported values: "
-            + ", ".join(invalid_anti_collapse_modes)
-        )
     valid_optimizer_step_modes = {"subject", "batch_mean"}
     invalid_optimizer_step_modes = [
         value for value in optimizer_step_modes if value not in valid_optimizer_step_modes
@@ -2216,10 +2100,6 @@ def main():
         parser.error("--cross_pred_fixed_warmup_epochs must be >= 0")
     if args.cross_pred_fixed_ramp_epochs < 1:
         parser.error("--cross_pred_fixed_ramp_epochs must be >= 1")
-    if args.anti_collapse_warmup_epochs < 0:
-        parser.error("--anti_collapse_warmup_epochs must be >= 0")
-    if args.anti_collapse_ramp_epochs < 1:
-        parser.error("--anti_collapse_ramp_epochs must be >= 1")
     if args.subject_limit == 0 or args.subject_limit < -1:
         parser.error("--subject_limit must be -1 or a positive integer")
     if args.time_limit == 0 or args.time_limit < -1:
@@ -2232,17 +2112,14 @@ def main():
         positive_targets = []
     if any(value > 0.0 for value in ungated_symmetry_values) and not args.directional_kappa_gate:
         parser.error("--ungated_symmetry_values with a positive value requires --directional_kappa_gate")
-    if any(value > 0.0 for value in anti_collapse_lambdas):
-        if not args.directional_kappa_gate:
-            parser.error("--anti_collapse_lambdas with a positive value require --directional_kappa_gate")
-        if not any(enable for enable, _, _ in directional_conditions):
-            parser.error("--anti_collapse_lambdas with a positive value require enabled directional conditions")
-        if "signed_gate" in anti_collapse_modes and any(value >= 1.0 for value in anti_collapse_margin_values):
-            parser.error("--anti_collapse_modes signed_gate requires all --anti_collapse_margin_values to be < 1")
     args.directional_prior_lags = ",".join(str(value) for value in directional_prior_lags)
     args.directional_prior_lag_weights = ",".join(f"{value:g}" for value in directional_prior_lag_weights)
     args.cross_pred_lags = ",".join(str(value) for value in cross_pred_lags)
     args.cross_pred_lag_weights = ",".join(f"{value:g}" for value in cross_pred_lag_weights)
+    print(
+        "[Compat] Legacy cross-pred sweep is mapped to causal_lag_main_* in main_structure_learning.py; "
+        "cross_pred_schedule and cross_pred_fixed warmup/ramp are recorded in CSV but not forwarded as trainer flags."
+    )
     aggregate_metric_names = tuple(BASE_AGGREGATE_METRICS) + tuple(
         build_extra_strict_metric_names(strict_margin_eps_values)
     ) + tuple(
@@ -2296,71 +2173,61 @@ def main():
                             for directional_target_ratio in directional_ratio_values:
                                 for directional_loss_end_epoch in directional_end_values:
                                     fixed_cross_weight_values = [0.0] if not enable_cross_prediction else cross_pred_fixed_weights
-                                    anti_collapse_weight_values = [0.0] if not enable_directional_loss else anti_collapse_lambdas
                                     for cross_pred_fixed_weight in fixed_cross_weight_values:
-                                        for anti_collapse_lambda in anti_collapse_weight_values:
-                                            anti_collapse_margin_candidates = (
-                                                anti_collapse_margin_values if anti_collapse_lambda > 0.0 else [0.0]
-                                            )
-                                            anti_collapse_mode_candidates = (
-                                                anti_collapse_modes if anti_collapse_lambda > 0.0 else ["disabled"]
-                                            )
-                                            for anti_collapse_mode in anti_collapse_mode_candidates:
-                                                for anti_collapse_margin in anti_collapse_margin_candidates:
-                                                    for lambda_l1 in lambda_l1_values:
-                                                        for structure_parameterization in structure_parameterizations:
-                                                            active_fixed_support_mask_modes = (
-                                                                fixed_support_mask_modes
-                                                                if structure_parameterization == "support_direction"
-                                                                else ["none"]
-                                                            )
-                                                            active_direction_init_modes = (
-                                                                direction_init_modes
-                                                                if structure_parameterization == "support_direction"
-                                                                else ["patel_tau"]
-                                                            )
-                                                            for (
-                                                                fixed_support_mask_mode,
-                                                                direction_init_mode,
-                                                                emb_dim,
-                                                                optimizer_step_mode,
-                                                                adj_activation,
-                                                                kappa_logit_bias_scale,
-                                                                direction_logit_bias_scale,
-                                                                main_loss_weight,
-                                                                selection_agreement_weight,
-                                                            ) in product(
-                                                                active_fixed_support_mask_modes,
-                                                                active_direction_init_modes,
-                                                                emb_dims,
-                                                                optimizer_step_modes,
-                                                                adj_activations,
-                                                                kappa_logit_bias_scales,
-                                                                direction_logit_bias_scales,
-                                                                main_loss_weights,
-                                                                selection_agreement_weights,
-                                                            ):
-                                                                active_direction_lr_multipliers = (
-                                                                    direction_lr_multipliers
-                                                                    if structure_parameterization == "support_direction"
-                                                                    else [1.0]
-                                                                )
-                                                                active_freeze_direction_after_epochs = (
-                                                                    freeze_direction_after_epochs
-                                                                    if structure_parameterization == "support_direction"
-                                                                    else [-1]
-                                                                )
-                                                                for (
-                                                                    direction_lr_multiplier,
-                                                                    freeze_direction_after_epoch,
-                                                                    scale,
-                                                                    seed,
-                                                                ) in product(
-                                                                    active_direction_lr_multipliers,
-                                                                    active_freeze_direction_after_epochs,
-                                                                    scales,
-                                                                    seeds,
-                                                                ):
+                                        for lambda_l1 in lambda_l1_values:
+                                            for structure_parameterization in structure_parameterizations:
+                                                active_fixed_support_mask_modes = (
+                                                    fixed_support_mask_modes
+                                                    if structure_parameterization == "support_direction"
+                                                    else ["none"]
+                                                )
+                                                active_direction_init_modes = (
+                                                    direction_init_modes
+                                                    if structure_parameterization == "support_direction"
+                                                    else ["patel_tau"]
+                                                )
+                                                for (
+                                                    fixed_support_mask_mode,
+                                                    direction_init_mode,
+                                                    emb_dim,
+                                                    optimizer_step_mode,
+                                                    adj_activation,
+                                                    kappa_logit_bias_scale,
+                                                    direction_logit_bias_scale,
+                                                    main_loss_weight,
+                                                    selection_agreement_weight,
+                                                ) in product(
+                                                    active_fixed_support_mask_modes,
+                                                    active_direction_init_modes,
+                                                    emb_dims,
+                                                    optimizer_step_modes,
+                                                    adj_activations,
+                                                    kappa_logit_bias_scales,
+                                                    direction_logit_bias_scales,
+                                                    main_loss_weights,
+                                                    selection_agreement_weights,
+                                                ):
+                                                    active_direction_lr_multipliers = (
+                                                        direction_lr_multipliers
+                                                        if structure_parameterization == "support_direction"
+                                                        else [1.0]
+                                                    )
+                                                    active_freeze_direction_after_epochs = (
+                                                        freeze_direction_after_epochs
+                                                        if structure_parameterization == "support_direction"
+                                                        else [-1]
+                                                    )
+                                                    for (
+                                                        direction_lr_multiplier,
+                                                        freeze_direction_after_epoch,
+                                                        scale,
+                                                        seed,
+                                                    ) in product(
+                                                        active_direction_lr_multipliers,
+                                                        active_freeze_direction_after_epochs,
+                                                        scales,
+                                                        seeds,
+                                                    ):
                                                                     print(
                                                                         f"=== RUN condition={condition} init={args.structure_init_mode} "
                                                                         f"lambda_l1={lambda_l1} parent_entropy={parent_entropy_lambda} "
@@ -2378,7 +2245,6 @@ def main():
                                                                         f"sel_agree={selection_agreement_weight} "
                                                                         f"dir_end={directional_loss_end_epoch} "
                                                                         f"cross_fixed={cross_pred_fixed_weight} "
-                                                                        f"anti_collapse={anti_collapse_lambda}@{anti_collapse_margin}:{anti_collapse_mode} "
                                                                         f"dir_lr_mult={direction_lr_multiplier} "
                                                                         f"dir_freeze={freeze_direction_after_epoch} "
                                                                         f"ungated_sym={ungated_symmetry_lambda} "
@@ -2401,9 +2267,6 @@ def main():
                                                                         parent_cap_target=parent_cap_target,
                                                                         ungated_symmetry_lambda=ungated_symmetry_lambda,
                                                                         cross_pred_fixed_weight=cross_pred_fixed_weight,
-                                                                        anti_collapse_lambda=anti_collapse_lambda,
-                                                                        anti_collapse_margin=anti_collapse_margin,
-                                                                        anti_collapse_mode=anti_collapse_mode,
                                                                         directional_target_ratio=directional_target_ratio,
                                                                         directional_loss_end_epoch=directional_loss_end_epoch,
                                                                         lambda_l1=lambda_l1,
@@ -2439,7 +2302,6 @@ def main():
                                                                         f"sel_agree={selection_agreement_weight} "
                                                                         f"dir_end={directional_loss_end_epoch} "
                                                                         f"cross_fixed={cross_pred_fixed_weight} "
-                                                                        f"anti_collapse={anti_collapse_lambda}@{anti_collapse_margin}:{anti_collapse_mode} "
                                                                         f"dir_lr_mult={direction_lr_multiplier} "
                                                                         f"dir_freeze={freeze_direction_after_epoch} "
                                                                         f"ungated_sym={ungated_symmetry_lambda} "
@@ -2460,254 +2322,6 @@ def main():
                                                                         f"near0(<1e-2)={row['margin_lt_1e2_frac']:.2%}, "
                                                                         f"mode={row['failure_mode']}"
                                                                     )
-                                                    '''
-                                                            print(
-                                                                f"=== RUN condition={condition} init={args.structure_init_mode} "
-                                                                f"lambda_l1={lambda_l1} parent_entropy={parent_entropy_lambda} "
-                                                                f"parent_cap={parent_cap_lambda}@{parent_cap_target} "
-                                                                f"dir_ratio={directional_target_ratio} "
-                                                                f"struct={structure_parameterization} "
-                                                                f"support_mask={fixed_support_mask_mode} "
-                                                                f"dir_init={direction_init_mode} "
-                                                                f"emb_dim={emb_dim} msg_mode={args.structure_message_graph_mode} "
-                                                                f"opt_step={optimizer_step_mode} "
-                                                                f"adj_act={adj_activation} "
-                                                                f"kappa_bias={kappa_logit_bias_scale} "
-                                                                f"ungated_sym={ungated_symmetry_lambda} "
-                                                                f"scale={scale} seed={seed} ==="
-                                                            )
-                                                            cmd = build_command(
-                                                                args,
-                                                                seed=seed,
-                                                                scale=scale,
-                                                                emb_dim=emb_dim,
-                                                                structure_parameterization=structure_parameterization,
-                                                                fixed_support_mask_mode=fixed_support_mask_mode,
-                                                                direction_init_mode=direction_init_mode,
-                                                                optimizer_step_mode=optimizer_step_mode,
-                                                                adj_activation=adj_activation,
-                                                                kappa_logit_bias_scale=kappa_logit_bias_scale,
-                                                                directional_target_ratio=directional_target_ratio,
-                                                                lambda_l1=lambda_l1,
-                                                                parent_entropy_lambda=parent_entropy_lambda,
-                                                                parent_cap_lambda=parent_cap_lambda,
-                                                                parent_cap_target=parent_cap_target,
-                                                                ungated_symmetry_lambda=ungated_symmetry_lambda,
-                                                                enable_cross_prediction=enable_cross_prediction,
-                                                                enable_directional_loss=enable_directional_loss,
-                                                                directional_prior_mode=directional_prior_mode,
-                                                                lag_direction_source=lag_direction_source,
-                                                            )
-                                                            proc = subprocess.run(
-                                                                cmd,
-                                                                cwd=str(script_dir),
-                                                                capture_output=True,
-                                                                text=True,
-                                                                encoding="utf-8",
-                                                                errors="replace",
-                                                                check=False,
-                                                            )
-                                                            if proc.returncode != 0:
-                                                                raise RuntimeError(
-                                                                    "Training subprocess failed for "
-                                                                    f"condition={condition}, lambda_l1={lambda_l1}, "
-                                                                    f"parent_entropy={parent_entropy_lambda}, "
-                                                                    f"parent_cap={parent_cap_lambda}@{parent_cap_target}, "
-                                                                    f"dir_ratio={directional_target_ratio}, "
-                                                                    f"struct={structure_parameterization}, "
-                                                                    f"support_mask={fixed_support_mask_mode}, "
-                                                                    f"dir_init={direction_init_mode}, "
-                                                                    f"emb_dim={emb_dim}, msg_mode={args.structure_message_graph_mode}, "
-                                                                    f"opt_step={optimizer_step_mode}, "
-                                                                    f"adj_act={adj_activation}, "
-                                                                    f"kappa_bias={kappa_logit_bias_scale}, "
-                                                                    f"ungated_sym={ungated_symmetry_lambda}, "
-                                                                    f"seed={seed}, scale={scale}\n"
-                                                                    f"STDOUT:\n{proc.stdout}\n"
-                                                                    f"STDERR:\n{proc.stderr}"
-                                                                )
-                                                            stdout = proc.stdout
-                                                            match = re.search(r"Results will be saved to: (.+)", stdout)
-                                                            if not match:
-                                                                raise RuntimeError(
-                                                                    "Could not parse result dir for "
-                                                                    f"condition={condition}, lambda_l1={lambda_l1}, "
-                                                                    f"parent_entropy={parent_entropy_lambda}, "
-                                                                    f"parent_cap={parent_cap_lambda}@{parent_cap_target}, "
-                                                                    f"dir_ratio={directional_target_ratio}, "
-                                                                    f"struct={structure_parameterization}, "
-                                                                    f"support_mask={fixed_support_mask_mode}, "
-                                                                    f"dir_init={direction_init_mode}, "
-                                                                    f"emb_dim={emb_dim}, msg_mode={args.structure_message_graph_mode}, "
-                                                                    f"opt_step={optimizer_step_mode}, "
-                                                                    f"adj_act={adj_activation}, "
-                                                                    f"kappa_bias={kappa_logit_bias_scale}, "
-                                                                    f"ungated_sym={ungated_symmetry_lambda}, "
-                                                                    f"seed={seed}, scale={scale}"
-                                                                )
-                                                            result_dir = (script_dir / match.group(1).strip()).resolve()
-                                                            (result_dir / "cross_pred_v1_final_only_compare_stdout.log").write_text(
-                                                                stdout,
-                                                                encoding="utf-8",
-                                                            )
-                                                            if proc.stderr:
-                                                                (result_dir / "cross_pred_v1_final_only_compare_stderr.log").write_text(
-                                                                    proc.stderr,
-                                                                    encoding="utf-8",
-                                                                )
-
-                                                            best_adj = np.loadtxt(result_dir / "learned_adjacency_causal.csv", delimiter=",")
-                                                            final_adj = np.loadtxt(result_dir / "final_epoch_adjacency_causal.csv", delimiter=",")
-                                                            tau = np.loadtxt(result_dir / "patel_tau.csv", delimiter=",")
-                                                            final_diff_loss = load_final_diff_loss(result_dir)
-                                                            best_metrics = evaluate_best_adjacency_metrics(
-                                                                best_adj,
-                                                                gt_edges,
-                                                                tau,
-                                                                strict_margin_eps_values,
-                                                            )
-                                                            direction_eval = evaluate_directional(final_adj, gt_edges)
-                                                            primary_strict_eval = evaluate_directional_strict(
-                                                                final_adj,
-                                                                gt_edges,
-                                                                margin_eps=strict_margin_eps_values[0],
-                                                            )
-                                                            extra_strict_eval: Dict[str, float] = {}
-                                                            for margin_eps in strict_margin_eps_values:
-                                                                strict_eval = evaluate_directional_strict(
-                                                                    final_adj,
-                                                                    gt_edges,
-                                                                    margin_eps=margin_eps,
-                                                                )
-                                                                for metric_name, metric_value in strict_eval.items():
-                                                                    extra_strict_eval[strict_metric_field(metric_name, margin_eps)] = metric_value
-                                                            stats = margin_stats(final_adj)
-                                                            adj_density = adjacency_density_stats(final_adj)
-                                                            adj_concentration = adjacency_parent_concentration_stats(final_adj)
-                                                            gt_margin = gt_edge_margin_stats(final_adj, gt_edges)
-                                                            same_tau, total_pairs = tau_alignment(final_adj, tau)
-        
-                                                            row = {
-                                                                "condition": condition,
-                                                                "enable_cross_prediction": int(enable_cross_prediction),
-                                                                "cross_pred_target_ratio": (
-                                                                    args.cross_pred_target_ratio if enable_cross_prediction else 0.0
-                                                                ),
-                                                                "cross_pred_schedule": cross_pred_schedule_name(
-                                                                    enable_cross_prediction,
-                                                                    args.cross_pred_schedule,
-                                                                ),
-                                                                "cross_pred_aggregation": cross_pred_aggregation_name(
-                                                                    enable_cross_prediction,
-                                                                    args.cross_pred_aggregation,
-                                                                ),
-                                                                "cross_pred_softmax_temp": (
-                                                                    args.cross_pred_softmax_temp if enable_cross_prediction else 0.0
-                                                                ),
-                                                                "enable_directional_loss": int(enable_directional_loss),
-                                                                "directional_prior_mode": directional_prior_mode_name(
-                                                                    enable_directional_loss,
-                                                                    directional_prior_mode,
-                                                                ),
-                                                                "directional_schedule": directional_schedule_name(
-                                                                    enable_directional_loss,
-                                                                    args.directional_schedule,
-                                                                ),
-                                                                "lag_direction_source": lag_direction_source_name(
-                                                                    enable_directional_loss,
-                                                                    directional_prior_mode,
-                                                                    lag_direction_source,
-                                                                ),
-                                                                "directional_kappa_gate": int(
-                                                                    enable_directional_loss and args.directional_kappa_gate
-                                                                ),
-                                                                "directional_kappa_gate_quantile": (
-                                                                    args.directional_kappa_gate_quantile
-                                                                    if enable_directional_loss and args.directional_kappa_gate
-                                                                    else 0.0
-                                                                ),
-                                                                "directional_target_ratio": (
-                                                                    directional_target_ratio if enable_directional_loss else 0.0
-                                                                ),
-                                                                "parent_entropy_lambda": parent_entropy_lambda,
-                                                                "parent_entropy_warmup_epochs": args.parent_entropy_warmup_epochs,
-                                                                "parent_entropy_ramp_epochs": args.parent_entropy_ramp_epochs,
-                                                                "parent_cap_lambda": parent_cap_lambda,
-                                                                "parent_cap_target": parent_cap_target,
-                                                                "parent_cap_warmup_epochs": args.parent_cap_warmup_epochs,
-                                                                "parent_cap_ramp_epochs": args.parent_cap_ramp_epochs,
-                                                                "ungated_symmetry_lambda": ungated_symmetry_lambda,
-                                                                "ungated_symmetry_warmup_epochs": args.ungated_symmetry_warmup_epochs,
-                                                                "ungated_symmetry_ramp_epochs": args.ungated_symmetry_ramp_epochs,
-                                                                "strict_margin_eps_values": ",".join(
-                                                                    f"{normalize_margin_eps(v):g}" for v in strict_margin_eps_values
-                                                                ),
-                                                                "strict_primary_margin_eps": strict_margin_eps_values[0],
-                                                                "structure_parameterization": structure_parameterization,
-                                                                "fixed_support_mask_mode": fixed_support_mask_mode,
-                                                                "direction_init_mode": direction_init_mode,
-                                                                "emb_dim": emb_dim,
-                                                                "structure_message_graph_mode": args.structure_message_graph_mode,
-                                                                "optimizer_step_mode": optimizer_step_mode,
-                                                                "adj_activation": adj_activation,
-                                                                "kappa_logit_bias_scale": kappa_logit_bias_scale,
-                                                                "direction_logit_bias_scale": direction_logit_bias_scale,
-                                                                "lambda_l1": lambda_l1,
-                                                                "structure_init_mode": args.structure_init_mode,
-                                                                "structure_init_scale": scale,
-                                                                "seed": seed,
-                                                                "result_dir": str(result_dir),
-                                                                "final_precision": float(direction_eval["precision"]),
-                                                                "final_recall": float(direction_eval["recall"]),
-                                                                "final_f1": float(direction_eval["f1"]),
-                                                                **primary_strict_eval,
-                                                                **extra_strict_eval,
-                                                                "final_diff_loss": final_diff_loss,
-                                                                "final_tie_count": int(direction_eval["tie_count"]),
-                                                                "final_same_dir_vs_tau": int(same_tau),
-                                                                "total_pairs": int(total_pairs),
-                                                                **best_metrics,
-                                                                **stats,
-                                                                **adj_density,
-                                                                **adj_concentration,
-                                                                **gt_margin,
-                                                                "failure_mode": failure_mode(stats, direction_eval),
-                                                                "final_top5": str(
-                                                                    [
-                                                                        (src + 1, dst + 1, round(margin, 4))
-                                                                        for src, dst, margin in direction_eval["predictions"][:5]
-                                                                    ]
-                                                                ),
-                                                            }
-                                                            rows.append(row)
-                                                            print(
-                                                                f"{condition} l1={lambda_l1} parent_ent={parent_entropy_lambda} "
-                                                                f"parent_cap={parent_cap_lambda}@{parent_cap_target} "
-                                                                f"dir_ratio={directional_target_ratio} "
-                                                                f"struct={structure_parameterization} "
-                                                                f"support_mask={fixed_support_mask_mode} "
-                                                                f"dir_init={direction_init_mode} "
-                                                                f"emb_dim={emb_dim} msg_mode={args.structure_message_graph_mode} "
-                                                                f"opt_step={optimizer_step_mode} "
-                                                                f"adj_act={adj_activation} "
-                                                                f"kappa_bias={kappa_logit_bias_scale} "
-                                                                f"ungated_sym={ungated_symmetry_lambda} "
-                                                                f"scale={scale} seed={seed}: "
-                                                                f"diff={row['final_diff_loss']:.4f}, "
-                                                                f"best_strict={row['best_strict_f1']:.4f}, "
-                                                                f"final_F1={row['final_f1']:.4f}, "
-                                                                f"strict_primary_F1={row['strict_f1']:.4f}, "
-                                                                f"{format_margin_eps_summary(row, strict_margin_eps_values)}, "
-                                                                f"margin_med={row['margin_median']:.4e}, "
-                                                                f"gt_margin_med={row['gt_signed_margin_median']:.4e}, "
-                                                                f"p90={row['margin_p90']:.4e}, "
-                                                                f"eff_par={row['adj_eff_parents_mean']:.2f}, "
-                                                                f"gt_pos={row['gt_signed_margin_frac_pos']:.2%}, "
-                                                                f"near0(<1e-2)={row['margin_lt_1e2_frac']:.2%}, "
-                                                                f"mode={row['failure_mode']}"
-                                                            )
-
-                                                    '''
 
     write_csv(run_summary_path, rows)
     aggregate_rows_data = aggregate_rows(rows, aggregate_metric_names)
