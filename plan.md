@@ -4001,3 +4001,116 @@ Everything for this Option B branch should be recorded in **this file**:
   - not as:
     - a demonstrated fix for best/export mismatch
     - or a demonstrated GT-quality improvement
+
+## 2026-04-07 Full Sweep Under The New Soft Prior
+
+- Goal:
+  - run the new soft-prior family once across all four datasets with one fixed
+    backbone, then summarize the actual results and exact configuration
+- Interpreted "new soft prior" configuration:
+  - `support_prior_algorithm = soft_patel`
+  - `direction_prior_algorithm = lag_gain`
+  - `direction_init_mode = lag_gain`
+  - keep the current stable non-prior backbone unchanged otherwise
+- Shared config across all four datasets:
+  - `seed = 11`
+  - `epochs = 40`
+  - `pretrain_checkpoint = .\results\run_20260405_202707\pretrained_encoder.pt`
+  - `structure_parameterization = support_direction`
+  - `fixed_support_mask_mode = maxgap_kappa`
+  - `structure_init_mode = patel_score`
+  - `support_prior_mode = patel_kappa`
+  - `directional_kappa_gate = on`
+  - `gradient_routing_mode = warmup_then_orthogonal`
+  - `detach_direction_from_main_after_epoch = 23`
+  - `causal_lag_main_weight = 0.25`
+  - `causal_lag_main_lags = 1,2`
+  - `soft_patel_K = 5`
+  - `soft_patel_beta = 10.0`
+  - `lag_gain_ridge_lambda = 1e-3`
+  - `lag_gain_score_alpha = 1.0`
+  - `training_noise_guide_mode = fixed_patel`
+    - note:
+      - this flag name is historical
+      - under this sweep it means "keep the fixed base guide built from the
+        current soft support prior", not "force Patel guidance back in"
+- Runs:
+  - `fMRI`
+    - `GraphExp/results/run_20260407_151924`
+  - `sim2`
+    - `GraphExp/results/run_20260407_152234`
+  - `sim3`
+    - `GraphExp/results/run_20260407_152704`
+  - `sim4`
+    - `GraphExp/results/run_20260407_153308`
+  - compact CSV summary:
+    - `GraphExp/results/soft_prior_full_sweep_20260407_summary.csv`
+- Result summary:
+  - `fMRI`
+    - best GT:
+      - epoch `8`
+      - strict `0.8000`
+      - mode `mixed_or_partial`
+    - exported:
+      - epoch `13`
+      - strict `0.6000`
+      - gap `-0.2000`
+    - final:
+      - epoch `40`
+      - strict `0.6000`
+      - gap `-0.2000`
+  - `sim2`
+    - best GT:
+      - epoch `18`
+      - strict `0.7273`
+      - mode `mixed_or_partial`
+    - exported:
+      - epoch `12`
+      - strict `0.7273`
+      - gap `+0.0000`
+    - final:
+      - epoch `40`
+      - strict `0.6364`
+      - gap `-0.0909`
+  - `sim3`
+    - best GT:
+      - epoch `8`
+      - strict `0.6111`
+      - mode `weak_asymmetry`
+    - exported:
+      - epoch `16`
+      - strict `0.5556`
+      - gap `-0.0556`
+    - final:
+      - epoch `40`
+      - strict `0.5556`
+      - gap `-0.0556`
+  - `sim4`
+    - best GT:
+      - epoch `4`
+      - strict `0.5000`
+      - mode `symmetric_collapse`
+    - exported:
+      - epoch `40`
+      - strict `0.3448`
+      - gap `-0.1552`
+    - final:
+      - epoch `40`
+      - strict `0.3448`
+      - gap `-0.1552`
+- Immediate read:
+  - the new soft-prior family is fully wired and runnable across all datasets
+  - but under the current backbone it does **not** look competitive as a
+    drop-in replacement for the stronger Patel-based direction signal
+  - degradation becomes more obvious as graph size grows:
+    - `sim3`
+      - weak asymmetry
+    - `sim4`
+      - clear symmetric collapse
+- Practical conclusion:
+  - do not promote this full `soft_patel + lag_gain` stack into the mainline
+    yet
+  - if revisited, it should be treated as:
+    - a new prior family that is implemented and benchmarked
+  - not as:
+    - a validated replacement for the current direction teacher

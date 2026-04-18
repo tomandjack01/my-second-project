@@ -1,0 +1,317 @@
+﻿diff --git a/GraphExp/main_structure_learning.py b/GraphExp/main_structure_learning.py
+index d040ae7..bbfdea6 100644
+--- a/GraphExp/main_structure_learning.py
++++ b/GraphExp/main_structure_learning.py
+@@ -31,6 +31,7 @@ import torch.nn.functional as F
+ 
+ from models import DDM
+ from utils.patel_util import compute_patel_components
++from utils.soft_prior_util import compute_soft_prior_components
+ 
+ 
+ # ============================================================================
+@@ -2367,6 +2368,7 @@ def train_brain_connectivity(
+     patel_matrix: torch.Tensor,
+     patel_direction_matrix: Optional[torch.Tensor] = None,
+     patel_strength_matrix: Optional[torch.Tensor] = None,
++    direction_prior_reliability_matrix: Optional[torch.Tensor] = None,
+     noise_guide_adj: Optional[torch.Tensor] = None,
+ 
+     num_epochs: int = 100,
+@@ -2667,6 +2669,13 @@ def train_brain_connectivity(
+         patel_strength_matrix = torch.clamp(0.5 * (patel_score_matrix + patel_score_matrix.t()), min=0.0)
+     else:
+         patel_strength_matrix = patel_strength_matrix.to(device)
++    if direction_prior_reliability_matrix is not None:
++        direction_prior_reliability_matrix = direction_prior_reliability_matrix.to(device)
++        if direction_prior_reliability_matrix.shape != patel_direction_matrix.shape:
++            raise ValueError(
++                "direction_prior_reliability_matrix must match patel_direction_matrix shape, "
++                f"got {tuple(direction_prior_reliability_matrix.shape)} vs {tuple(patel_direction_matrix.shape)}"
++            )
+     if directional_kappa_gate or ungated_symmetry_lambda > 0.0:
+         directional_pair_gate_matrix, directional_kappa_threshold, directional_kappa_gate_pair_frac = (
+             build_kappa_gate_matrix(
+@@ -2940,8 +2949,8 @@ def train_brain_connectivity(
+     fallback_best_score = -1.0
+     fallback_best_epoch = -1
+     fallback_best_quality_details = None
+-    patel_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
+-    patel_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
++    selector_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
++    selector_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
+     selection_top_k = target_edge_count if selection_top_k is None else int(selection_top_k)
+     quality_top_k = min(max(selection_top_k, 1), max(num_nodes * (num_nodes - 1) // 2, 1))
+     peak_eligible_skeleton_overlap = 0.0
+@@ -3174,6 +3183,7 @@ def train_brain_connectivity(
+                         causal_logits,
+                         patel_direction_matrix,
+                         pair_gate_matrix=directional_pair_gate_matrix,
++                        pair_reliability_matrix=direction_prior_reliability_matrix,
+                     )
+                 else:
+                     raw_loss_dir = torch.tensor(0.0, device=device)
+@@ -3362,6 +3372,7 @@ def train_brain_connectivity(
+                 patel_direction_matrix=patel_direction_matrix,
+                 directional_pair_gate_matrix=directional_pair_gate_matrix,
+                 lambda_dir_effective=grad_probe_lambda_dir,
++                direction_prior_reliability_matrix=direction_prior_reliability_matrix,
+                 main_routing=epoch_gradient_routing.main,
+                 structure_regularizer_routing=epoch_gradient_routing.structure_regularizers,
+                 seed=gradient_alignment_probe_seed,
+@@ -3387,6 +3398,7 @@ def train_brain_connectivity(
+                     causal_logits,
+                     probe_direction_prior,
+                     pair_gate_matrix=directional_pair_gate_matrix,
++                    pair_reliability_matrix=direction_prior_reliability_matrix,
+                 )
+             else:
+                 direction_margin_stats = {
+@@ -3405,6 +3417,7 @@ def train_brain_connectivity(
+                     causal_logits,
+                     probe_direction_prior,
+                     pair_gate_matrix=directional_pair_gate_matrix,
++                    pair_reliability_matrix=direction_prior_reliability_matrix,
+                 ).item()
+             else:
+                 raw_dir_snap = 0.0
+@@ -3502,8 +3515,8 @@ def train_brain_connectivity(
+         curr_adj_causal = adj_sigmoid_causal.cpu().numpy()
+         epoch_score, epoch_details = compute_epoch_quality(
+             curr_adj_causal,
+-            patel_direction_cpu,
+-            patel_strength_cpu,
++            selector_direction_cpu,
++            selector_strength_cpu,
+             top_k=quality_top_k,
+             agreement_weight=selection_agreement_weight,
+             fixed_support_mask_active=bool(fixed_support_mask is not None),
+@@ -4008,6 +4021,20 @@ def main():
+     parser.add_argument('--support_prior_mode', type=str, default='patel_kappa',
+                         choices=['patel_kappa', 'pearson_abs'],
+                         help='Symmetric support-prior source used by fixed support masks and the diffusion noise guide')
++    parser.add_argument('--support_prior_algorithm', type=str, default='patel',
++                        choices=['patel', 'soft_patel'],
++                        help='Algorithm used for kappa-like support-strength priors outside the Pearson-only support path')
++    parser.add_argument('--direction_prior_algorithm', type=str, default='patel',
++                        choices=['patel', 'lag_gain'],
++                        help='Algorithm used for directional priors and direction-bias side paths')
++    parser.add_argument('--soft_patel_K', type=int, default=5,
++                        help='Number of soft-event thresholds used by the soft Patel support prior')
++    parser.add_argument('--soft_patel_beta', type=float, default=10.0,
++                        help='Sigmoid sharpness for soft-event support computation')
++    parser.add_argument('--lag_gain_ridge_lambda', type=float, default=1e-3,
++                        help='Ridge penalty used by the lag-gain direction prior')
++    parser.add_argument('--lag_gain_score_alpha', type=float, default=1.0,
++                        help='Direction sensitivity for the asymmetric lag-gain structure-init score')
+     parser.add_argument('--structure_init_scale', type=float, default=1.0,
+                         help='Target std of initial structure logits after SVD-based rescaling; 0 disables directional init strength')
+     parser.add_argument('--emb_dim', type=int, default=0,
+@@ -4022,14 +4049,14 @@ def main():
+                         choices=['sigmoid', 'sparsemax', 'entmax15'],
+                         help='Adjacency activation: sigmoid = independent edges; sparsemax/entmax15 = competing parents per target')
+     parser.add_argument('--kappa_logit_bias_scale', type=float, default=0.0,
+-                        help='Persistent symmetric Patel-kappa bias added to structure logits during training')
++                        help='Persistent symmetric support-prior bias added to structure logits during training')
+     parser.add_argument('--direction_logit_bias_scale', type=float, default=0.0,
+-                        help='Persistent Patel-tau bias added to direction logits during training; for a pure residual setup prefer --direction_init_mode zeros or random')
++                        help='Persistent direction-prior bias added to direction logits during training; for a pure residual setup prefer --direction_init_mode zeros or random')
+     parser.add_argument('--fixed_support_mask_mode', type=str, default='none',
+                         choices=['none', 'topk_kappa', 'maxgap_kappa'],
+                         help='Optional fixed undirected support mask injected into support/direction factorization')
+     parser.add_argument('--direction_init_mode', type=str, default='patel_tau',
+-                        choices=['patel_tau', 'zeros', 'random'],
++                        choices=['patel_tau', 'lag_gain', 'zeros', 'random'],
+                         help='Initialization for the directional branch in support/direction factorization')
+ 
+     parser.add_argument('--selection_start_epoch', type=int, default=6,
+@@ -4272,6 +4299,16 @@ def main():
+         parser.error('--selection_primary_skeleton_tiebreak_weight must be >= 0')
+     if args.selection_primary_density_tiebreak_weight < 0.0:
+         parser.error('--selection_primary_density_tiebreak_weight must be >= 0')
++    if args.soft_patel_K <= 0:
++        parser.error('--soft_patel_K must be > 0')
++    if args.soft_patel_beta <= 0.0:
++        parser.error('--soft_patel_beta must be > 0')
++    if args.lag_gain_ridge_lambda < 0.0:
++        parser.error('--lag_gain_ridge_lambda must be >= 0')
++    if args.lag_gain_score_alpha < 0.0:
++        parser.error('--lag_gain_score_alpha must be >= 0')
++    if args.direction_init_mode == 'lag_gain' and args.direction_prior_algorithm != 'lag_gain':
++        parser.error('--direction_init_mode lag_gain requires --direction_prior_algorithm lag_gain')
+ 
+     try:
+         causal_lag_main_lags, causal_lag_main_lag_weights = resolve_lag_weight_spec(
+@@ -4316,6 +4353,8 @@ def main():
+     print("=" * 60)
+ 
+     print(f"Device: {args.device}")
++    print(f"Support prior algorithm: {args.support_prior_algorithm}")
++    print(f"Direction prior algorithm: {args.direction_prior_algorithm}")
+     print(f"Support prior mode: {args.support_prior_mode}")
+ 
+     print(f"Time points per subject (raw): {args.time_points}")
+@@ -4417,21 +4456,76 @@ def main():
+     patel_score_matrix = torch.from_numpy(patel_score_np).float()
+     patel_kappa_matrix = torch.from_numpy(patel_kappa_np).float()
+     patel_tau_matrix = torch.from_numpy(patel_tau_np).float()
++    soft_support_np = None
++    lag_direction_np = None
++    direction_reliability_np = None
++    asymmetric_score_np = None
++    soft_support_matrix = None
++    lag_direction_matrix = None
++    direction_reliability_matrix = None
++    asymmetric_score_matrix = None
+ 
+     print(f"Patel score range: [{patel_score_matrix.min():.4f}, {patel_score_matrix.max():.4f}]")
+     print(f"Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
+     print(f"Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
+ 
++    if args.support_prior_algorithm == 'soft_patel' or args.direction_prior_algorithm == 'lag_gain':
++        print("\nComputing soft support / lag-gain prior components...")
++        soft_support_np, lag_direction_np, direction_reliability_np, asymmetric_score_np = (
++            compute_soft_prior_components(
++                data_3d=data_3d,
++                K=args.soft_patel_K,
++                beta=args.soft_patel_beta,
++                lags=causal_lag_main_lags,
++                lag_weights=causal_lag_main_lag_weights,
++                ridge_lambda=args.lag_gain_ridge_lambda,
++                score_alpha=args.lag_gain_score_alpha,
++            )
++        )
++        soft_support_matrix = torch.from_numpy(soft_support_np).float()
++        lag_direction_matrix = torch.from_numpy(lag_direction_np).float()
++        direction_reliability_matrix = torch.from_numpy(direction_reliability_np).float()
++        asymmetric_score_matrix = torch.from_numpy(asymmetric_score_np).float()
++        print(
++            f"Soft support range: [{soft_support_matrix.min():.4f}, {soft_support_matrix.max():.4f}] "
++            f"(K={args.soft_patel_K}, beta={args.soft_patel_beta:g})"
++        )
++        print(
++            f"Lag direction range: [{lag_direction_matrix.min():.4f}, {lag_direction_matrix.max():.4f}] "
++            f"(lags={list(causal_lag_main_lags)})"
++        )
++        print(
++            "Direction reliability range: "
++            f"[{direction_reliability_matrix.min():.4f}, {direction_reliability_matrix.max():.4f}]"
++        )
++
++    effective_kappa_matrix = (
++        soft_support_matrix if args.support_prior_algorithm == 'soft_patel' else patel_kappa_matrix
++    )
++    effective_tau_matrix = (
++        lag_direction_matrix if args.direction_prior_algorithm == 'lag_gain' else patel_tau_matrix
++    )
++    effective_reliability_matrix = (
++        direction_reliability_matrix if args.direction_prior_algorithm == 'lag_gain' else None
++    )
++    effective_score_matrix = patel_score_matrix
++    if (
++        args.support_prior_algorithm == 'soft_patel' and
++        args.direction_prior_algorithm == 'lag_gain' and
++        asymmetric_score_matrix is not None
++    ):
++        effective_score_matrix = asymmetric_score_matrix.t()
++
+     structure_init_matrix = build_structure_init_matrix(
+         mode=args.structure_init_mode,
+-        patel_score_matrix=patel_score_matrix,
+-        patel_kappa_matrix=patel_kappa_matrix,
++        patel_score_matrix=effective_score_matrix,
++        patel_kappa_matrix=effective_kappa_matrix,
+         pearson_matrix=pearson_matrix.float(),
+         seed=args.seed,
+     )
+     support_prior_matrix = build_support_prior_matrix(
+         mode=args.support_prior_mode,
+-        patel_kappa_matrix=patel_kappa_matrix,
++        patel_kappa_matrix=effective_kappa_matrix,
+         pearson_matrix=pearson_matrix.float(),
+     )
+     print(f"Structure init mode: {args.structure_init_mode} | "
+@@ -4443,14 +4537,15 @@ def main():
+         print(f"Support/direction factorization: enabled | direction_init={args.direction_init_mode} | "
+               f"fixed_support_mask={args.fixed_support_mask_mode}")
+     if args.kappa_logit_bias_scale != 0.0:
++        effective_kappa_sym = torch.maximum(effective_kappa_matrix, effective_kappa_matrix.t())
+         print(
+             "Kappa logit bias: enabled | "
+             f"scale={args.kappa_logit_bias_scale} | "
+-            f"sym_range=[{torch.clamp(patel_kappa_matrix, min=0.0).min():.4f}, "
+-            f"{torch.clamp(patel_kappa_matrix, min=0.0).max():.4f}]"
++            f"sym_range=[{torch.clamp(effective_kappa_sym, min=0.0).min():.4f}, "
++            f"{torch.clamp(effective_kappa_sym, min=0.0).max():.4f}]"
+         )
+     if args.direction_logit_bias_scale != 0.0:
+-        tau_contrast = patel_tau_matrix - patel_tau_matrix.t()
++        tau_contrast = effective_tau_matrix - effective_tau_matrix.t()
+         print(
+             "Direction logit bias: enabled | "
+             f"scale={args.direction_logit_bias_scale} | "
+@@ -4476,7 +4571,7 @@ def main():
+               f"warmup={args.ungated_symmetry_warmup_epochs} | "
+               f"ramp={args.ungated_symmetry_ramp_epochs}")
+     if not args.disable_directional_loss:
+-        print(f"Directional prior: enabled | source=patel_tau | "
++        print(f"Directional prior: enabled | source={args.direction_prior_algorithm} | "
+               f"schedule={args.directional_schedule} | "
+               f"target_ratio={args.directional_target_ratio} | "
+               f"end_epoch={args.directional_loss_end_epoch}")
+@@ -4520,6 +4615,12 @@ def main():
+ 
+     if args.direction_init_mode == 'patel_tau':
+         direction_init_matrix = patel_tau_matrix.clone()
++    elif args.direction_init_mode == 'lag_gain':
++        if args.direction_prior_algorithm != 'lag_gain' or lag_direction_matrix is None:
++            raise ValueError(
++                "direction_init_mode='lag_gain' requires direction_prior_algorithm='lag_gain'"
++            )
++        direction_init_matrix = lag_direction_matrix.clone()
+     elif args.direction_init_mode == 'zeros':
+         direction_init_matrix = torch.zeros_like(patel_tau_matrix)
+     else:
+@@ -4538,14 +4639,19 @@ def main():
+     os.makedirs(result_dir, exist_ok=True)
+ 
+     print(f"\nResults will be saved to: {result_dir}")
++    if soft_support_np is not None:
++        np.save(os.path.join(result_dir, 'soft_support.npy'), soft_support_np)
++        np.save(os.path.join(result_dir, 'lag_direction.npy'), lag_direction_np)
++        np.save(os.path.join(result_dir, 'direction_reliability.npy'), direction_reliability_np)
++        np.save(os.path.join(result_dir, 'asymmetric_score.npy'), asymmetric_score_np)
+ 
+     
+ 
+     # Step 6: Train model
+ 
+     # - structure_init_matrix: chosen matrix for sender/receiver initialization
+-    # - patel_tau_matrix: weak directional prior only
+-    # - patel_kappa_matrix: skeleton prior for proxy scoring / noise guidance
++    # - effective_tau_matrix: weak directional prior only
++    # - effective_kappa_matrix: skeleton prior for proxy scoring / noise guidance
+ 
+     model, adj_matrix, loss_history, collapse_history, best_epoch = train_brain_connectivity(
+ 
+@@ -4560,8 +4666,9 @@ def main():
+         noise_guide_adj=noise_guide_adj,  # For neighbor-based noise
+ 
+         patel_matrix=structure_init_matrix,  # Chosen matrix for SVD init
+-        patel_direction_matrix=patel_tau_matrix,  # Pure direction prior for margin loss
+-        patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),  # Skeleton prior
++        patel_direction_matrix=effective_tau_matrix,  # Pure direction prior for margin loss
++        patel_strength_matrix=effective_kappa_matrix,  # Skeleton prior for selector / gates / bias
++        direction_prior_reliability_matrix=effective_reliability_matrix,
+         target_edge_count=k_pairs,
+ 
+         num_epochs=args.epochs,
+@@ -4998,6 +5105,8 @@ def main():
+     print(f"  - pearson_matrix.csv")
+ 
+     print(f"  - patel_score.csv / patel_kappa.csv / patel_tau.csv")
++    if soft_support_np is not None:
++        print(f"  - soft_support.npy / lag_direction.npy / direction_reliability.npy / asymmetric_score.npy")
+ 
+     print(f"  - config.npy")
+ 

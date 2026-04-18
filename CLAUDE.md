@@ -92,7 +92,7 @@ python main_structure_learning.py --epochs 100 --disable_temporal_encoder
 - `build_noise()`: 构建邻居引导的各向异性噪声（基于固定 noise_guide_adj）
 - `sample_q()`: 前向扩散 $x_t = \sqrt{\bar\alpha_t} x_0 + \sqrt{1 - \bar\alpha_t} \epsilon'$
 - `node_denoising()`: 去噪损失计算（smooth_l1 + cosine hybrid）
-- `Denoising_Unet`: GAT-based U-Net 去噪网络（encoder-decoder with skip connections）
+- `Denoising_Unet`: GraphConv/GCN-based U-Net 去噪网络（encoder-decoder with skip connections）
 - `CausalConv1d`: 因果一维卷积（left-padding + truncation）
 - `NodeSpecificTemporalEncoder`: 因果膨胀时序编码器（可选，默认开启）
 

@@ -442,7 +442,7 @@ $$q_{00}^{(s,k)}(i,j) = \frac{1}{T_s} \sum_{t=1}^{T_s} \big(1 - \phi_{i,k}^{(s)}
 
 $$\bar{q}_{ab}^{(k)}(i,j) = \frac{\sum_s T_s \cdot q_{ab}^{(s,k)}(i,j)}{\sum_s T_s}$$
 
-当所有 $T_s$ 相等时，这等价于在 per-subject-normalized 拼接数据上直接计算。
+这在数学上等价于先做 per-subject normalization，再按时间点数拼接后整体求平均。无论各 subject 的 $T_s$ 是否相等都成立。
 
 #### 5.2.4 Bounded normalization（直接沿用 Patel 数学骨架）
 
@@ -625,7 +625,7 @@ weight_matrix = weight_matrix * reliability  # L1124
 >
 > ```python
 > if num_subjects < 5:
->     R_D = np.ones_like(delta_aggregated)
+>     R_D = np.ones((N, N))  # N = num_nodes
 > ```
 
 ### 5.5 Step 5: Asymmetric Init Score ($A$)
@@ -763,8 +763,13 @@ else:
     effective_reliability = None
 
 # Structure init：如果两个新算法都启用，用 A
+# 注意：A 是 causal convention [cause, effect]，patel_score 是 raw convention [effect, cause]
 if args.support_prior_algorithm == 'soft_patel' and args.direction_prior_algorithm == 'lag_gain':
-    effective_score = torch.from_numpy(A).float()        # 替换 patel_score
+    A_tensor = torch.from_numpy(A).float()
+    if args.structure_init_mode in ('patel_score', 'neg_patel_score'):
+        effective_score = A_tensor.t()                    # causal -> raw
+    else:  # patel_score_t, neg_patel_score_t, etc.
+        effective_score = A_tensor                        # causal as-is
 else:
     effective_score = patel_score_matrix                  # 保持原样
 ```
@@ -803,7 +808,12 @@ if args.direction_init_mode == 'patel_tau':
 
 ```python
 elif args.direction_init_mode == 'lag_gain':
-    direction_init_matrix = effective_tau.clone()  # D matrix
+    if args.direction_prior_algorithm != 'lag_gain':
+        raise ValueError(
+            "direction_init_mode='lag_gain' requires direction_prior_algorithm='lag_gain', "
+            f"but got '{args.direction_prior_algorithm}'"
+        )
+    direction_init_matrix = torch.from_numpy(D).float().clone()  # 直接从原始 D 取值，不经过 effective_tau
 ```
 
 #### (d) R^D 主训练接线（新增 plumbing）

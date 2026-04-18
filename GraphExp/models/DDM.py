@@ -160,12 +160,14 @@ class DDM(nn.Module):
             preserve_noise_sign: bool = False,
             emb_dim: Optional[int] = None,  # None = full rank (N)
             structure_parameterization: str = 'coupled',  # coupled = one matrix; support_direction = symmetric support + pairwise direction split
+            direction_parameterization: str = 'factorized',  # factorized = sender/receiver matrix; skew_matrix = direct skew contrast parameter
             structure_message_graph_mode: str = 'raw',  # raw uses internal [effect,cause], causal uses transpose
+            structure_message_edge_mode: str = 'full',  # full uses support*direction; support_only removes direction; support_only_preserve_budget keeps pair budget matched
             adj_activation: str = 'sigmoid',  # sigmoid = independent edges; sparsemax/entmax15 = competing parents
             adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
             init_logit_scale: float = 1.0,  # Target std of initial structure logits after rescaling
-            kappa_logit_bias_scale: float = 0.0,  # Persistent symmetric Patel-kappa bias added to structure logits
-            direction_logit_bias_scale: float = 0.0,  # Persistent Patel-tau bias added to direction logits
+            kappa_logit_bias_scale: float = 0.0,  # Persistent symmetric support-prior bias added to structure logits
+            direction_logit_bias_scale: float = 0.0,  # Persistent direction-prior bias added to direction logits
             # Temporal encoder parameters
             temporal_hidden_channels: int = 32,
             use_temporal_encoder: bool = True,
@@ -250,7 +252,7 @@ class DDM(nn.Module):
         self.direction_logit_bias_scale = float(direction_logit_bias_scale)
         if direction_logit_bias_prior is not None:
             # Store half of the skew-symmetric prior so the downstream
-            # direction_gate = sigmoid(D - D^T) receives the full Patel tau
+            # direction_gate = sigmoid(D - D^T) receives the full direction
             # contrast after the transpose subtraction.
             direction_logit_bias_prior = 0.5 * (
                 direction_logit_bias_prior - direction_logit_bias_prior.transpose(0, 1)
@@ -284,11 +286,37 @@ class DDM(nn.Module):
                 f"structure_parameterization must be one of ['coupled', 'support_direction'], got {structure_parameterization}"
             )
         self.structure_parameterization = structure_parameterization
+        if direction_parameterization not in {'factorized', 'skew_matrix'}:
+            raise ValueError(
+                "direction_parameterization must be one of "
+                f"['factorized', 'skew_matrix'], got {direction_parameterization}"
+            )
+        self.direction_parameterization = direction_parameterization
         if structure_message_graph_mode not in {'raw', 'causal'}:
             raise ValueError(
                 f"structure_message_graph_mode must be 'raw' or 'causal', got {structure_message_graph_mode}"
             )
         self.structure_message_graph_mode = structure_message_graph_mode
+        if structure_message_edge_mode not in {
+            'full',
+            'support_only',
+            'support_only_preserve_budget',
+        }:
+            raise ValueError(
+                "structure_message_edge_mode must be one of "
+                "['full', 'support_only', 'support_only_preserve_budget'], "
+                f"got {structure_message_edge_mode}"
+            )
+        if (
+            structure_message_edge_mode != 'full' and
+            structure_parameterization != 'support_direction'
+        ):
+            raise ValueError(
+                "structure_message_edge_mode in "
+                "['support_only', 'support_only_preserve_budget'] requires "
+                "structure_parameterization='support_direction'"
+            )
+        self.structure_message_edge_mode = structure_message_edge_mode
         if adj_activation not in {'sigmoid', 'sparsemax', 'entmax15'}:
             raise ValueError(
                 f"adj_activation must be one of ['sigmoid', 'sparsemax', 'entmax15'], got {adj_activation}"
@@ -311,13 +339,21 @@ class DDM(nn.Module):
             if self.structure_parameterization == 'support_direction':
                 if direction_init_features is None:
                     direction_init_features = torch.zeros_like(init_features)
-                direction_sender, direction_receiver = self._factorized_init_from_matrix(
-                    direction_init_features.float(),
-                    emb_dim=self.emb_dim,
-                    target_std=init_logit_scale,
-                )
-                self.direction_emb_sender = nn.Parameter(direction_sender)
-                self.direction_emb_receiver = nn.Parameter(direction_receiver)
+                if self.direction_parameterization == 'factorized':
+                    direction_sender, direction_receiver = self._factorized_init_from_matrix(
+                        direction_init_features.float(),
+                        emb_dim=self.emb_dim,
+                        target_std=init_logit_scale,
+                    )
+                    self.direction_emb_sender = nn.Parameter(direction_sender)
+                    self.direction_emb_receiver = nn.Parameter(direction_receiver)
+                else:
+                    direction_matrix = self._rescale_matrix_init(
+                        direction_init_features.float(),
+                        target_std=init_logit_scale,
+                        skew_only=True,
+                    )
+                    self.direction_logits_param = nn.Parameter(direction_matrix)
             # Learnable sparsity bias: shifts all logits to encourage sparse output
             if adj_bias_init is not None:
                 self.adj_bias = nn.Parameter(torch.tensor(float(adj_bias_init)))
@@ -333,11 +369,14 @@ class DDM(nn.Module):
             self.register_buffer('diag_mask', 1.0 - torch.eye(N))
             self.num_nodes = N
             print(f"Structure parameterization mode: {self.structure_parameterization}")
+            if self.structure_parameterization == 'support_direction':
+                print(f"Direction parameterization mode: {self.direction_parameterization}")
             print(
                 "Structure message graph mode: "
                 f"{self.structure_message_graph_mode} "
                 f"({'cause->effect' if self.structure_message_graph_mode == 'causal' else 'raw internal convention'})"
             )
+            print(f"Structure message edge mode: {self.structure_message_edge_mode}")
             print(f"Structure adjacency activation: {self.adj_activation}")
             if self.kappa_logit_bias_prior is not None and abs(self.kappa_logit_bias_scale) > 0.0:
                 print(
@@ -381,6 +420,23 @@ class DDM(nn.Module):
             scale = math.sqrt(target_std / (logit_std + 1e-8)) if target_std > 0 else 0.0
         return raw_sender * scale, raw_receiver * scale
 
+    def _rescale_matrix_init(
+        self,
+        matrix: torch.Tensor,
+        target_std: float,
+        *,
+        skew_only: bool = False,
+    ) -> torch.Tensor:
+        """Rescale a direct matrix init so the effective logits match target_std."""
+        work = matrix
+        if skew_only:
+            work = 0.5 * (work - work.transpose(0, 1))
+        with torch.no_grad():
+            current_std = work.std()
+            target_std = max(float(target_std), 0.0)
+            scale = (target_std / (current_std + 1e-8)) if target_std > 0 else 0.0
+        return matrix * scale
+
     def get_structure_logits(self):
         """Return the clamped structure logits used everywhere downstream."""
         if not self.structure_learning_mode:
@@ -396,12 +452,56 @@ class DDM(nn.Module):
         """Return raw pairwise directional logits for support/direction factorization."""
         if self.structure_parameterization != 'support_direction':
             return self.get_structure_logits()
-        direction_logits = self.direction_emb_sender @ self.direction_emb_receiver.T
+        if self.direction_parameterization == 'factorized':
+            direction_logits = self.direction_emb_sender @ self.direction_emb_receiver.T
+        else:
+            direction_logits = 0.5 * (
+                self.direction_logits_param - self.direction_logits_param.transpose(0, 1)
+            )
         if self.direction_logit_bias_prior is not None and abs(self.direction_logit_bias_scale) > 0.0:
             direction_logits = (
                 direction_logits + self.direction_logit_bias_scale * self.direction_logit_bias_prior
             )
         return torch.clamp(direction_logits, -6.0, 6.0)
+
+    def _get_support_direction_components(
+        self,
+        detach_direction_gate: bool = False,
+        detach_support_weights: bool = False,
+    ) -> tuple:
+        """Return symmetric support weights and directional gate for support_direction mode."""
+        if self.structure_parameterization != 'support_direction':
+            raise RuntimeError("_get_support_direction_components requires support_direction mode.")
+        support_logits = self.get_structure_logits()
+        support_weights = torch.sigmoid(support_logits)
+        if detach_support_weights:
+            support_weights = support_weights.detach()
+        support_weights = support_weights * self.diag_mask.to(support_weights.device)
+        if self.fixed_support_mask is not None:
+            support_weights = support_weights * self.fixed_support_mask.to(support_weights.device)
+        direction_logits = self.get_direction_logits()
+        direction_gate = torch.sigmoid(direction_logits - direction_logits.transpose(0, 1))
+        if detach_direction_gate:
+            direction_gate = direction_gate.detach()
+        return support_weights, direction_gate
+
+    def _compose_message_edge_weights(
+        self,
+        support_weights: torch.Tensor,
+        direction_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compose message-edge weights under the configured support/direction readout."""
+        if self.structure_message_edge_mode == 'full':
+            return support_weights * direction_gate
+        if self.structure_message_edge_mode == 'support_only':
+            return support_weights
+        if self.structure_message_edge_mode == 'support_only_preserve_budget':
+            # Keep the undirected pair budget matched to full mode:
+            # full => A_ij + A_ji = s, preserve_budget => 0.5*s + 0.5*s = s.
+            return 0.5 * support_weights
+        raise RuntimeError(
+            f"Unsupported structure_message_edge_mode: {self.structure_message_edge_mode}"
+        )
 
     def get_structure_adj(
         self,
@@ -410,17 +510,10 @@ class DDM(nn.Module):
     ):
         """Return the masked adjacency matrix used for graph weights and export."""
         if self.structure_parameterization == 'support_direction':
-            support_logits = self.get_structure_logits()
-            support_weights = torch.sigmoid(support_logits)
-            if detach_support_weights:
-                support_weights = support_weights.detach()
-            support_weights = support_weights * self.diag_mask.to(support_weights.device)
-            if self.fixed_support_mask is not None:
-                support_weights = support_weights * self.fixed_support_mask.to(support_weights.device)
-            direction_logits = self.get_direction_logits()
-            direction_gate = torch.sigmoid(direction_logits - direction_logits.transpose(0, 1))
-            if detach_direction_gate:
-                direction_gate = direction_gate.detach()
+            support_weights, direction_gate = self._get_support_direction_components(
+                detach_direction_gate=detach_direction_gate,
+                detach_support_weights=detach_support_weights,
+            )
             adj_weights = support_weights * direction_gate
         else:
             adj_logits = self.get_structure_logits()
@@ -448,10 +541,20 @@ class DDM(nn.Module):
         `causal` transposes into A_msg[cause, effect] so message edges follow
         cause -> effect semantics.
         """
-        adj_weights = self.get_structure_adj(
-            detach_direction_gate=detach_direction_gate,
-            detach_support_weights=detach_support_weights,
-        )
+        if self.structure_parameterization == 'support_direction':
+            support_weights, direction_gate = self._get_support_direction_components(
+                detach_direction_gate=detach_direction_gate,
+                detach_support_weights=detach_support_weights,
+            )
+            adj_weights = self._compose_message_edge_weights(
+                support_weights,
+                direction_gate,
+            )
+        else:
+            adj_weights = self.get_structure_adj(
+                detach_direction_gate=detach_direction_gate,
+                detach_support_weights=detach_support_weights,
+            )
         if self.structure_message_graph_mode == 'causal':
             return adj_weights.transpose(0, 1)
         return adj_weights

@@ -1,6 +1,6 @@
 # Mainline Constriction Log
 
-Last updated: 2026-03-29
+Last updated: 2026-04-08
 
 ## Why Constrict Now
 
@@ -1469,7 +1469,7 @@ Separate checkpoint-selection failures from training-mechanism failures.
 - Objective:
   - test whether the `fMRI.csv` retention fix
     - `detach_direction_from_main_after_epoch`
-    transfers to `sim4`
+      transfers to `sim4`
   - and explicitly inspect the full epoch-level strict-F1 trajectory, because
     `sim4` had already shown later GT-best epochs in earlier runs
 - Shared setup:
@@ -2183,7 +2183,7 @@ Separate checkpoint-selection failures from training-mechanism failures.
   - but the selector signals that turned out to matter in recent audits:
     - `selection_causal_lag_delta_mean`
     - `selection_causal_lag_delta_std`
-    are still selection-only diagnostics, not training objectives
+      are still selection-only diagnostics, not training objectives
 - More precise design target:
   - keep the existing two-stage interpretation:
     1. before detach:
@@ -2305,26 +2305,26 @@ run_20260331_191723            15      15       0,0         0.9444 @ 15    0.944
 run_20260331_190749            15      15       1,10        0.9444 @ 18    0.9444 @ 15   0.8333 @ 30
 ```
 
-  - corrected-timing detail:
-    - `detach = 15` no-post:
-      - best / exported / final all landed on the same strict-F1 plateau:
-        `0.9444`
-      - final no longer drifted away from the GT-best region
-    - `detach = 15` + post objective:
-      - exported still hit the best plateau
-      - but final fell back to `0.8333`
-  - post-detach trajectory contrast on the corrected-timing pair:
-    - no-post:
-      - from epoch `15` to `30`, selector lag stats changed only gently:
-        - `delta_mean`: `0.0010  0.0025`
-        - `delta_std`: `0.0055  0.0045`
-      - strict-F1 stayed flat at `0.9444`
-    - with post objective:
-      - after detach, the new objective kept pushing the branch:
-        - `post_detach_direction_delta_mean`: `0.0010  0.0114`
-        - `selection_causal_lag_delta_std`: `0.0055  0.0103`
-      - strict-F1 dropped:
-        - `0.9444  0.8333`
+- corrected-timing detail:
+  - `detach = 15` no-post:
+    - best / exported / final all landed on the same strict-F1 plateau:
+      `0.9444`
+    - final no longer drifted away from the GT-best region
+  - `detach = 15` + post objective:
+    - exported still hit the best plateau
+    - but final fell back to `0.8333`
+- post-detach trajectory contrast on the corrected-timing pair:
+  - no-post:
+    - from epoch `15` to `30`, selector lag stats changed only gently:
+      - `delta_mean`: `0.0010  0.0025`
+      - `delta_std`: `0.0055  0.0045`
+    - strict-F1 stayed flat at `0.9444`
+  - with post objective:
+    - after detach, the new objective kept pushing the branch:
+      - `post_detach_direction_delta_mean`: `0.0010  0.0114`
+      - `selection_causal_lag_delta_std`: `0.0055  0.0103`
+    - strict-F1 dropped:
+      - `0.9444  0.8333`
 - Interpretation:
   - the first important finding is about **timing**, not about the new loss:
     - under `batch_mean`, `sim3`'s GT-best window moved to around epoch `15`
@@ -2422,33 +2422,33 @@ run_20260331_201124               27      27       0,0         0.8033 @ 27    0.
 run_20260331_211150               27      27       1,10        0.8033 @ 28    0.7705 @ 22   0.7869 @ 40
 ```
 
-  - `batch_mean` baseline read:
-    - the GT-best window moved to around epoch `27`
-    - exported still came from epoch `22`
-    - final dropped by `-0.0492` vs best GT
-  - aligned timing without the new loss:
-    - final drift disappeared
-    - from epoch `27` onward, strict-F1 stayed on the best plateau:
-      - epoch `27`: `0.8033`
-      - epoch `30`: `0.8033`
-      - epoch `40`: `0.8033`
-    - selector still exported epoch `22`, so the residual problem was selection,
-      not retention
-  - aligned timing with the new post-detach objective:
-    - the new objective strongly increased late lag-direction separation:
-      - `post_detach_direction_delta_mean`:
-        - epoch `28`: `0.0024`
-        - epoch `30`: `0.0079`
-        - epoch `40`: `0.0147`
-      - `selection_causal_lag_delta_mean`:
-        - epoch `28`: `0.0037`
-        - epoch `30`: `0.0090`
-        - epoch `40`: `0.0148`
-    - but GT quality did not improve:
-      - final only reached `0.7869`
-      - this is better than the no-detach final `0.7541`
-      - but worse than the aligned no-post final `0.8033`
-    - selector still exported epoch `22`
+- `batch_mean` baseline read:
+  - the GT-best window moved to around epoch `27`
+  - exported still came from epoch `22`
+  - final dropped by `-0.0492` vs best GT
+- aligned timing without the new loss:
+  - final drift disappeared
+  - from epoch `27` onward, strict-F1 stayed on the best plateau:
+    - epoch `27`: `0.8033`
+    - epoch `30`: `0.8033`
+    - epoch `40`: `0.8033`
+  - selector still exported epoch `22`, so the residual problem was selection,
+    not retention
+- aligned timing with the new post-detach objective:
+  - the new objective strongly increased late lag-direction separation:
+    - `post_detach_direction_delta_mean`:
+      - epoch `28`: `0.0024`
+      - epoch `30`: `0.0079`
+      - epoch `40`: `0.0147`
+    - `selection_causal_lag_delta_mean`:
+      - epoch `28`: `0.0037`
+      - epoch `30`: `0.0090`
+      - epoch `40`: `0.0148`
+  - but GT quality did not improve:
+    - final only reached `0.7869`
+    - this is better than the no-detach final `0.7541`
+    - but worse than the aligned no-post final `0.8033`
+  - selector still exported epoch `22`
 - Interpretation:
   - the first decisive `sim4 batch_mean` finding matches the updated `sim3`
     mechanism reading:
@@ -3578,7 +3578,7 @@ to this file with:
   - selection
 - Purpose:
   - check whether the current weakness of the `random structure init + kappa
-    gate on` branch is still mainly selector-side by replaying multiple selector
+gate on` branch is still mainly selector-side by replaying multiple selector
     scores on the **same** audited training trajectory
 - Fixed trajectory:
   - run:
@@ -3619,7 +3619,7 @@ to this file with:
   - even a pure offline replay, without changing one training gradient, can move
     exported quality from:
     - `0.770492`
-    to:
+      to:
     - `0.836066` with `causal_lag_composite`
     - `0.852459` with `causal_lag_primary`
 - Current decision:
@@ -4034,6 +4034,95 @@ to this file with:
     - epoch `10`
     - strict `0.8197`
 - Correct interpretation:
+
+### 2026-04-08 - Lag-gain direction prior falsified as direction teacher
+
+- Branch line:
+  - mechanism (prior replacement)
+- Datasets:
+  - all four (`fMRI`, `sim2`, `sim3`, `sim4`)
+- Exact claim tested:
+  - Whether `lag_gain` (self-history-conditioned lagged predictive gain) can
+    replace Patel tau as the direction teacher in the `support_direction`
+    factorization pipeline
+- Implementation status:
+  - `soft_prior_util.py` implemented and integrated
+  - CLI switches `--support_prior_algorithm`, `--direction_prior_algorithm`
+    wired end-to-end
+  - `R^D` reliability plumbed into `compute_directional_margin_loss`
+  - Prior compare batch runner executed across all 4 datasets
+- Quantitative evidence — GT direction accuracy on true edges:
+
+  | Dataset | Lag-gain correct | Patel Tau correct | Gap    |
+  | ------- | ---------------- | ----------------- | ------ |
+  | fMRI    | 60.0% (3/5)      | 80.0% (4/5)       | −20 pp |
+  | sim2    | 63.6% (7/11)     | 90.9% (10/11)     | −27 pp |
+  | sim3    | 66.7% (12/18)    | 77.8% (14/18)     | −11 pp |
+  | sim4    | 55.7% (34/61)    | 77.0% (47/61)     | −21 pp |
+
+- Quantitative evidence — signal amplitude:
+
+  | Metric | Lag-gain | Patel Tau | Ratio  |
+  | ------ | -------- | --------- | ------ | ----- | --------- |
+  | `      | delta    | ` mean    | ~0.001 | ~0.14 | **~140×** |
+
+  `delta = D − D.T` (direction contrast). Lag-gain's direction contrast is
+  indistinguishable from numerical noise at `0.001`-level.
+
+- Quantitative evidence — end-to-end F1 (prior_compare batch `20260406_191524`, 12 epochs):
+
+  | Dataset | Baseline Patel best-GT F1 | Lag-gain best-GT F1 | Delta |
+  | ------- | ------------------------- | ------------------- | ----- |
+  | fMRI    | 0.5333                    | 0.5333              | 0     |
+  | sim2    | 0.3214                    | 0.3214              | 0     |
+  | sim3    | 0.2439                    | 0.2439              | 0     |
+  | sim4    | 0.0747                    | 0.0747              | 0     |
+
+  No improvement on any dataset. Failure mode consistently `weak_asymmetry`
+  or `wrong_direction_asymmetry` on larger graphs.
+
+- Root cause analysis:
+  1. **T=200 too short for lag-gain regression** — 195 effective samples with
+     10 parameters (5 lags × 2 for self + source), augmented R² at noise level
+  2. **Lag-gain direction contrast ~0.001** — 140× weaker than Patel tau;
+     `build_directional_active_mask` treats `sign(delta)` as hard label,
+     turning noise-level differences into supervision targets
+  3. **Lag-gain accuracy < Patel tau on all 4 datasets** — not just weak, but
+     strictly worse than the baseline it was meant to replace; sim4 at 55.7%
+     is barely above random (50%)
+  4. **Downstream amplification** — `lambda_dir` auto-scaling and `sign()`
+     extraction compound the problem by treating noisy direction contrasts as
+     confident labels
+
+- Evaluated repair proposals (all insufficient):
+  - "Pre-training audit gate" → would reject lag_gain on all 4 datasets,
+    equivalent to disabling it entirely
+  - "Significance-based active mask" → filters quantity but not accuracy;
+    surviving edges still have worse direction calls than Patel tau
+  - "Reliability-based direction gate" → `R^D` measures cross-subject
+    consistency, not correctness; consistently wrong edges score high
+
+- Decision:
+  - **Falsified**: `lag_gain` as direction teacher under current data
+    conditions (T=200, simulated fMRI)
+  - `direction_prior_algorithm` default stays `patel`
+  - `soft_patel` support (S matrix) is neutral-to-equivalent with `patel_kappa`;
+    retained as optional but not promoted to default
+  - Code for `lag_gain` and `soft_patel` preserved for future evaluation with
+    longer time series (T ≥ 1000)
+  - Record in `CLAUDE.md` "已证伪" table
+
+- Key run dirs:
+  - `results/prior_compare_20260406_191524` (4-dataset, 12-epoch, patel vs
+    lag_gain with zero direction init)
+  - `results/prior_compare_20260406_174602` (4-dataset, 6-epoch, 4 variants
+    including soft_patel + lag_gain)
+  - `results/run_20260406_192310` (sim4 lag_gain, has `lag_direction.npy`)
+  - `results/run_20260406_191902` (sim3 lag_gain, has `lag_direction.npy`)
+
+- Stop condition:
+  - met — lag_gain is strictly dominated by Patel tau on accuracy, amplitude,
+    and end-to-end F1; no further tuning warranted on current data
   - this run proves the scheduled-blend branch is now a **real training
     mechanism**, not just a probe
   - it does **not** yet prove that scheduled blend improves the model
@@ -4113,7 +4202,7 @@ to this file with:
     - exported strict F1
     - final strict F1
     - best/export gap
-  - what it **did** improve is the *shape* of the late adjacency:
+  - what it **did** improve is the _shape_ of the late adjacency:
     - less concentrated
     - fewer extreme spikes
     - slightly higher parent entropy
@@ -4127,3 +4216,55 @@ to this file with:
   - if revisited later, treat it as:
     - a collapse-shape control
     - not a demonstrated accuracy improvement
+
+### 2026-04-07 - Full four-dataset sweep of the new soft prior family
+
+- Shared tested stack:
+  - `support_prior_algorithm = soft_patel`
+  - `direction_prior_algorithm = lag_gain`
+  - `direction_init_mode = lag_gain`
+  - `structure_init_mode = patel_score`
+  - `support_direction`
+  - `fixed_support_mask_mode = maxgap_kappa`
+  - `directional_kappa_gate = on`
+  - `gradient_routing_mode = warmup_then_orthogonal`
+  - `detach_direction_from_main_after_epoch = 23`
+  - `causal_lag_main_weight = 0.25`
+  - `causal_lag_main_lags = 1,2`
+  - `soft_patel_K = 5`
+  - `soft_patel_beta = 10`
+  - `lag_gain_ridge_lambda = 1e-3`
+  - `lag_gain_score_alpha = 1.0`
+  - `seed = 11`
+  - `epochs = 40`
+- Run summary:
+  - `fMRI`
+    - `GraphExp/results/run_20260407_151924`
+    - best/export/final strict:
+      - `0.8000 / 0.6000 / 0.6000`
+  - `sim2`
+    - `GraphExp/results/run_20260407_152234`
+    - best/export/final strict:
+      - `0.7273 / 0.7273 / 0.6364`
+  - `sim3`
+    - `GraphExp/results/run_20260407_152704`
+    - best/export/final strict:
+      - `0.6111 / 0.5556 / 0.5556`
+  - `sim4`
+    - `GraphExp/results/run_20260407_153308`
+    - best/export/final strict:
+      - `0.5000 / 0.3448 / 0.3448`
+  - compact csv:
+    - `GraphExp/results/soft_prior_full_sweep_20260407_summary.csv`
+- Architecture read:
+  - the new soft-prior family is now fully integrated and benchmarked
+  - but under the current backbone it does **not** replace the stronger
+    Patel-side direction signal
+  - as the graph gets larger, the branch trends toward:
+    - `weak_asymmetry`
+    - then `symmetric_collapse`
+- Practical conclusion:
+  - this branch should currently be treated as:
+    - implemented
+    - reproducibly benchmarked
+    - not yet competitive

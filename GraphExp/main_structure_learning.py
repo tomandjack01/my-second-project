@@ -31,6 +31,7 @@ import torch.nn.functional as F
 
 from models import DDM
 from utils.patel_util import compute_patel_components
+from utils.soft_prior_util import compute_soft_prior_components
 
 
 # ============================================================================
@@ -675,7 +676,7 @@ def get_direction_branch_parameters(model: DDM) -> List[torch.nn.Parameter]:
     if getattr(model, "structure_parameterization", "coupled") != "support_direction":
         return []
     params: List[torch.nn.Parameter] = []
-    for name in ("direction_emb_sender", "direction_emb_receiver"):
+    for name in ("direction_emb_sender", "direction_emb_receiver", "direction_logits_param"):
         param = getattr(model, name, None)
         if isinstance(param, torch.nn.Parameter):
             params.append(param)
@@ -785,6 +786,10 @@ def build_epoch_gradient_routing(
       both support and direction
     - after detach: the same paths stop updating direction
 
+    `main_detach_only` isolates only the main denoising path after the switch:
+    - main denoising updates support only
+    - structure regularizers and causal-lag main stay joint
+
     `orthogonal` enforces the split from epoch 1:
     - main denoising + structure regularizers update support only
     - causal-lag main updates direction only
@@ -819,6 +824,20 @@ def build_epoch_gradient_routing(
             structure_regularizers=route,
             causal_lag_main=route,
             direction_isolation_active=legacy_detach_active,
+        )
+    if gradient_routing_mode == "main_detach_only":
+        if detach_direction_from_main_after_epoch < 0:
+            raise ValueError(
+                "main_detach_only requires detach_direction_from_main_after_epoch >= 0"
+            )
+        detach_active = (epoch + 1) > detach_direction_from_main_after_epoch
+        return EpochGradientRouting(
+            mode=gradient_routing_mode,
+            label="main_detached_only" if detach_active else "warmup_joint",
+            main=support_only if detach_active else joint,
+            structure_regularizers=joint,
+            causal_lag_main=joint,
+            direction_isolation_active=detach_active,
         )
     if gradient_routing_mode == "orthogonal":
         return EpochGradientRouting(
@@ -970,6 +989,34 @@ def get_current_structure_adj(model: DDM, causal: bool = False) -> torch.Tensor:
     """Fetch the current adjacency under raw or causal convention."""
     adj = model.get_structure_adj().detach()
     return to_causal_matrix_torch(adj) if causal else adj
+
+
+@torch.no_grad()
+def capture_support_direction_snapshot(model: DDM) -> Optional[Dict[str, torch.Tensor]]:
+    """Capture the current support/direction branch state under the live export formula."""
+    if getattr(model, "structure_parameterization", "coupled") != "support_direction":
+        return None
+
+    support_logits = model.get_structure_logits().detach()
+    support_weights = torch.sigmoid(support_logits)
+    diag_mask = model.diag_mask.to(support_weights.device)
+    support_weights = support_weights * diag_mask
+    fixed_support_mask = getattr(model, "fixed_support_mask", None)
+    if fixed_support_mask is not None:
+        support_weights = support_weights * fixed_support_mask.to(support_weights.device)
+
+    direction_logits = model.get_direction_logits().detach()
+    direction_gate = torch.sigmoid(direction_logits - direction_logits.transpose(0, 1))
+    adj_raw = (support_weights * direction_gate) * diag_mask
+
+    return {
+        "support_logits": support_logits,
+        "support_weights": support_weights,
+        "direction_logits": direction_logits,
+        "direction_gate": direction_gate,
+        "adj_raw": adj_raw,
+        "adj_causal": to_causal_matrix_torch(adj_raw),
+    }
 
 
 def compute_single_aux_lambda(
@@ -1370,6 +1417,98 @@ def compute_ungated_asymmetry_diagnostics(
     }
 
 
+def compute_self_distilled_direction_retention_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    fixed_support_mask: Optional[torch.Tensor] = None,
+    active_quantile: float = 0.5,
+    margin_scale: float = 0.5,
+    margin_floor: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Keep the current direction branch close to its own earlier high-confidence
+    directions, without injecting any external prior into the forward path.
+
+    The teacher is a detached EMA of past causal-direction logits. We activate
+    this loss only on support pairs whose teacher contrast is within the top
+    quantile of absolute margins, then require the student to preserve the
+    teacher sign with at least a fraction of the teacher margin.
+    """
+    zero = student_logits.new_tensor(0.0)
+    diag = {
+        "self_distill_retention_teacher_available": 0.0,
+        "self_distill_retention_active_pair_frac": 0.0,
+        "self_distill_retention_teacher_margin_threshold": 0.0,
+        "self_distill_retention_teacher_margin_mean": 0.0,
+        "self_distill_retention_teacher_margin_median": 0.0,
+        "self_distill_retention_student_signed_margin_mean": 0.0,
+        "self_distill_retention_target_margin_mean": 0.0,
+    }
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            "student_logits and teacher_logits must have the same shape, "
+            f"got {tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
+        )
+    if not 0.0 <= active_quantile <= 1.0:
+        raise ValueError(
+            f"self-distill active_quantile must be in [0, 1], got {active_quantile}"
+        )
+    if margin_scale < 0.0:
+        raise ValueError(f"self-distill margin_scale must be >= 0, got {margin_scale}")
+    if margin_floor < 0.0:
+        raise ValueError(f"self-distill margin_floor must be >= 0, got {margin_floor}")
+
+    num_nodes = student_logits.shape[0]
+    offdiag_mask = ~torch.eye(num_nodes, dtype=torch.bool, device=student_logits.device)
+    active_mask = offdiag_mask
+    if fixed_support_mask is not None:
+        active_mask = active_mask & fixed_support_mask.to(
+            device=student_logits.device, dtype=torch.bool
+        )
+
+    teacher_contrast = teacher_logits - teacher_logits.transpose(0, 1)
+    student_contrast = student_logits - student_logits.transpose(0, 1)
+    teacher_abs = torch.abs(teacher_contrast).masked_select(active_mask)
+    positive_teacher_abs = teacher_abs[teacher_abs > 0.0]
+    if positive_teacher_abs.numel() == 0:
+        return zero, diag
+
+    threshold = float(torch.quantile(positive_teacher_abs, active_quantile).item())
+    confident_mask = active_mask & (torch.abs(teacher_contrast) >= threshold)
+    if not confident_mask.any():
+        return zero, diag
+
+    teacher_sign = torch.sign(teacher_contrast)
+    student_signed_margin = teacher_sign * student_contrast
+    target_margin = torch.clamp(torch.abs(teacher_contrast) * margin_scale, min=margin_floor)
+    penalties = F.relu(target_margin - student_signed_margin)
+    loss = penalties.masked_select(confident_mask).mean()
+
+    confident_teacher_abs = torch.abs(teacher_contrast).masked_select(confident_mask)
+    confident_student_signed = student_signed_margin.masked_select(confident_mask)
+    confident_target_margin = target_margin.masked_select(confident_mask)
+    total_pairs = max(int(offdiag_mask.sum().item()), 1)
+    diag.update({
+        "self_distill_retention_teacher_available": 1.0,
+        "self_distill_retention_active_pair_frac": float(
+            confident_mask.float().sum().item() / total_pairs
+        ),
+        "self_distill_retention_teacher_margin_threshold": float(threshold),
+        "self_distill_retention_teacher_margin_mean": float(confident_teacher_abs.mean().item()),
+        "self_distill_retention_teacher_margin_median": float(
+            confident_teacher_abs.median().item()
+        ),
+        "self_distill_retention_student_signed_margin_mean": float(
+            confident_student_signed.mean().item()
+        ),
+        "self_distill_retention_target_margin_mean": float(
+            confident_target_margin.mean().item()
+        ),
+    })
+    return loss, diag
+
+
 def zscore_per_node_time(x: torch.Tensor) -> torch.Tensor:
     """Per-node z-score along the time dimension."""
     mean = x.mean(dim=-1, keepdim=True)
@@ -1510,6 +1649,8 @@ def selector_audit_margin_stats(adj: np.ndarray) -> Dict[str, float]:
 def selector_audit_gt_edge_margin_stats(
     adj: np.ndarray,
     gt_edges: Set[Tuple[int, int]],
+    *,
+    prefix: str = "selector_audit_gt_signed_margin",
 ) -> Dict[str, float]:
     """Summarize signed GT margins on a causal adjacency."""
     gt_signed_margins: List[float] = []
@@ -1520,20 +1661,98 @@ def selector_audit_gt_edge_margin_stats(
 
     if not gt_signed_margins:
         return {
-            "selector_audit_gt_signed_margin_mean": 0.0,
-            "selector_audit_gt_signed_margin_median": 0.0,
-            "selector_audit_gt_signed_margin_p10": 0.0,
-            "selector_audit_gt_signed_margin_p90": 0.0,
-            "selector_audit_gt_signed_margin_frac_pos": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_frac_pos": 0.0,
         }
 
     gt_signed_margins_np = np.array(gt_signed_margins, dtype=float)
     return {
-        "selector_audit_gt_signed_margin_mean": float(np.mean(gt_signed_margins_np)),
-        "selector_audit_gt_signed_margin_median": float(np.median(gt_signed_margins_np)),
-        "selector_audit_gt_signed_margin_p10": float(np.quantile(gt_signed_margins_np, 0.10)),
-        "selector_audit_gt_signed_margin_p90": float(np.quantile(gt_signed_margins_np, 0.90)),
-        "selector_audit_gt_signed_margin_frac_pos": float(np.mean(gt_signed_margins_np > 0.0)),
+        f"{prefix}_mean": float(np.mean(gt_signed_margins_np)),
+        f"{prefix}_median": float(np.median(gt_signed_margins_np)),
+        f"{prefix}_p10": float(np.quantile(gt_signed_margins_np, 0.10)),
+        f"{prefix}_p90": float(np.quantile(gt_signed_margins_np, 0.90)),
+        f"{prefix}_frac_pos": float(np.mean(gt_signed_margins_np > 0.0)),
+    }
+
+
+def selector_audit_gt_support_stats(
+    support_adj: Optional[np.ndarray],
+    gt_edges: Set[Tuple[int, int]],
+    *,
+    prefix: str = "selector_audit_gt_support",
+) -> Dict[str, float]:
+    """Summarize GT support magnitudes on a causal adjacency."""
+    if support_adj is None:
+        return {
+            f"{prefix}_available": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p90": 0.0,
+        }
+    gt_support_values = np.array(
+        [float(support_adj[src, dst]) for src, dst in gt_edges],
+        dtype=float,
+    )
+    if gt_support_values.size == 0:
+        return {
+            f"{prefix}_available": 1.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p90": 0.0,
+        }
+    return {
+        f"{prefix}_available": 1.0,
+        f"{prefix}_mean": float(np.mean(gt_support_values)),
+        f"{prefix}_median": float(np.median(gt_support_values)),
+        f"{prefix}_p10": float(np.quantile(gt_support_values, 0.10)),
+        f"{prefix}_p90": float(np.quantile(gt_support_values, 0.90)),
+    }
+
+
+def selector_audit_gt_gate_margin_stats(
+    direction_gate_adj: Optional[np.ndarray],
+    gt_edges: Set[Tuple[int, int]],
+    *,
+    prefix: str = "selector_audit_gt_gate_signed_margin",
+) -> Dict[str, float]:
+    """Summarize GT directional gate margins on a causal adjacency."""
+    if direction_gate_adj is None:
+        return {
+            f"{prefix}_available": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_frac_pos": 0.0,
+        }
+    gate_signed_margins = np.array(
+        [
+            float(direction_gate_adj[src, dst] - direction_gate_adj[dst, src])
+            for src, dst in gt_edges
+        ],
+        dtype=float,
+    )
+    if gate_signed_margins.size == 0:
+        return {
+            f"{prefix}_available": 1.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_frac_pos": 0.0,
+        }
+    return {
+        f"{prefix}_available": 1.0,
+        f"{prefix}_mean": float(np.mean(gate_signed_margins)),
+        f"{prefix}_median": float(np.median(gate_signed_margins)),
+        f"{prefix}_p10": float(np.quantile(gate_signed_margins, 0.10)),
+        f"{prefix}_p90": float(np.quantile(gate_signed_margins, 0.90)),
+        f"{prefix}_frac_pos": float(np.mean(gate_signed_margins > 0.0)),
     }
 
 
@@ -1564,16 +1783,32 @@ def compute_selector_audit_metrics(
     adj: np.ndarray,
     gt_edges: Set[Tuple[int, int]],
     strict_margin_eps_values: Sequence[float],
+    *,
+    support_adj: Optional[np.ndarray] = None,
+    direction_gate_adj: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Compute GT-only selector audit metrics for one exported adjacency."""
     directional_eval = selector_audit_evaluate_directional(adj, gt_edges)
     margin_stats = selector_audit_margin_stats(adj)
     gt_margin_stats = selector_audit_gt_edge_margin_stats(adj, gt_edges)
+    gt_exported_margin_stats = selector_audit_gt_edge_margin_stats(
+        adj,
+        gt_edges,
+        prefix="selector_audit_gt_exported_signed_margin",
+    )
+    gt_support_stats = selector_audit_gt_support_stats(support_adj, gt_edges)
+    gt_gate_margin_stats = selector_audit_gt_gate_margin_stats(
+        direction_gate_adj,
+        gt_edges,
+    )
 
     metrics: Dict[str, Any] = {
         **directional_eval,
         **margin_stats,
         **gt_margin_stats,
+        **gt_exported_margin_stats,
+        **gt_support_stats,
+        **gt_gate_margin_stats,
     }
     metrics["selector_audit_failure_mode"] = selector_audit_failure_mode(
         margin_stats,
@@ -1734,6 +1969,8 @@ def compute_message_graph_direction_diagnostics(model: DDM, x: torch.Tensor) -> 
     """
     default_stats = {
         "msg_dir_mode_is_causal": 0.0,
+        "msg_edge_mode_is_support_only": 0.0,
+        "msg_edge_mode_is_support_only_preserve_budget": 0.0,
         "msg_dir_raw_diag_mean": 0.0,
         "msg_dir_raw_offdiag_mean": 0.0,
         "msg_dir_raw_diag_gap": 0.0,
@@ -1753,12 +1990,21 @@ def compute_message_graph_direction_diagnostics(model: DDM, x: torch.Tensor) -> 
     target_z = zscore_per_node_time(clean_future)
     target_norm = F.normalize(target_z, p=2, dim=-1, eps=1e-8)
 
-    raw_adj = model.get_structure_adj()
+    if getattr(model, "structure_parameterization", "coupled") == "support_direction":
+        support_weights, direction_gate = model._get_support_direction_components()
+        raw_adj = model._compose_message_edge_weights(support_weights, direction_gate)
+    else:
+        raw_adj = model.get_structure_adj()
     raw_message = normalize_message_graph_weights(raw_adj)
     causal_message = normalize_message_graph_weights(to_causal_matrix_torch(raw_adj))
 
+    message_edge_mode = str(getattr(model, "structure_message_edge_mode", "full"))
     stats = {
         "msg_dir_mode_is_causal": float(getattr(model, "structure_message_graph_mode", "raw") == "causal"),
+        "msg_edge_mode_is_support_only": float(message_edge_mode != "full"),
+        "msg_edge_mode_is_support_only_preserve_budget": float(
+            message_edge_mode == "support_only_preserve_budget"
+        ),
     }
     for mode_name, weights in (("raw", raw_message), ("causal", causal_message)):
         pred = torch.einsum("se,st->et", weights, clean_past)
@@ -2367,6 +2613,7 @@ def train_brain_connectivity(
     patel_matrix: torch.Tensor,
     patel_direction_matrix: Optional[torch.Tensor] = None,
     patel_strength_matrix: Optional[torch.Tensor] = None,
+    direction_prior_reliability_matrix: Optional[torch.Tensor] = None,
     noise_guide_adj: Optional[torch.Tensor] = None,
 
     num_epochs: int = 100,
@@ -2420,6 +2667,7 @@ def train_brain_connectivity(
     gradient_routing_mode: str = "legacy",
     enable_gradient_alignment_probe: bool = False,
     gradient_alignment_probe_seed: int = 0,
+    save_support_direction_snapshots: bool = False,
     causal_lag_main_weight: float = 0.0,
     causal_lag_main_aggregation: str = "mean",
     causal_lag_main_softmax_temp: float = 1.0,
@@ -2435,6 +2683,12 @@ def train_brain_connectivity(
     ungated_symmetry_lambda: float = 0.0,
     ungated_symmetry_warmup_epochs: int = 0,
     ungated_symmetry_ramp_epochs: int = 1,
+    self_distill_direction_retention_lambda: float = 0.0,
+    self_distill_direction_retention_start_epoch: int = -1,
+    self_distill_direction_retention_ema: float = 0.9,
+    self_distill_direction_retention_active_quantile: float = 0.5,
+    self_distill_direction_retention_margin_scale: float = 0.5,
+    self_distill_direction_retention_margin_floor: float = 0.0,
     selection_agreement_weight: float = 0.25,
     selection_agreement_mode: str = "hard_coverage",
     selection_score_mode: str = "legacy",
@@ -2530,15 +2784,58 @@ def train_brain_connectivity(
             "detach_direction_from_main_after_epoch must be >= -1, "
             f"got {detach_direction_from_main_after_epoch}"
         )
-    if gradient_routing_mode not in {"legacy", "orthogonal", "warmup_then_orthogonal"}:
+    if gradient_routing_mode not in {
+        "legacy",
+        "main_detach_only",
+        "orthogonal",
+        "warmup_then_orthogonal",
+    }:
         raise ValueError(
-            "gradient_routing_mode must be 'legacy', 'orthogonal', or "
-            f"'warmup_then_orthogonal', got {gradient_routing_mode}"
+            "gradient_routing_mode must be 'legacy', 'main_detach_only', "
+            f"'orthogonal', or 'warmup_then_orthogonal', got {gradient_routing_mode}"
         )
     if directional_loss_end_epoch < -1:
         raise ValueError(
             "directional_loss_end_epoch must be >= -1, "
             f"got {directional_loss_end_epoch}"
+        )
+    if self_distill_direction_retention_lambda < 0.0:
+        raise ValueError(
+            "self_distill_direction_retention_lambda must be >= 0, "
+            f"got {self_distill_direction_retention_lambda}"
+        )
+    if self_distill_direction_retention_start_epoch < -1:
+        raise ValueError(
+            "self_distill_direction_retention_start_epoch must be >= -1, "
+            f"got {self_distill_direction_retention_start_epoch}"
+        )
+    if (
+        self_distill_direction_retention_lambda > 0.0 and
+        self_distill_direction_retention_start_epoch < 0
+    ):
+        raise ValueError(
+            "self_distill_direction_retention_start_epoch must be >= 0 when "
+            "self_distill_direction_retention_lambda is enabled"
+        )
+    if not 0.0 <= self_distill_direction_retention_ema < 1.0:
+        raise ValueError(
+            "self_distill_direction_retention_ema must be in [0, 1), "
+            f"got {self_distill_direction_retention_ema}"
+        )
+    if not 0.0 <= self_distill_direction_retention_active_quantile <= 1.0:
+        raise ValueError(
+            "self_distill_direction_retention_active_quantile must be in [0, 1], "
+            f"got {self_distill_direction_retention_active_quantile}"
+        )
+    if self_distill_direction_retention_margin_scale < 0.0:
+        raise ValueError(
+            "self_distill_direction_retention_margin_scale must be >= 0, "
+            f"got {self_distill_direction_retention_margin_scale}"
+        )
+    if self_distill_direction_retention_margin_floor < 0.0:
+        raise ValueError(
+            "self_distill_direction_retention_margin_floor must be >= 0, "
+            f"got {self_distill_direction_retention_margin_floor}"
         )
     if selection_agreement_mode not in {"hard_coverage", "soft_weighted"}:
         raise ValueError(
@@ -2607,11 +2904,11 @@ def train_brain_connectivity(
             f"got {selection_primary_density_tiebreak_weight}"
         )
     if (
-        gradient_routing_mode == "warmup_then_orthogonal" and
+        gradient_routing_mode in {"main_detach_only", "warmup_then_orthogonal"} and
         detach_direction_from_main_after_epoch < 0
     ):
         raise ValueError(
-            "warmup_then_orthogonal requires detach_direction_from_main_after_epoch >= 0"
+            f"{gradient_routing_mode} requires detach_direction_from_main_after_epoch >= 0"
         )
     if causal_lag_main_aggregation not in {"mean", "softmax"}:
         raise ValueError(
@@ -2667,6 +2964,13 @@ def train_brain_connectivity(
         patel_strength_matrix = torch.clamp(0.5 * (patel_score_matrix + patel_score_matrix.t()), min=0.0)
     else:
         patel_strength_matrix = patel_strength_matrix.to(device)
+    if direction_prior_reliability_matrix is not None:
+        direction_prior_reliability_matrix = direction_prior_reliability_matrix.to(device)
+        if direction_prior_reliability_matrix.shape != patel_direction_matrix.shape:
+            raise ValueError(
+                "direction_prior_reliability_matrix must match patel_direction_matrix shape, "
+                f"got {tuple(direction_prior_reliability_matrix.shape)} vs {tuple(patel_direction_matrix.shape)}"
+            )
     if directional_kappa_gate or ungated_symmetry_lambda > 0.0:
         directional_pair_gate_matrix, directional_kappa_threshold, directional_kappa_gate_pair_frac = (
             build_kappa_gate_matrix(
@@ -2680,6 +2984,26 @@ def train_brain_connectivity(
         directional_kappa_gate_pair_frac = 0.0
 
     ddm_kwargs = {} if ddm_kwargs is None else dict(ddm_kwargs)
+    structure_message_edge_mode = str(ddm_kwargs.get('structure_message_edge_mode', 'full'))
+    if structure_message_edge_mode not in {
+        'full',
+        'support_only',
+        'support_only_preserve_budget',
+    }:
+        raise ValueError(
+            "structure_message_edge_mode must be one of "
+            "['full', 'support_only', 'support_only_preserve_budget'], "
+            f"got {structure_message_edge_mode}"
+        )
+    if (
+        structure_message_edge_mode != 'full' and
+        str(ddm_kwargs.get('structure_parameterization', 'coupled')) != 'support_direction'
+    ):
+        raise ValueError(
+            "structure_message_edge_mode in "
+            "['support_only', 'support_only_preserve_budget'] requires "
+            "structure_parameterization='support_direction'"
+        )
     fixed_support_mask = ddm_kwargs.get('fixed_support_mask', None)
     if fixed_support_mask is not None:
         fixed_support_mask = fixed_support_mask.to(device)
@@ -2753,6 +3077,7 @@ def train_brain_connectivity(
         f"emb_dim={getattr(model, 'emb_dim', num_nodes)} "
         f"(requested={'full' if requested_emb_dim is None else requested_emb_dim}) | "
         f"message_graph_mode={getattr(model, 'structure_message_graph_mode', 'raw')} | "
+        f"message_edge_mode={getattr(model, 'structure_message_edge_mode', 'full')} | "
         f"kappa_logit_bias_scale={getattr(model, 'kappa_logit_bias_scale', 0.0):g} | "
         f"direction_logit_bias_scale={getattr(model, 'direction_logit_bias_scale', 0.0):g}"
     )
@@ -2805,6 +3130,16 @@ def train_brain_connectivity(
             "Selector audit: enabled | "
             f"gt_edges={len(selector_audit_gt_edges)} | "
             f"strict_margin_eps={list(selector_audit_strict_margin_eps_values)}"
+        )
+    if self_distill_direction_retention_lambda > 0.0:
+        print(
+            "Self-distilled retention: enabled | "
+            f"lambda={self_distill_direction_retention_lambda:g} | "
+            f"start_epoch={self_distill_direction_retention_start_epoch} | "
+            f"ema={self_distill_direction_retention_ema:.3f} | "
+            f"active_quantile={self_distill_direction_retention_active_quantile:.2f} | "
+            f"margin_scale={self_distill_direction_retention_margin_scale:.3f} | "
+            f"margin_floor={self_distill_direction_retention_margin_floor:.4f}"
         )
     print(
         "Selection proxy: "
@@ -2896,6 +3231,8 @@ def train_brain_connectivity(
     direction_branch_frozen_from_epoch = -1
     directional_loss_deactivated_from_epoch = -1
     direction_from_main_detached_from_epoch = -1
+    self_distill_direction_teacher_logits: Optional[torch.Tensor] = None
+    self_distill_direction_teacher_initialized_from_epoch = -1
     if direction_branch_has_separate_params:
         print(
             "Optimizer groups: "
@@ -2928,6 +3265,20 @@ def train_brain_connectivity(
 
     collapse_history = []
     quality_history = []
+    support_direction_snapshot_records: Optional[Dict[str, List[np.ndarray]]] = None
+    if (
+        save_support_direction_snapshots and
+        getattr(model, "structure_parameterization", "coupled") == "support_direction"
+    ):
+        support_direction_snapshot_records = {
+            "epochs": [],
+            "support_logits": [],
+            "support_weights": [],
+            "direction_logits": [],
+            "direction_gate": [],
+            "adj_raw": [],
+            "adj_causal": [],
+        }
 
     # Best-epoch tracking (Patel-based proxy, no GT needed)
     best_guarded_adj = None
@@ -2940,8 +3291,8 @@ def train_brain_connectivity(
     fallback_best_score = -1.0
     fallback_best_epoch = -1
     fallback_best_quality_details = None
-    patel_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
-    patel_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
+    selector_direction_cpu = patel_direction_matrix.detach().cpu().numpy()
+    selector_strength_cpu = patel_strength_matrix.detach().cpu().numpy()
     selection_top_k = target_edge_count if selection_top_k is None else int(selection_top_k)
     quality_top_k = min(max(selection_top_k, 1), max(num_nodes * (num_nodes - 1) // 2, 1))
     peak_eligible_skeleton_overlap = 0.0
@@ -3022,6 +3373,8 @@ def train_brain_connectivity(
 
         epoch_ungated_symmetry_loss = 0.0
 
+        epoch_self_distill_retention_loss = 0.0
+
         epoch_causal_lag_main_loss = 0.0
         epoch_training_noise_guide_active = 0.0
         epoch_training_noise_guide_blend_weight = 0.0
@@ -3032,6 +3385,8 @@ def train_brain_connectivity(
         current_parent_cap_weight = 0.0
 
         current_ungated_symmetry_weight = 0.0
+
+        current_self_distill_retention_weight = 0.0
 
         num_batches = 0
 
@@ -3174,6 +3529,7 @@ def train_brain_connectivity(
                         causal_logits,
                         patel_direction_matrix,
                         pair_gate_matrix=directional_pair_gate_matrix,
+                        pair_reliability_matrix=direction_prior_reliability_matrix,
                     )
                 else:
                     raw_loss_dir = torch.tensor(0.0, device=device)
@@ -3227,6 +3583,26 @@ def train_brain_connectivity(
                     )
                 else:
                     raw_loss_ungated_symmetry = torch.tensor(0.0, device=device)
+                self_distill_retention_active = (
+                    self_distill_direction_retention_lambda > 0.0 and
+                    self_distill_direction_teacher_logits is not None and
+                    self_distill_direction_retention_start_epoch >= 0 and
+                    (epoch + 1) >= self_distill_direction_retention_start_epoch and
+                    direction_branch_has_separate_params
+                )
+                if self_distill_retention_active:
+                    raw_loss_self_distill_retention, _ = (
+                        compute_self_distilled_direction_retention_loss(
+                            causal_logits,
+                            self_distill_direction_teacher_logits.to(causal_logits.device),
+                            fixed_support_mask=fixed_support_mask,
+                            active_quantile=self_distill_direction_retention_active_quantile,
+                            margin_scale=self_distill_direction_retention_margin_scale,
+                            margin_floor=self_distill_direction_retention_margin_floor,
+                        )
+                    )
+                else:
+                    raw_loss_self_distill_retention = torch.tensor(0.0, device=device)
                 raw_loss_ortho = compute_feature_ortho_loss(
                     model.node_emb_sender, model.node_emb_receiver,
                 )
@@ -3275,6 +3651,12 @@ def train_brain_connectivity(
                 weighted_ungated_symmetry = (
                     current_ungated_symmetry_weight * raw_loss_ungated_symmetry
                 )
+                current_self_distill_retention_weight = (
+                    self_distill_direction_retention_lambda if self_distill_retention_active else 0.0
+                )
+                weighted_self_distill_retention = (
+                    current_self_distill_retention_weight * raw_loss_self_distill_retention
+                )
 
                 weighted_causal_lag_main = causal_lag_main_weight * raw_loss_causal_lag_main
                 # Treat causal-lag denoising as part of the main reconstruction path,
@@ -3288,7 +3670,8 @@ def train_brain_connectivity(
                     weighted_ortho +
                     weighted_parent_entropy +
                     weighted_parent_cap +
-                    weighted_ungated_symmetry
+                    weighted_ungated_symmetry +
+                    weighted_self_distill_retention
                 )
 
                 
@@ -3328,6 +3711,8 @@ def train_brain_connectivity(
 
                 epoch_ungated_symmetry_loss += weighted_ungated_symmetry.item()
 
+                epoch_self_distill_retention_loss += weighted_self_distill_retention.item()
+
                 epoch_causal_lag_main_loss += weighted_causal_lag_main.item()
 
                 num_batches += 1
@@ -3344,6 +3729,7 @@ def train_brain_connectivity(
         avg_parent_entropy_loss = epoch_parent_entropy_loss / num_batches
         avg_parent_cap_loss = epoch_parent_cap_loss / num_batches
         avg_ungated_symmetry_loss = epoch_ungated_symmetry_loss / num_batches
+        avg_self_distill_retention_loss = epoch_self_distill_retention_loss / num_batches
         avg_causal_lag_main_loss = epoch_causal_lag_main_loss / num_batches
         avg_training_noise_guide_active = epoch_training_noise_guide_active / num_batches
         avg_training_noise_guide_blend_weight = (
@@ -3362,6 +3748,7 @@ def train_brain_connectivity(
                 patel_direction_matrix=patel_direction_matrix,
                 directional_pair_gate_matrix=directional_pair_gate_matrix,
                 lambda_dir_effective=grad_probe_lambda_dir,
+                direction_prior_reliability_matrix=direction_prior_reliability_matrix,
                 main_routing=epoch_gradient_routing.main,
                 structure_regularizer_routing=epoch_gradient_routing.structure_regularizers,
                 seed=gradient_alignment_probe_seed,
@@ -3380,6 +3767,49 @@ def train_brain_connectivity(
 
         with torch.no_grad():
             causal_logits = get_current_directional_logits(model, causal=True)
+            self_distill_retention_enabled = (
+                self_distill_direction_retention_lambda > 0.0 and
+                self_distill_direction_retention_start_epoch >= 0
+            )
+            self_distill_retention_stats = {
+                "self_distill_retention_teacher_available": 0.0,
+                "self_distill_retention_active_pair_frac": 0.0,
+                "self_distill_retention_teacher_margin_threshold": 0.0,
+                "self_distill_retention_teacher_margin_mean": 0.0,
+                "self_distill_retention_teacher_margin_median": 0.0,
+                "self_distill_retention_student_signed_margin_mean": 0.0,
+                "self_distill_retention_target_margin_mean": 0.0,
+            }
+            raw_self_distill_retention_snap = 0.0
+            if (
+                self_distill_retention_enabled and
+                self_distill_direction_teacher_logits is not None
+            ):
+                raw_self_distill_eval, self_distill_retention_stats = (
+                    compute_self_distilled_direction_retention_loss(
+                        causal_logits,
+                        self_distill_direction_teacher_logits.to(causal_logits.device),
+                        fixed_support_mask=fixed_support_mask,
+                        active_quantile=self_distill_direction_retention_active_quantile,
+                        margin_scale=self_distill_direction_retention_margin_scale,
+                        margin_floor=self_distill_direction_retention_margin_floor,
+                    )
+                )
+                if current_self_distill_retention_weight > 0.0:
+                    raw_self_distill_retention_snap = float(raw_self_distill_eval.item())
+            if self_distill_retention_enabled:
+                current_teacher_logits = causal_logits.detach()
+                if self_distill_direction_teacher_logits is None:
+                    self_distill_direction_teacher_logits = current_teacher_logits.clone()
+                    self_distill_direction_teacher_initialized_from_epoch = epoch + 1
+                else:
+                    ema_teacher = self_distill_direction_teacher_logits.to(
+                        current_teacher_logits.device
+                    )
+                    self_distill_direction_teacher_logits = (
+                        self_distill_direction_retention_ema * ema_teacher +
+                        (1.0 - self_distill_direction_retention_ema) * current_teacher_logits
+                    ).detach()
             probe_direction_prior = None
             if directional_loss_active:
                 probe_direction_prior = patel_direction_matrix
@@ -3387,6 +3817,7 @@ def train_brain_connectivity(
                     causal_logits,
                     probe_direction_prior,
                     pair_gate_matrix=directional_pair_gate_matrix,
+                    pair_reliability_matrix=direction_prior_reliability_matrix,
                 )
             else:
                 direction_margin_stats = {
@@ -3405,6 +3836,7 @@ def train_brain_connectivity(
                     causal_logits,
                     probe_direction_prior,
                     pair_gate_matrix=directional_pair_gate_matrix,
+                    pair_reliability_matrix=direction_prior_reliability_matrix,
                 ).item()
             else:
                 raw_dir_snap = 0.0
@@ -3500,10 +3932,31 @@ def train_brain_connectivity(
 
         curr_adj_raw = adj_sigmoid_raw.cpu().numpy()
         curr_adj_causal = adj_sigmoid_causal.cpu().numpy()
+        snapshot: Optional[Dict[str, torch.Tensor]] = None
+        if support_direction_snapshot_records is not None or selector_audit_gt_edges is not None:
+            snapshot = capture_support_direction_snapshot(model)
+        if support_direction_snapshot_records is not None:
+            if snapshot is None:
+                raise RuntimeError(
+                    "support_direction snapshots were requested, but the model "
+                    "does not expose support_direction branch state."
+                )
+            support_direction_snapshot_records["epochs"].append(np.int32(epoch + 1))
+            for key in (
+                "support_logits",
+                "support_weights",
+                "direction_logits",
+                "direction_gate",
+                "adj_raw",
+                "adj_causal",
+            ):
+                support_direction_snapshot_records[key].append(
+                    snapshot[key].cpu().numpy().astype(np.float32, copy=False)
+                )
         epoch_score, epoch_details = compute_epoch_quality(
             curr_adj_causal,
-            patel_direction_cpu,
-            patel_strength_cpu,
+            selector_direction_cpu,
+            selector_strength_cpu,
             top_k=quality_top_k,
             agreement_weight=selection_agreement_weight,
             fixed_support_mask_active=bool(fixed_support_mask is not None),
@@ -3536,10 +3989,21 @@ def train_brain_connectivity(
             primary_density_tiebreak_weight=selection_primary_density_tiebreak_weight,
         )
         if selector_audit_gt_edges is not None:
+            support_adj_causal_np = None
+            direction_gate_causal_np = None
+            if snapshot is not None:
+                support_adj_causal_np = to_causal_matrix_torch(
+                    snapshot["support_weights"]
+                ).cpu().numpy()
+                direction_gate_causal_np = to_causal_matrix_torch(
+                    snapshot["direction_gate"]
+                ).cpu().numpy()
             selector_audit_metrics = compute_selector_audit_metrics(
                 curr_adj_causal,
                 selector_audit_gt_edges,
                 selector_audit_strict_margin_eps_values,
+                support_adj=support_adj_causal_np,
+                direction_gate_adj=direction_gate_causal_np,
             )
         else:
             selector_audit_metrics = {}
@@ -3645,9 +4109,34 @@ def train_brain_connectivity(
             "ungated_symmetry_raw": raw_ungated_symmetry_snap,
             "ungated_symmetry_weighted": avg_ungated_symmetry_loss,
             "ungated_symmetry_lambda_current": current_ungated_symmetry_weight,
+            "self_distill_retention_enabled": int(self_distill_retention_enabled),
+            "self_distill_retention_active": int(current_self_distill_retention_weight > 0.0),
+            "self_distill_retention_lambda": float(self_distill_direction_retention_lambda),
+            "self_distill_retention_start_epoch": int(
+                self_distill_direction_retention_start_epoch
+            ),
+            "self_distill_retention_weight_current": float(
+                current_self_distill_retention_weight
+            ),
+            "self_distill_retention_ema": float(self_distill_direction_retention_ema),
+            "self_distill_retention_active_quantile": float(
+                self_distill_direction_retention_active_quantile
+            ),
+            "self_distill_retention_margin_scale": float(
+                self_distill_direction_retention_margin_scale
+            ),
+            "self_distill_retention_margin_floor": float(
+                self_distill_direction_retention_margin_floor
+            ),
+            "self_distill_retention_teacher_initialized_from_epoch": int(
+                self_distill_direction_teacher_initialized_from_epoch
+            ),
+            "self_distill_retention_raw": float(raw_self_distill_retention_snap),
+            "self_distill_retention_weighted": float(avg_self_distill_retention_loss),
             "gradient_alignment_probe_enabled": int(enable_gradient_alignment_probe),
             "gradient_alignment_probe_seed": int(gradient_alignment_probe_seed),
             "selector_audit_enabled": int(selector_audit_gt_edges is not None),
+            **self_distill_retention_stats,
             **grad_probe_stats,
             **causal_lag_diag_stats,
             **selector_dataset_stats,
@@ -3699,6 +4188,10 @@ def train_brain_connectivity(
                   f"(lambda={current_parent_cap_weight:.4f}, target={parent_cap_target:.2f}) | "
                   f"Ungated Sym(raw/w): {raw_ungated_symmetry_snap:.4f}/{avg_ungated_symmetry_loss:.4f} "
                   f"(lambda={current_ungated_symmetry_weight:.4f}) | "
+                  f"SelfDistill(raw/w): {raw_self_distill_retention_snap:.4f}/"
+                  f"{avg_self_distill_retention_loss:.4f} "
+                  f"(lambda={current_self_distill_retention_weight:.4f}, "
+                  f"pairs={self_distill_retention_stats['self_distill_retention_active_pair_frac']:.2%}) | "
                   f"Ortho Loss(raw/w): {raw_ortho_snap:.4f}/{avg_ortho_loss:.4f} | "
                   f"Adj Mean: {adj_mean:.3f} | "
                   f"Sparsity: {sparsity_ratio:.2%} | "
@@ -3775,8 +4268,9 @@ def train_brain_connectivity(
                       f"r={noise_guide_probe_stats['noise_probe_ratio_learned_over_patel']:.3f}) | "
                       f"guide_l1={noise_guide_probe_stats['noise_probe_guide_l1_mean']:.4f}")
             active_msg_mode = "causal" if message_dir_stats["msg_dir_mode_is_causal"] > 0.5 else "raw"
+            active_msg_edge_mode = str(getattr(model, "structure_message_edge_mode", "full"))
             preferred_msg_mode = "causal" if message_dir_stats["msg_dir_prefers_causal"] > 0.5 else "raw"
-            print(f"  [MsgDir] active={active_msg_mode} | "
+            print(f"  [MsgDir] active={active_msg_mode}/{active_msg_edge_mode} | "
                   f"raw_gap={message_dir_stats['msg_dir_raw_diag_gap']:.3f} | "
                   f"causal_gap={message_dir_stats['msg_dir_causal_diag_gap']:.3f} | "
                   f"delta(causal-raw)={message_dir_stats['msg_dir_gap_delta_causal_minus_raw']:.3f} | "
@@ -3846,12 +4340,51 @@ def train_brain_connectivity(
     model.best_epoch_score_only = fallback_best_epoch
     model.best_epoch_score_only_score = fallback_best_score
     model.quality_history = quality_history
+    if support_direction_snapshot_records is not None:
+        snapshot_payload: Dict[str, np.ndarray] = {
+            "epochs": np.asarray(
+                support_direction_snapshot_records["epochs"],
+                dtype=np.int32,
+            ),
+            "best_epoch": np.asarray([best_epoch], dtype=np.int32),
+            "final_epoch": np.asarray([num_epochs], dtype=np.int32),
+        }
+        for key in (
+            "support_logits",
+            "support_weights",
+            "direction_logits",
+            "direction_gate",
+            "adj_raw",
+            "adj_causal",
+        ):
+            snapshot_payload[key] = np.stack(
+                support_direction_snapshot_records[key],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        fixed_support_mask = getattr(model, "fixed_support_mask", None)
+        if fixed_support_mask is not None:
+            snapshot_payload["fixed_support_mask"] = (
+                fixed_support_mask.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+        else:
+            snapshot_payload["fixed_support_mask"] = np.zeros(
+                (num_nodes, num_nodes), dtype=np.float32
+            )
+        snapshot_payload["has_fixed_support_mask"] = np.asarray(
+            [int(fixed_support_mask is not None)],
+            dtype=np.int32,
+        )
+        model.support_direction_snapshots = snapshot_payload
     if selector_audit_gt_edges is not None and quality_history:
         primary_eps = selector_audit_strict_margin_eps_values[0]
         primary_key = selector_audit_strict_metric_field("strict_f1", primary_eps)
         gt_margin_key = "selector_audit_gt_signed_margin_median"
         audit_rows = [row for row in quality_history if primary_key in row]
         if audit_rows:
+            gate_margin_key = "selector_audit_gt_gate_signed_margin_median"
+            support_median_key = "selector_audit_gt_support_median"
+            support_p10_key = "selector_audit_gt_support_p10"
+            exported_margin_key = "selector_audit_gt_exported_signed_margin_median"
             best_gt_row = max(
                 audit_rows,
                 key=lambda row: (
@@ -3876,6 +4409,18 @@ def train_brain_connectivity(
                 "selector_audit_best_gt_proxy_score": float(best_gt_row.get("score", 0.0)),
                 "selector_audit_best_gt_primary_strict_f1": float(best_gt_row.get(primary_key, 0.0)),
                 "selector_audit_best_gt_signed_margin_median": float(best_gt_row.get(gt_margin_key, 0.0)),
+                "selector_audit_best_gt_exported_signed_margin_median": float(
+                    best_gt_row.get(exported_margin_key, best_gt_row.get(gt_margin_key, 0.0))
+                ),
+                "selector_audit_best_gt_gate_signed_margin_median": float(
+                    best_gt_row.get(gate_margin_key, 0.0)
+                ),
+                "selector_audit_best_gt_support_median": float(
+                    best_gt_row.get(support_median_key, 0.0)
+                ),
+                "selector_audit_best_gt_support_p10": float(
+                    best_gt_row.get(support_p10_key, 0.0)
+                ),
                 "selector_audit_best_gt_failure_mode": str(best_gt_row.get("selector_audit_failure_mode", "unknown")),
                 "selector_audit_exported_epoch": int(best_epoch),
                 "selector_audit_exported_primary_strict_f1": (
@@ -3883,6 +4428,27 @@ def train_brain_connectivity(
                 ),
                 "selector_audit_exported_signed_margin_median": (
                     float(exported_row.get(gt_margin_key, 0.0)) if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_gt_exported_signed_margin_median": (
+                    float(
+                        exported_row.get(
+                            exported_margin_key,
+                            exported_row.get(gt_margin_key, 0.0),
+                        )
+                    )
+                    if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_gt_gate_signed_margin_median": (
+                    float(exported_row.get(gate_margin_key, 0.0))
+                    if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_gt_support_median": (
+                    float(exported_row.get(support_median_key, 0.0))
+                    if exported_row is not None else 0.0
+                ),
+                "selector_audit_exported_gt_support_p10": (
+                    float(exported_row.get(support_p10_key, 0.0))
+                    if exported_row is not None else 0.0
                 ),
                 "selector_audit_exported_failure_mode": (
                     str(exported_row.get("selector_audit_failure_mode", "unknown"))
@@ -3894,6 +4460,27 @@ def train_brain_connectivity(
                 ),
                 "selector_audit_final_signed_margin_median": (
                     float(final_row.get(gt_margin_key, 0.0)) if final_row is not None else 0.0
+                ),
+                "selector_audit_final_gt_exported_signed_margin_median": (
+                    float(
+                        final_row.get(
+                            exported_margin_key,
+                            final_row.get(gt_margin_key, 0.0),
+                        )
+                    )
+                    if final_row is not None else 0.0
+                ),
+                "selector_audit_final_gt_gate_signed_margin_median": (
+                    float(final_row.get(gate_margin_key, 0.0))
+                    if final_row is not None else 0.0
+                ),
+                "selector_audit_final_gt_support_median": (
+                    float(final_row.get(support_median_key, 0.0))
+                    if final_row is not None else 0.0
+                ),
+                "selector_audit_final_gt_support_p10": (
+                    float(final_row.get(support_p10_key, 0.0))
+                    if final_row is not None else 0.0
                 ),
                 "selector_audit_final_failure_mode": (
                     str(final_row.get("selector_audit_failure_mode", "unknown"))
@@ -3924,6 +4511,27 @@ def train_brain_connectivity(
     model.gradient_routing_last_label = epoch_gradient_routing.label
     model.gradient_alignment_probe_enabled = int(enable_gradient_alignment_probe)
     model.gradient_alignment_probe_seed = int(gradient_alignment_probe_seed)
+    model.self_distill_direction_retention_lambda = float(
+        self_distill_direction_retention_lambda
+    )
+    model.self_distill_direction_retention_start_epoch = int(
+        self_distill_direction_retention_start_epoch
+    )
+    model.self_distill_direction_retention_ema = float(
+        self_distill_direction_retention_ema
+    )
+    model.self_distill_direction_retention_active_quantile = float(
+        self_distill_direction_retention_active_quantile
+    )
+    model.self_distill_direction_retention_margin_scale = float(
+        self_distill_direction_retention_margin_scale
+    )
+    model.self_distill_direction_retention_margin_floor = float(
+        self_distill_direction_retention_margin_floor
+    )
+    model.self_distill_direction_teacher_initialized_from_epoch = int(
+        self_distill_direction_teacher_initialized_from_epoch
+    )
 
     return model, adj_matrix, loss_history, collapse_history, best_epoch
 
@@ -4008,6 +4616,20 @@ def main():
     parser.add_argument('--support_prior_mode', type=str, default='patel_kappa',
                         choices=['patel_kappa', 'pearson_abs'],
                         help='Symmetric support-prior source used by fixed support masks and the diffusion noise guide')
+    parser.add_argument('--support_prior_algorithm', type=str, default='patel',
+                        choices=['patel', 'soft_patel'],
+                        help='Algorithm used for kappa-like support-strength priors outside the Pearson-only support path')
+    parser.add_argument('--direction_prior_algorithm', type=str, default='patel',
+                        choices=['patel', 'lag_gain'],
+                        help='Algorithm used for directional priors and direction-bias side paths')
+    parser.add_argument('--soft_patel_K', type=int, default=5,
+                        help='Number of soft-event thresholds used by the soft Patel support prior')
+    parser.add_argument('--soft_patel_beta', type=float, default=10.0,
+                        help='Sigmoid sharpness for soft-event support computation')
+    parser.add_argument('--lag_gain_ridge_lambda', type=float, default=1e-3,
+                        help='Ridge penalty used by the lag-gain direction prior')
+    parser.add_argument('--lag_gain_score_alpha', type=float, default=1.0,
+                        help='Direction sensitivity for the asymmetric lag-gain structure-init score')
     parser.add_argument('--structure_init_scale', type=float, default=1.0,
                         help='Target std of initial structure logits after SVD-based rescaling; 0 disables directional init strength')
     parser.add_argument('--emb_dim', type=int, default=0,
@@ -4018,19 +4640,25 @@ def main():
     parser.add_argument('--structure_message_graph_mode', type=str, default='raw',
                         choices=['raw', 'causal'],
                         help='Adjacency convention used for GraphConv message passing: raw keeps internal A[effect,cause], causal uses transpose A[cause,effect]')
+    parser.add_argument('--structure_message_edge_mode', type=str, default='full',
+                        choices=['full', 'support_only', 'support_only_preserve_budget'],
+                        help='Message-edge weighting for GraphConv: full uses support*direction_gate; support_only uses symmetric support only; support_only_preserve_budget uses 0.5*support to match the original pairwise message budget while keeping direction for auxiliary losses/export')
     parser.add_argument('--adj_activation', type=str, default='sigmoid',
                         choices=['sigmoid', 'sparsemax', 'entmax15'],
                         help='Adjacency activation: sigmoid = independent edges; sparsemax/entmax15 = competing parents per target')
     parser.add_argument('--kappa_logit_bias_scale', type=float, default=0.0,
-                        help='Persistent symmetric Patel-kappa bias added to structure logits during training')
+                        help='Persistent symmetric support-prior bias added to structure logits during training')
     parser.add_argument('--direction_logit_bias_scale', type=float, default=0.0,
-                        help='Persistent Patel-tau bias added to direction logits during training; for a pure residual setup prefer --direction_init_mode zeros or random')
+                        help='Persistent direction-prior bias added to direction logits during training; for a pure residual setup prefer --direction_init_mode zeros or random')
     parser.add_argument('--fixed_support_mask_mode', type=str, default='none',
                         choices=['none', 'topk_kappa', 'maxgap_kappa'],
                         help='Optional fixed undirected support mask injected into support/direction factorization')
     parser.add_argument('--direction_init_mode', type=str, default='patel_tau',
-                        choices=['patel_tau', 'zeros', 'random'],
+                        choices=['patel_tau', 'lag_gain', 'zeros', 'random'],
                         help='Initialization for the directional branch in support/direction factorization')
+    parser.add_argument('--direction_parameterization', type=str, default='factorized',
+                        choices=['factorized', 'skew_matrix'],
+                        help='Parameterization used by the direction branch inside support_direction: factorized = sender/receiver matrix, skew_matrix = direct skew-contrast parameter')
 
     parser.add_argument('--selection_start_epoch', type=int, default=6,
                         help='First epoch eligible for best-epoch export selection')
@@ -4145,12 +4773,14 @@ def main():
     parser.add_argument('--detach_direction_from_main_after_epoch', type=int, default=-1,
                         help='Detach the direction gate from main denoising/causal-lag gradients after this many full epochs; -1 disables')
     parser.add_argument('--gradient_routing_mode', type=str, default='legacy',
-                        choices=['legacy', 'orthogonal', 'warmup_then_orthogonal'],
-                        help="Explicit loss-to-branch routing: legacy preserves current detach behavior; orthogonal makes main/structure support-only and causal-lag direction-only from epoch 1; warmup_then_orthogonal switches at --detach_direction_from_main_after_epoch")
+                        choices=['legacy', 'main_detach_only', 'orthogonal', 'warmup_then_orthogonal'],
+                        help="Explicit loss-to-branch routing: legacy preserves current detach behavior; main_detach_only detaches only the main denoising path after --detach_direction_from_main_after_epoch; orthogonal makes main/structure support-only and causal-lag direction-only from epoch 1; warmup_then_orthogonal switches to that orthogonal split at --detach_direction_from_main_after_epoch")
     parser.add_argument('--enable_gradient_alignment_probe', action='store_true', default=False,
                         help='Record end-of-epoch gradient alignment diagnostics on the direction branch')
     parser.add_argument('--gradient_alignment_probe_seed', type=int, default=0,
                         help='RNG seed used by the fixed gradient-alignment probe forward pass')
+    parser.add_argument('--save_support_direction_snapshots', action='store_true', default=False,
+                        help='Save per-epoch support/direction branch snapshots for offline epoch-swap analysis')
     parser.add_argument('--causal_lag_main_weight', type=float, default=0.0,
                         help='Weight of the lagged candidate-parent reconstruction term inside the main denoising branch; 0 disables')
     parser.add_argument('--causal_lag_main_aggregation', type=str, default='mean',
@@ -4182,6 +4812,18 @@ def main():
                         help='Warmup epochs before ungated-pair symmetry regularization activates')
     parser.add_argument('--ungated_symmetry_ramp_epochs', type=int, default=1,
                         help='Linear ramp epochs for ungated-pair symmetry regularization')
+    parser.add_argument('--self_distill_direction_retention_lambda', type=float, default=0.0,
+                        help='Late-stage self-distilled anti-tie retention weight on causal direction logits')
+    parser.add_argument('--self_distill_direction_retention_start_epoch', type=int, default=-1,
+                        help='First epoch that enables the self-distilled direction retention loss; -1 disables')
+    parser.add_argument('--self_distill_direction_retention_ema', type=float, default=0.9,
+                        help='EMA coefficient for the detached teacher logits used by self-distilled retention')
+    parser.add_argument('--self_distill_direction_retention_active_quantile', type=float, default=0.5,
+                        help='Teacher-margin quantile used to choose confident pairs for self-distilled retention')
+    parser.add_argument('--self_distill_direction_retention_margin_scale', type=float, default=0.5,
+                        help='Fraction of teacher margin that the student must retain on active pairs')
+    parser.add_argument('--self_distill_direction_retention_margin_floor', type=float, default=0.0,
+                        help='Minimum retained margin target enforced by self-distilled retention')
 
     # === Fix 6: Loss function ===
     parser.add_argument('--loss_type', type=str, default='denoise_hybrid',
@@ -4203,6 +4845,8 @@ def main():
         parser.error('--ungated_symmetry_lambda requires --directional_kappa_gate')
     if args.fixed_support_mask_mode != 'none' and args.structure_parameterization != 'support_direction':
         parser.error('--fixed_support_mask_mode requires --structure_parameterization support_direction')
+    if args.structure_message_edge_mode != 'full' and args.structure_parameterization != 'support_direction':
+        parser.error('--structure_message_edge_mode support_only/support_only_preserve_budget requires --structure_parameterization support_direction')
     if args.direction_lr_multiplier <= 0.0:
         parser.error('--direction_lr_multiplier must be > 0')
     if args.freeze_direction_after_epoch < -1:
@@ -4210,11 +4854,11 @@ def main():
     if args.detach_direction_from_main_after_epoch < -1:
         parser.error('--detach_direction_from_main_after_epoch must be >= -1')
     if (
-        args.gradient_routing_mode == 'warmup_then_orthogonal' and
+        args.gradient_routing_mode in {'main_detach_only', 'warmup_then_orthogonal'} and
         args.detach_direction_from_main_after_epoch < 0
     ):
         parser.error(
-            '--gradient_routing_mode warmup_then_orthogonal requires '
+            f'--gradient_routing_mode {args.gradient_routing_mode} requires '
             '--detach_direction_from_main_after_epoch >= 0'
         )
     if args.directional_loss_end_epoch < -1:
@@ -4234,19 +4878,24 @@ def main():
             abs(args.direction_lr_multiplier - 1.0) > 1e-12 or
             args.freeze_direction_after_epoch >= 0 or
             args.detach_direction_from_main_after_epoch >= 0 or
-            args.gradient_routing_mode != 'legacy'
+            args.gradient_routing_mode != 'legacy' or
+            args.direction_parameterization != 'factorized'
         ) and
         args.structure_parameterization != 'support_direction'
     ):
         parser.error(
             '--direction_lr_multiplier, --freeze_direction_after_epoch, '
             '--detach_direction_from_main_after_epoch, and '
-            '--gradient_routing_mode require '
+            '--gradient_routing_mode, and --direction_parameterization require '
             '--structure_parameterization support_direction'
         )
     if args.enable_gradient_alignment_probe and args.structure_parameterization != 'support_direction':
         parser.error(
             '--enable_gradient_alignment_probe requires --structure_parameterization support_direction'
+        )
+    if args.save_support_direction_snapshots and args.structure_parameterization != 'support_direction':
+        parser.error(
+            '--save_support_direction_snapshots requires --structure_parameterization support_direction'
         )
     if args.causal_lag_main_weight < 0.0:
         parser.error('--causal_lag_main_weight must be >= 0')
@@ -4272,6 +4921,33 @@ def main():
         parser.error('--selection_primary_skeleton_tiebreak_weight must be >= 0')
     if args.selection_primary_density_tiebreak_weight < 0.0:
         parser.error('--selection_primary_density_tiebreak_weight must be >= 0')
+    if args.self_distill_direction_retention_lambda < 0.0:
+        parser.error('--self_distill_direction_retention_lambda must be >= 0')
+    if args.self_distill_direction_retention_start_epoch < -1:
+        parser.error('--self_distill_direction_retention_start_epoch must be >= -1')
+    if args.self_distill_direction_retention_lambda > 0.0 and args.self_distill_direction_retention_start_epoch < 0:
+        parser.error(
+            '--self_distill_direction_retention_start_epoch must be >= 0 when '
+            '--self_distill_direction_retention_lambda is enabled'
+        )
+    if not 0.0 <= args.self_distill_direction_retention_ema < 1.0:
+        parser.error('--self_distill_direction_retention_ema must be in [0, 1)')
+    if not 0.0 <= args.self_distill_direction_retention_active_quantile <= 1.0:
+        parser.error('--self_distill_direction_retention_active_quantile must be in [0, 1]')
+    if args.self_distill_direction_retention_margin_scale < 0.0:
+        parser.error('--self_distill_direction_retention_margin_scale must be >= 0')
+    if args.self_distill_direction_retention_margin_floor < 0.0:
+        parser.error('--self_distill_direction_retention_margin_floor must be >= 0')
+    if args.soft_patel_K <= 0:
+        parser.error('--soft_patel_K must be > 0')
+    if args.soft_patel_beta <= 0.0:
+        parser.error('--soft_patel_beta must be > 0')
+    if args.lag_gain_ridge_lambda < 0.0:
+        parser.error('--lag_gain_ridge_lambda must be >= 0')
+    if args.lag_gain_score_alpha < 0.0:
+        parser.error('--lag_gain_score_alpha must be >= 0')
+    if args.direction_init_mode == 'lag_gain' and args.direction_prior_algorithm != 'lag_gain':
+        parser.error('--direction_init_mode lag_gain requires --direction_prior_algorithm lag_gain')
 
     try:
         causal_lag_main_lags, causal_lag_main_lag_weights = resolve_lag_weight_spec(
@@ -4316,6 +4992,8 @@ def main():
     print("=" * 60)
 
     print(f"Device: {args.device}")
+    print(f"Support prior algorithm: {args.support_prior_algorithm}")
+    print(f"Direction prior algorithm: {args.direction_prior_algorithm}")
     print(f"Support prior mode: {args.support_prior_mode}")
 
     print(f"Time points per subject (raw): {args.time_points}")
@@ -4417,21 +5095,76 @@ def main():
     patel_score_matrix = torch.from_numpy(patel_score_np).float()
     patel_kappa_matrix = torch.from_numpy(patel_kappa_np).float()
     patel_tau_matrix = torch.from_numpy(patel_tau_np).float()
+    soft_support_np = None
+    lag_direction_np = None
+    direction_reliability_np = None
+    asymmetric_score_np = None
+    soft_support_matrix = None
+    lag_direction_matrix = None
+    direction_reliability_matrix = None
+    asymmetric_score_matrix = None
 
     print(f"Patel score range: [{patel_score_matrix.min():.4f}, {patel_score_matrix.max():.4f}]")
     print(f"Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
     print(f"Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
 
+    if args.support_prior_algorithm == 'soft_patel' or args.direction_prior_algorithm == 'lag_gain':
+        print("\nComputing soft support / lag-gain prior components...")
+        soft_support_np, lag_direction_np, direction_reliability_np, asymmetric_score_np = (
+            compute_soft_prior_components(
+                data_3d=data_3d,
+                K=args.soft_patel_K,
+                beta=args.soft_patel_beta,
+                lags=causal_lag_main_lags,
+                lag_weights=causal_lag_main_lag_weights,
+                ridge_lambda=args.lag_gain_ridge_lambda,
+                score_alpha=args.lag_gain_score_alpha,
+            )
+        )
+        soft_support_matrix = torch.from_numpy(soft_support_np).float()
+        lag_direction_matrix = torch.from_numpy(lag_direction_np).float()
+        direction_reliability_matrix = torch.from_numpy(direction_reliability_np).float()
+        asymmetric_score_matrix = torch.from_numpy(asymmetric_score_np).float()
+        print(
+            f"Soft support range: [{soft_support_matrix.min():.4f}, {soft_support_matrix.max():.4f}] "
+            f"(K={args.soft_patel_K}, beta={args.soft_patel_beta:g})"
+        )
+        print(
+            f"Lag direction range: [{lag_direction_matrix.min():.4f}, {lag_direction_matrix.max():.4f}] "
+            f"(lags={list(causal_lag_main_lags)})"
+        )
+        print(
+            "Direction reliability range: "
+            f"[{direction_reliability_matrix.min():.4f}, {direction_reliability_matrix.max():.4f}]"
+        )
+
+    effective_kappa_matrix = (
+        soft_support_matrix if args.support_prior_algorithm == 'soft_patel' else patel_kappa_matrix
+    )
+    effective_tau_matrix = (
+        lag_direction_matrix if args.direction_prior_algorithm == 'lag_gain' else patel_tau_matrix
+    )
+    effective_reliability_matrix = (
+        direction_reliability_matrix if args.direction_prior_algorithm == 'lag_gain' else None
+    )
+    effective_score_matrix = patel_score_matrix
+    if (
+        args.support_prior_algorithm == 'soft_patel' and
+        args.direction_prior_algorithm == 'lag_gain' and
+        asymmetric_score_matrix is not None
+    ):
+        effective_score_matrix = asymmetric_score_matrix.t()
+
     structure_init_matrix = build_structure_init_matrix(
         mode=args.structure_init_mode,
-        patel_score_matrix=patel_score_matrix,
-        patel_kappa_matrix=patel_kappa_matrix,
+        patel_score_matrix=effective_score_matrix,
+        patel_kappa_matrix=effective_kappa_matrix,
         pearson_matrix=pearson_matrix.float(),
         seed=args.seed,
     )
     support_prior_matrix = build_support_prior_matrix(
         mode=args.support_prior_mode,
-        patel_kappa_matrix=patel_kappa_matrix,
+        patel_kappa_matrix=effective_kappa_matrix,
         pearson_matrix=pearson_matrix.float(),
     )
     print(f"Structure init mode: {args.structure_init_mode} | "
@@ -4441,16 +5174,19 @@ def main():
           f"range=[{support_prior_matrix.min():.4f}, {support_prior_matrix.max():.4f}]")
     if args.structure_parameterization == 'support_direction':
         print(f"Support/direction factorization: enabled | direction_init={args.direction_init_mode} | "
-              f"fixed_support_mask={args.fixed_support_mask_mode}")
+              f"direction_parameterization={args.direction_parameterization} | "
+              f"fixed_support_mask={args.fixed_support_mask_mode} | "
+              f"message_edge_mode={args.structure_message_edge_mode}")
     if args.kappa_logit_bias_scale != 0.0:
+        effective_kappa_sym = torch.maximum(effective_kappa_matrix, effective_kappa_matrix.t())
         print(
             "Kappa logit bias: enabled | "
             f"scale={args.kappa_logit_bias_scale} | "
-            f"sym_range=[{torch.clamp(patel_kappa_matrix, min=0.0).min():.4f}, "
-            f"{torch.clamp(patel_kappa_matrix, min=0.0).max():.4f}]"
+            f"sym_range=[{torch.clamp(effective_kappa_sym, min=0.0).min():.4f}, "
+            f"{torch.clamp(effective_kappa_sym, min=0.0).max():.4f}]"
         )
     if args.direction_logit_bias_scale != 0.0:
-        tau_contrast = patel_tau_matrix - patel_tau_matrix.t()
+        tau_contrast = effective_tau_matrix - effective_tau_matrix.t()
         print(
             "Direction logit bias: enabled | "
             f"scale={args.direction_logit_bias_scale} | "
@@ -4475,8 +5211,18 @@ def main():
         print(f"Ungated-pair symmetry: enabled | lambda={args.ungated_symmetry_lambda} | "
               f"warmup={args.ungated_symmetry_warmup_epochs} | "
               f"ramp={args.ungated_symmetry_ramp_epochs}")
+    if args.self_distill_direction_retention_lambda > 0.0:
+        print(
+            "Self-distilled retention: enabled | "
+            f"lambda={args.self_distill_direction_retention_lambda:g} | "
+            f"start_epoch={args.self_distill_direction_retention_start_epoch} | "
+            f"ema={args.self_distill_direction_retention_ema:.3f} | "
+            f"active_quantile={args.self_distill_direction_retention_active_quantile:.2f} | "
+            f"margin_scale={args.self_distill_direction_retention_margin_scale:.3f} | "
+            f"margin_floor={args.self_distill_direction_retention_margin_floor:.4f}"
+        )
     if not args.disable_directional_loss:
-        print(f"Directional prior: enabled | source=patel_tau | "
+        print(f"Directional prior: enabled | source={args.direction_prior_algorithm} | "
               f"schedule={args.directional_schedule} | "
               f"target_ratio={args.directional_target_ratio} | "
               f"end_epoch={args.directional_loss_end_epoch}")
@@ -4489,6 +5235,8 @@ def main():
               f"gradient_routing_mode={args.gradient_routing_mode}")
     if args.enable_gradient_alignment_probe:
         print(f"Gradient alignment probe: enabled | seed={args.gradient_alignment_probe_seed}")
+    if args.save_support_direction_snapshots:
+        print("Support/direction snapshots: enabled")
 
     # Step 3: Build noise-guide skeleton from the selected symmetric support prior.
     noise_selection_mode = 'maxgap' if args.fixed_support_mask_mode == 'maxgap_kappa' else 'topk'
@@ -4520,6 +5268,12 @@ def main():
 
     if args.direction_init_mode == 'patel_tau':
         direction_init_matrix = patel_tau_matrix.clone()
+    elif args.direction_init_mode == 'lag_gain':
+        if args.direction_prior_algorithm != 'lag_gain' or lag_direction_matrix is None:
+            raise ValueError(
+                "direction_init_mode='lag_gain' requires direction_prior_algorithm='lag_gain'"
+            )
+        direction_init_matrix = lag_direction_matrix.clone()
     elif args.direction_init_mode == 'zeros':
         direction_init_matrix = torch.zeros_like(patel_tau_matrix)
     else:
@@ -4538,14 +5292,19 @@ def main():
     os.makedirs(result_dir, exist_ok=True)
 
     print(f"\nResults will be saved to: {result_dir}")
+    if soft_support_np is not None:
+        np.save(os.path.join(result_dir, 'soft_support.npy'), soft_support_np)
+        np.save(os.path.join(result_dir, 'lag_direction.npy'), lag_direction_np)
+        np.save(os.path.join(result_dir, 'direction_reliability.npy'), direction_reliability_np)
+        np.save(os.path.join(result_dir, 'asymmetric_score.npy'), asymmetric_score_np)
 
     
 
     # Step 6: Train model
 
     # - structure_init_matrix: chosen matrix for sender/receiver initialization
-    # - patel_tau_matrix: weak directional prior only
-    # - patel_kappa_matrix: skeleton prior for proxy scoring / noise guidance
+    # - effective_tau_matrix: weak directional prior only
+    # - effective_kappa_matrix: skeleton prior for proxy scoring / noise guidance
 
     model, adj_matrix, loss_history, collapse_history, best_epoch = train_brain_connectivity(
 
@@ -4560,8 +5319,9 @@ def main():
         noise_guide_adj=noise_guide_adj,  # For neighbor-based noise
 
         patel_matrix=structure_init_matrix,  # Chosen matrix for SVD init
-        patel_direction_matrix=patel_tau_matrix,  # Pure direction prior for margin loss
-        patel_strength_matrix=torch.clamp(patel_kappa_matrix, min=0.0),  # Skeleton prior
+        patel_direction_matrix=effective_tau_matrix,  # Pure direction prior for margin loss
+        patel_strength_matrix=effective_kappa_matrix,  # Skeleton prior for selector / gates / bias
+        direction_prior_reliability_matrix=effective_reliability_matrix,
         target_edge_count=k_pairs,
 
         num_epochs=args.epochs,
@@ -4611,6 +5371,7 @@ def main():
         gradient_routing_mode=args.gradient_routing_mode,
         enable_gradient_alignment_probe=args.enable_gradient_alignment_probe,
         gradient_alignment_probe_seed=args.gradient_alignment_probe_seed,
+        save_support_direction_snapshots=args.save_support_direction_snapshots,
         causal_lag_main_weight=args.causal_lag_main_weight,
         causal_lag_main_aggregation=args.causal_lag_main_aggregation,
         causal_lag_main_softmax_temp=args.causal_lag_main_softmax_temp,
@@ -4626,6 +5387,12 @@ def main():
         ungated_symmetry_lambda=args.ungated_symmetry_lambda,
         ungated_symmetry_warmup_epochs=args.ungated_symmetry_warmup_epochs,
         ungated_symmetry_ramp_epochs=args.ungated_symmetry_ramp_epochs,
+        self_distill_direction_retention_lambda=args.self_distill_direction_retention_lambda,
+        self_distill_direction_retention_start_epoch=args.self_distill_direction_retention_start_epoch,
+        self_distill_direction_retention_ema=args.self_distill_direction_retention_ema,
+        self_distill_direction_retention_active_quantile=args.self_distill_direction_retention_active_quantile,
+        self_distill_direction_retention_margin_scale=args.self_distill_direction_retention_margin_scale,
+        self_distill_direction_retention_margin_floor=args.self_distill_direction_retention_margin_floor,
         selection_agreement_weight=args.selection_agreement_weight,
         selection_agreement_mode=args.selection_agreement_mode,
         selection_score_mode=args.selection_score_mode,
@@ -4649,7 +5416,9 @@ def main():
             'init_logit_scale': args.structure_init_scale,
             'emb_dim': None if args.emb_dim <= 0 else args.emb_dim,
             'structure_parameterization': args.structure_parameterization,
+            'direction_parameterization': args.direction_parameterization,
             'structure_message_graph_mode': args.structure_message_graph_mode,
+            'structure_message_edge_mode': args.structure_message_edge_mode,
             'adj_activation': args.adj_activation,
             'kappa_logit_bias_scale': args.kappa_logit_bias_scale,
             'direction_logit_bias_scale': args.direction_logit_bias_scale,
@@ -4856,6 +5625,8 @@ def main():
     config['requested_emb_dim'] = int(args.emb_dim)
     config['effective_emb_dim'] = int(getattr(model, 'emb_dim', num_nodes))
     config['structure_message_graph_mode'] = str(getattr(model, 'structure_message_graph_mode', args.structure_message_graph_mode))
+    config['structure_message_edge_mode'] = str(getattr(model, 'structure_message_edge_mode', args.structure_message_edge_mode))
+    config['direction_parameterization'] = str(getattr(model, 'direction_parameterization', args.direction_parameterization))
     config['adj_activation'] = str(getattr(model, 'adj_activation', args.adj_activation))
     config['kappa_logit_bias_scale'] = float(getattr(model, 'kappa_logit_bias_scale', args.kappa_logit_bias_scale))
     config['direction_logit_bias_scale'] = float(getattr(model, 'direction_logit_bias_scale', args.direction_logit_bias_scale))
@@ -4875,6 +5646,52 @@ def main():
     config['direction_from_main_detached_from_epoch'] = int(
         getattr(model, 'direction_from_main_detached_from_epoch', -1)
     )
+    config['self_distill_direction_retention_lambda'] = float(
+        getattr(
+            model,
+            'self_distill_direction_retention_lambda',
+            args.self_distill_direction_retention_lambda,
+        )
+    )
+    config['self_distill_direction_retention_start_epoch'] = int(
+        getattr(
+            model,
+            'self_distill_direction_retention_start_epoch',
+            args.self_distill_direction_retention_start_epoch,
+        )
+    )
+    config['self_distill_direction_retention_ema'] = float(
+        getattr(
+            model,
+            'self_distill_direction_retention_ema',
+            args.self_distill_direction_retention_ema,
+        )
+    )
+    config['self_distill_direction_retention_active_quantile'] = float(
+        getattr(
+            model,
+            'self_distill_direction_retention_active_quantile',
+            args.self_distill_direction_retention_active_quantile,
+        )
+    )
+    config['self_distill_direction_retention_margin_scale'] = float(
+        getattr(
+            model,
+            'self_distill_direction_retention_margin_scale',
+            args.self_distill_direction_retention_margin_scale,
+        )
+    )
+    config['self_distill_direction_retention_margin_floor'] = float(
+        getattr(
+            model,
+            'self_distill_direction_retention_margin_floor',
+            args.self_distill_direction_retention_margin_floor,
+        )
+    )
+    config['self_distill_direction_teacher_initialized_from_epoch'] = int(
+        getattr(model, 'self_distill_direction_teacher_initialized_from_epoch', -1)
+    )
+    config['save_support_direction_snapshots'] = bool(args.save_support_direction_snapshots)
     config['gradient_routing_last_label'] = getattr(model, 'gradient_routing_last_label', 'unknown')
     final_adj_diag = getattr(model, 'last_epoch_adj_diagnostics', None)
     if final_adj_diag is not None:
@@ -4933,6 +5750,11 @@ def main():
             float_format='%.6f',
         )
         print(f"Saved selector audit summary to: {selector_audit_summary_path}")
+    support_direction_snapshots = getattr(model, 'support_direction_snapshots', None)
+    if support_direction_snapshots is not None:
+        snapshot_path = os.path.join(result_dir, 'support_direction_snapshots.npz')
+        np.savez_compressed(snapshot_path, **support_direction_snapshots)
+        print(f"Saved support/direction snapshots to: {snapshot_path}")
 
     # Save Patel matrices for reference (both npy and csv)
     np.save(os.path.join(result_dir, 'patel_score.npy'), patel_score_matrix.numpy())
@@ -4998,6 +5820,8 @@ def main():
     print(f"  - pearson_matrix.csv")
 
     print(f"  - patel_score.csv / patel_kappa.csv / patel_tau.csv")
+    if soft_support_np is not None:
+        print(f"  - soft_support.npy / lag_direction.npy / direction_reliability.npy / asymmetric_score.npy")
 
     print(f"  - config.npy")
 
@@ -5028,15 +5852,23 @@ def main():
         print(f"  - Primary strict eps: {selector_audit_summary['selector_audit_primary_margin_eps']:g}")
         print(f"  - Best GT epoch: {selector_audit_summary['selector_audit_best_gt_epoch']} | "
               f"strict={selector_audit_summary['selector_audit_best_gt_primary_strict_f1']:.4f} | "
-              f"gt_margin_med={selector_audit_summary['selector_audit_best_gt_signed_margin_median']:+.4f} | "
+              f"exp_margin_med={selector_audit_summary['selector_audit_best_gt_exported_signed_margin_median']:+.4f} | "
+              f"gate_margin_med={selector_audit_summary['selector_audit_best_gt_gate_signed_margin_median']:+.4f} | "
+              f"support_med={selector_audit_summary['selector_audit_best_gt_support_median']:.4f} | "
               f"mode={selector_audit_summary['selector_audit_best_gt_failure_mode']}")
         print(f"  - Exported epoch: {selector_audit_summary['selector_audit_exported_epoch']} | "
               f"strict={selector_audit_summary['selector_audit_exported_primary_strict_f1']:.4f} | "
               f"gap_vs_best={selector_audit_summary['selector_audit_exported_vs_best_gt_gap_primary_strict_f1']:+.4f} | "
+              f"exp_margin_med={selector_audit_summary['selector_audit_exported_gt_exported_signed_margin_median']:+.4f} | "
+              f"gate_margin_med={selector_audit_summary['selector_audit_exported_gt_gate_signed_margin_median']:+.4f} | "
+              f"support_med={selector_audit_summary['selector_audit_exported_gt_support_median']:.4f} | "
               f"mode={selector_audit_summary['selector_audit_exported_failure_mode']}")
         print(f"  - Final epoch: {selector_audit_summary['selector_audit_final_epoch']} | "
               f"strict={selector_audit_summary['selector_audit_final_primary_strict_f1']:.4f} | "
               f"gap_vs_best={selector_audit_summary['selector_audit_final_vs_best_gt_gap_primary_strict_f1']:+.4f} | "
+              f"exp_margin_med={selector_audit_summary['selector_audit_final_gt_exported_signed_margin_median']:+.4f} | "
+              f"gate_margin_med={selector_audit_summary['selector_audit_final_gt_gate_signed_margin_median']:+.4f} | "
+              f"support_med={selector_audit_summary['selector_audit_final_gt_support_median']:.4f} | "
               f"mode={selector_audit_summary['selector_audit_final_failure_mode']}")
 
     
