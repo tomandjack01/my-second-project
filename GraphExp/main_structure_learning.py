@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from models import DDM
+from models.DDM import NodeSpecificTemporalEncoder
 from utils.patel_util import compute_patel_components
 from utils.soft_prior_util import compute_soft_prior_components
 
@@ -331,6 +332,145 @@ def compute_global_pearson(data_2d: torch.Tensor):
     
 
     return pearson_matrix
+
+
+def _extract_encoder_state_dict(checkpoint: Any) -> Dict[str, torch.Tensor]:
+    """Normalize supported checkpoint layouts to a temporal-encoder state dict."""
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Expected temporal encoder checkpoint to be a state-dict-like object")
+
+    if "model_state_dict" in checkpoint:
+        model_state = checkpoint["model_state_dict"]
+        if not isinstance(model_state, dict):
+            raise TypeError("checkpoint['model_state_dict'] is not a state dict")
+        encoder_state = {
+            key[len("temporal_encoder."):]: value
+            for key, value in model_state.items()
+            if key.startswith("temporal_encoder.")
+        }
+        if encoder_state:
+            return encoder_state
+
+    if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+        checkpoint = checkpoint["state_dict"]
+
+    if not all(isinstance(key, str) for key in checkpoint.keys()):
+        raise TypeError("Temporal encoder checkpoint keys must be strings")
+
+    normalized: Dict[str, torch.Tensor] = {}
+    for key, value in checkpoint.items():
+        clean_key = key[len("module."):] if key.startswith("module.") else key
+        clean_key = (
+            clean_key[len("temporal_encoder."):]
+            if clean_key.startswith("temporal_encoder.")
+            else clean_key
+        )
+        normalized[clean_key] = value
+    return normalized
+
+
+def _load_compatible_encoder_weights(
+    encoder: NodeSpecificTemporalEncoder,
+    state_dict: Dict[str, torch.Tensor],
+    checkpoint_path: str,
+) -> None:
+    """Load checkpoint tensors that match the current time length."""
+    target_state = encoder.state_dict()
+    compatible_state: Dict[str, torch.Tensor] = {}
+    skipped_keys: List[str] = []
+    for key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            skipped_keys.append(key)
+            continue
+        if key not in target_state:
+            skipped_keys.append(key)
+            continue
+        if tuple(value.shape) != tuple(target_state[key].shape):
+            skipped_keys.append(key)
+            continue
+        compatible_state[key] = value
+
+    if not compatible_state:
+        raise ValueError(
+            f"No compatible temporal encoder tensors found in {checkpoint_path}"
+        )
+
+    encoder.load_state_dict(compatible_state, strict=False)
+    if skipped_keys:
+        preview = ", ".join(skipped_keys[:6])
+        suffix = "" if len(skipped_keys) <= 6 else f", ... (+{len(skipped_keys) - 6})"
+        print(
+            "[Encoded Patel] Skipped checkpoint tensors with incompatible names/shapes: "
+            f"{preview}{suffix}"
+        )
+
+
+def resolve_existing_path(path: str) -> str:
+    """Resolve a user path against cwd, this script dir, and repo root."""
+    expanded = os.path.expanduser(path)
+    candidates = [expanded]
+    if not os.path.isabs(expanded):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(script_dir, expanded))
+        candidates.append(os.path.join(os.path.dirname(script_dir), expanded))
+    for candidate in candidates:
+        resolved = os.path.abspath(candidate)
+        if os.path.exists(resolved):
+            return resolved
+    return os.path.abspath(expanded)
+
+
+@torch.no_grad()
+def compute_encoded_patel_components(
+    data_3d: torch.Tensor,
+    checkpoint_path: str,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """
+    Encode [S, N, T] with a frozen temporal encoder and compute Patel on [S*T, N].
+
+    The unnormalized encoder output is used to match the denoising target path.
+    Shape-mismatched time-length-specific tensors are ignored so short smoke runs
+    with --time_limit can still load the convolutional encoder body.
+    """
+    resolved_checkpoint = resolve_existing_path(checkpoint_path)
+    if not os.path.exists(resolved_checkpoint):
+        raise FileNotFoundError(f"Missing prior encoder checkpoint: {checkpoint_path}")
+
+    state_dict = _extract_encoder_state_dict(
+        torch.load(resolved_checkpoint, map_location="cpu")
+    )
+    hidden_channels = 32
+    conv1_weight = state_dict.get("conv1.conv.weight")
+    if isinstance(conv1_weight, torch.Tensor) and conv1_weight.dim() >= 1:
+        hidden_channels = int(conv1_weight.shape[0])
+
+    time_points = int(data_3d.shape[-1])
+    num_nodes = int(data_3d.shape[1])
+    encoder = NodeSpecificTemporalEncoder(
+        time_points=time_points,
+        hidden_channels=hidden_channels,
+        output_dim=time_points,
+    )
+    _load_compatible_encoder_weights(encoder, state_dict, resolved_checkpoint)
+    encoder.to(device)
+    encoder.eval()
+
+    encoded_subjects: List[torch.Tensor] = []
+    for subject_idx in range(int(data_3d.shape[0])):
+        x = data_3d[subject_idx].to(device)
+        _, unnormalized = encoder(x, return_unnormalized=True)
+        if tuple(unnormalized.shape) != (num_nodes, time_points):
+            raise RuntimeError(
+                "Temporal encoder returned an unexpected shape for encoded Patel: "
+                f"{tuple(unnormalized.shape)} vs expected {(num_nodes, time_points)}"
+            )
+        encoded_subjects.append(unnormalized.detach().cpu().float())
+
+    encoded_3d = torch.stack(encoded_subjects, dim=0)  # [S, N, T]
+    encoded_2d = encoded_3d.permute(0, 2, 1).reshape(-1, num_nodes).contiguous()
+    score_np, kappa_np, tau_np = compute_patel_components(encoded_2d.numpy())
+    return score_np, kappa_np, tau_np, resolved_checkpoint
 
 
 def compute_target_density(num_nodes: int, target_edge_count: int, eps: float = 1e-4) -> float:
@@ -1017,6 +1157,96 @@ def capture_support_direction_snapshot(model: DDM) -> Optional[Dict[str, torch.T
         "adj_raw": adj_raw,
         "adj_causal": to_causal_matrix_torch(adj_raw),
     }
+
+
+@torch.no_grad()
+def compute_direction_branch_change_diagnostics(
+    current_snapshot: Optional[Dict[str, torch.Tensor]],
+    previous_snapshot: Optional[Dict[str, torch.Tensor]],
+    *,
+    fixed_support_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    """
+    Measure how fast the direction branch is still moving.
+
+    These diagnostics are logging-only. They do not affect training behavior.
+    We report both whole-matrix deltas and active-support deltas so later
+    scheduling logic can distinguish "globally quiet" from "quiet on the
+    support pairs that actually matter for export".
+    """
+    default_stats = {
+        "direction_change_available": 0.0,
+        "direction_logits_delta_mean": 0.0,
+        "direction_logits_delta_median": 0.0,
+        "direction_logits_delta_p90": 0.0,
+        "direction_gate_delta_mean": 0.0,
+        "direction_gate_delta_median": 0.0,
+        "direction_gate_delta_p90": 0.0,
+        "direction_active_pair_frac": 0.0,
+        "direction_active_logits_delta_mean": 0.0,
+        "direction_active_logits_delta_median": 0.0,
+        "direction_active_gate_delta_mean": 0.0,
+        "direction_active_gate_delta_median": 0.0,
+    }
+    if current_snapshot is None or previous_snapshot is None:
+        return default_stats
+
+    current_logits = current_snapshot["direction_logits"]
+    previous_logits = previous_snapshot["direction_logits"].to(current_logits.device)
+    current_gate = current_snapshot["direction_gate"]
+    previous_gate = previous_snapshot["direction_gate"].to(current_gate.device)
+
+    if current_logits.shape != previous_logits.shape or current_gate.shape != previous_gate.shape:
+        return default_stats
+
+    num_nodes = current_logits.shape[0]
+    offdiag_mask = ~torch.eye(num_nodes, dtype=torch.bool, device=current_logits.device)
+    active_mask = offdiag_mask
+    if fixed_support_mask is not None:
+        active_mask = active_mask & fixed_support_mask.to(
+            device=current_logits.device,
+            dtype=torch.bool,
+        )
+
+    logits_delta = torch.abs(current_logits - previous_logits)
+    gate_delta = torch.abs(current_gate - previous_gate)
+    logits_vals = logits_delta.masked_select(offdiag_mask)
+    gate_vals = gate_delta.masked_select(offdiag_mask)
+    active_logits_vals = logits_delta.masked_select(active_mask)
+    active_gate_vals = gate_delta.masked_select(active_mask)
+
+    def summarize(values: torch.Tensor, prefix: str) -> Dict[str, float]:
+        if values.numel() == 0:
+            return {
+                f"{prefix}_mean": 0.0,
+                f"{prefix}_median": 0.0,
+                f"{prefix}_p90": 0.0,
+            }
+        return {
+            f"{prefix}_mean": float(values.mean().item()),
+            f"{prefix}_median": float(values.median().item()),
+            f"{prefix}_p90": float(torch.quantile(values, 0.90).item()),
+        }
+
+    stats = {
+        "direction_change_available": 1.0,
+        "direction_active_pair_frac": float(active_mask.float().mean().item()),
+        **summarize(logits_vals, "direction_logits_delta"),
+        **summarize(gate_vals, "direction_gate_delta"),
+    }
+    if active_logits_vals.numel() > 0:
+        stats["direction_active_logits_delta_mean"] = float(active_logits_vals.mean().item())
+        stats["direction_active_logits_delta_median"] = float(active_logits_vals.median().item())
+    else:
+        stats["direction_active_logits_delta_mean"] = 0.0
+        stats["direction_active_logits_delta_median"] = 0.0
+    if active_gate_vals.numel() > 0:
+        stats["direction_active_gate_delta_mean"] = float(active_gate_vals.mean().item())
+        stats["direction_active_gate_delta_median"] = float(active_gate_vals.median().item())
+    else:
+        stats["direction_active_gate_delta_mean"] = 0.0
+        stats["direction_active_gate_delta_median"] = 0.0
+    return stats
 
 
 def compute_single_aux_lambda(
@@ -1995,6 +2225,7 @@ def compute_message_graph_direction_diagnostics(model: DDM, x: torch.Tensor) -> 
         raw_adj = model._compose_message_edge_weights(support_weights, direction_gate)
     else:
         raw_adj = model.get_structure_adj()
+    raw_adj = model._apply_message_self_loops(raw_adj)
     raw_message = normalize_message_graph_weights(raw_adj)
     causal_message = normalize_message_graph_weights(to_causal_matrix_torch(raw_adj))
 
@@ -2005,6 +2236,7 @@ def compute_message_graph_direction_diagnostics(model: DDM, x: torch.Tensor) -> 
         "msg_edge_mode_is_support_only_preserve_budget": float(
             message_edge_mode == "support_only_preserve_budget"
         ),
+        "msg_self_loop_weight": float(getattr(model, "message_self_loop_weight", 0.0)),
     }
     for mode_name, weights in (("raw", raw_message), ("causal", causal_message)):
         pred = torch.einsum("se,st->et", weights, clean_past)
@@ -2656,6 +2888,7 @@ def train_brain_connectivity(
     directional_kappa_gate_quantile: float = 0.5,
     directional_target_ratio: float = 0.01,
     main_loss_weight: float = 1.0,
+    diffusion_noise_mode: str = "guided",
     training_noise_guide_mode: str = "fixed_patel",
     training_noise_guide_blend_target: float = 0.5,
     training_noise_guide_warmup_epochs: int = 5,
@@ -3004,6 +3237,11 @@ def train_brain_connectivity(
             "['support_only', 'support_only_preserve_budget'] requires "
             "structure_parameterization='support_direction'"
         )
+    message_self_loop_weight = float(ddm_kwargs.get('message_self_loop_weight', 0.0))
+    if message_self_loop_weight < 0.0:
+        raise ValueError(
+            f"message_self_loop_weight must be >= 0, got {message_self_loop_weight}"
+        )
     fixed_support_mask = ddm_kwargs.get('fixed_support_mask', None)
     if fixed_support_mask is not None:
         fixed_support_mask = fixed_support_mask.to(device)
@@ -3078,6 +3316,7 @@ def train_brain_connectivity(
         f"(requested={'full' if requested_emb_dim is None else requested_emb_dim}) | "
         f"message_graph_mode={getattr(model, 'structure_message_graph_mode', 'raw')} | "
         f"message_edge_mode={getattr(model, 'structure_message_edge_mode', 'full')} | "
+        f"message_self_loop_weight={getattr(model, 'message_self_loop_weight', 0.0):g} | "
         f"kappa_logit_bias_scale={getattr(model, 'kappa_logit_bias_scale', 0.0):g} | "
         f"direction_logit_bias_scale={getattr(model, 'direction_logit_bias_scale', 0.0):g}"
     )
@@ -3086,6 +3325,7 @@ def train_brain_connectivity(
     model.causal_lag_main_softmax_temp = float(causal_lag_main_softmax_temp)
     model.causal_lag_main_lags = tuple(int(v) for v in causal_lag_main_lags)
     model.causal_lag_main_lag_weights = tuple(float(v) for v in causal_lag_main_lag_weights)
+    model.diffusion_noise_mode = str(diffusion_noise_mode)
     model.training_noise_guide_mode = str(training_noise_guide_mode)
     model.training_noise_guide_blend_target = float(training_noise_guide_blend_target)
     model.training_noise_guide_warmup_epochs = int(training_noise_guide_warmup_epochs)
@@ -3210,7 +3450,13 @@ def train_brain_connectivity(
 
     print(f"Learning adjacency matrix of shape [{num_nodes}, {num_nodes}]")
     print(f"Main DDM loss weight: {main_loss_weight:g}")
-    if training_noise_guide_mode == "scheduled_blend":
+    print(f"Diffusion noise mode: {diffusion_noise_mode}")
+    if diffusion_noise_mode == "gaussian_iid":
+        print(
+            "Training noise guide: inactive because "
+            "diffusion_noise_mode=gaussian_iid"
+        )
+    elif training_noise_guide_mode == "scheduled_blend":
         print(
             "Training noise guide: "
             f"mode={training_noise_guide_mode} | "
@@ -3266,6 +3512,7 @@ def train_brain_connectivity(
     collapse_history = []
     quality_history = []
     support_direction_snapshot_records: Optional[Dict[str, List[np.ndarray]]] = None
+    previous_support_direction_snapshot: Optional[Dict[str, torch.Tensor]] = None
     if (
         save_support_direction_snapshots and
         getattr(model, "structure_parameterization", "coupled") == "support_direction"
@@ -3425,16 +3672,24 @@ def train_brain_connectivity(
                 # Get subject data: [N, TIME_POINTS]
 
                 x = batch_data[subj_idx]  # [N, TIME_POINTS]
-                training_noise_guide_override, training_noise_guide_stats = (
-                    build_training_noise_guide_override(
-                        model,
-                        epoch=epoch,
-                        mode=training_noise_guide_mode,
-                        blend_target=training_noise_guide_blend_target,
-                        warmup_epochs=training_noise_guide_warmup_epochs,
-                        ramp_epochs=training_noise_guide_ramp_epochs,
+                if diffusion_noise_mode == "gaussian_iid":
+                    training_noise_guide_override = None
+                    training_noise_guide_stats = {
+                        "training_noise_guide_active": 0.0,
+                        "training_noise_guide_blend_weight": 0.0,
+                        "training_noise_guide_guide_l1_mean": 0.0,
+                    }
+                else:
+                    training_noise_guide_override, training_noise_guide_stats = (
+                        build_training_noise_guide_override(
+                            model,
+                            epoch=epoch,
+                            mode=training_noise_guide_mode,
+                            blend_target=training_noise_guide_blend_target,
+                            warmup_epochs=training_noise_guide_warmup_epochs,
+                            ramp_epochs=training_noise_guide_ramp_epochs,
+                        )
                     )
-                )
                 epoch_training_noise_guide_active += (
                     training_noise_guide_stats["training_noise_guide_active"]
                 )
@@ -3935,6 +4190,11 @@ def train_brain_connectivity(
         snapshot: Optional[Dict[str, torch.Tensor]] = None
         if support_direction_snapshot_records is not None or selector_audit_gt_edges is not None:
             snapshot = capture_support_direction_snapshot(model)
+        direction_change_stats = compute_direction_branch_change_diagnostics(
+            snapshot,
+            previous_support_direction_snapshot,
+            fixed_support_mask=fixed_support_mask,
+        )
         if support_direction_snapshot_records is not None:
             if snapshot is None:
                 raise RuntimeError(
@@ -3953,6 +4213,11 @@ def train_brain_connectivity(
                 support_direction_snapshot_records[key].append(
                     snapshot[key].cpu().numpy().astype(np.float32, copy=False)
                 )
+        if snapshot is not None:
+            previous_support_direction_snapshot = {
+                key: value.detach().clone()
+                for key, value in snapshot.items()
+            }
         epoch_score, epoch_details = compute_epoch_quality(
             curr_adj_causal,
             selector_direction_cpu,
@@ -4042,6 +4307,7 @@ def train_brain_connectivity(
             **parent_profile_stats,
             **ungated_asym_stats,
             **direction_margin_stats,
+            **direction_change_stats,
             **noise_guide_probe_stats,
             **message_dir_stats,
             "directional_kappa_gate_enabled": int(directional_kappa_gate),
@@ -4049,6 +4315,7 @@ def train_brain_connectivity(
             "directional_kappa_gate_threshold": float(directional_kappa_threshold),
             "directional_kappa_gate_pair_frac": float(directional_kappa_gate_pair_frac),
             "main_loss_weight": float(main_loss_weight),
+            "diffusion_noise_mode": diffusion_noise_mode,
             "training_noise_guide_mode": training_noise_guide_mode,
             "training_noise_guide_active": float(avg_training_noise_guide_active),
             "training_noise_guide_blend_weight": float(
@@ -4622,6 +4889,14 @@ def main():
     parser.add_argument('--direction_prior_algorithm', type=str, default='patel',
                         choices=['patel', 'lag_gain'],
                         help='Algorithm used for directional priors and direction-bias side paths')
+    parser.add_argument('--patel_input_source', type=str, default='raw',
+                        choices=['raw', 'encoded'],
+                        help='Input source for Patel prior components: raw data_2d or frozen temporal-encoder features')
+    parser.add_argument('--encoded_patel_scope', type=str, default='support_only',
+                        choices=['support_only', 'support_and_direction'],
+                        help='When --patel_input_source encoded, choose whether encoded Patel replaces only support/score or also tau direction')
+    parser.add_argument('--prior_encoder_checkpoint', type=str, default=None,
+                        help='Frozen temporal encoder checkpoint used only when --patel_input_source encoded')
     parser.add_argument('--soft_patel_K', type=int, default=5,
                         help='Number of soft-event thresholds used by the soft Patel support prior')
     parser.add_argument('--soft_patel_beta', type=float, default=10.0,
@@ -4643,6 +4918,8 @@ def main():
     parser.add_argument('--structure_message_edge_mode', type=str, default='full',
                         choices=['full', 'support_only', 'support_only_preserve_budget'],
                         help='Message-edge weighting for GraphConv: full uses support*direction_gate; support_only uses symmetric support only; support_only_preserve_budget uses 0.5*support to match the original pairwise message budget while keeping direction for auxiliary losses/export')
+    parser.add_argument('--message_self_loop_weight', type=float, default=0.0,
+                        help='Fixed self-edge weight added only to the GraphConv message adjacency; does not affect exported adjacency, selector audit, or support*gate export semantics')
     parser.add_argument('--adj_activation', type=str, default='sigmoid',
                         choices=['sigmoid', 'sparsemax', 'entmax15'],
                         help='Adjacency activation: sigmoid = independent edges; sparsemax/entmax15 = competing parents per target')
@@ -4665,6 +4942,9 @@ def main():
 
     parser.add_argument('--selection_top_k', type=int, default=None,
                         help='Top-k undirected pairs used only for best-epoch proxy selection')
+    parser.add_argument('--export_epoch_policy', type=str, default='selector',
+                        choices=['selector', 'final'],
+                        help='Which epoch writes learned_adjacency*. selector keeps the proxy-selected epoch; final exports the last epoch adjacency')
 
     parser.add_argument('--selection_min_skeleton_overlap', type=float, default=0.50,
                         help='Absolute minimum skeleton overlap required by guarded selection')
@@ -4755,6 +5035,9 @@ def main():
                         help='Target ratio of directional margin loss relative to main loss')
     parser.add_argument('--main_loss_weight', type=float, default=1.0,
                         help='Weight applied to the main DDM loss (diffusion + sparsity + hub)')
+    parser.add_argument('--diffusion_noise_mode', type=str, default='guided',
+                        choices=['guided', 'gaussian_iid'],
+                        help='Forward diffusion noise construction: guided uses the current guide/statistical noise path; gaussian_iid uses pure N(0,I) eps')
     parser.add_argument('--training_noise_guide_mode', type=str, default='fixed_patel',
                         choices=['fixed_patel', 'scheduled_blend'],
                         help='Training-time noise-guide mode: fixed_patel keeps the base guide; scheduled_blend mixes in a detached learned guide during training only')
@@ -4847,6 +5130,8 @@ def main():
         parser.error('--fixed_support_mask_mode requires --structure_parameterization support_direction')
     if args.structure_message_edge_mode != 'full' and args.structure_parameterization != 'support_direction':
         parser.error('--structure_message_edge_mode support_only/support_only_preserve_budget requires --structure_parameterization support_direction')
+    if args.message_self_loop_weight < 0.0:
+        parser.error('--message_self_loop_weight must be >= 0')
     if args.direction_lr_multiplier <= 0.0:
         parser.error('--direction_lr_multiplier must be > 0')
     if args.freeze_direction_after_epoch < -1:
@@ -4948,6 +5233,8 @@ def main():
         parser.error('--lag_gain_score_alpha must be >= 0')
     if args.direction_init_mode == 'lag_gain' and args.direction_prior_algorithm != 'lag_gain':
         parser.error('--direction_init_mode lag_gain requires --direction_prior_algorithm lag_gain')
+    if args.patel_input_source == 'encoded' and not args.prior_encoder_checkpoint:
+        parser.error('--patel_input_source encoded requires --prior_encoder_checkpoint')
 
     try:
         causal_lag_main_lags, causal_lag_main_lag_weights = resolve_lag_weight_spec(
@@ -4994,6 +5281,11 @@ def main():
     print(f"Device: {args.device}")
     print(f"Support prior algorithm: {args.support_prior_algorithm}")
     print(f"Direction prior algorithm: {args.direction_prior_algorithm}")
+    print(
+        "Patel input source: "
+        f"{args.patel_input_source} | encoded_scope={args.encoded_patel_scope} | "
+        f"prior_encoder_checkpoint={args.prior_encoder_checkpoint}"
+    )
     print(f"Support prior mode: {args.support_prior_mode}")
 
     print(f"Time points per subject (raw): {args.time_points}")
@@ -5006,7 +5298,13 @@ def main():
     print(f"Kappa logit bias scale: {args.kappa_logit_bias_scale}")
     print(f"Direction logit bias scale: {args.direction_logit_bias_scale}")
     print(f"Main DDM loss weight: {args.main_loss_weight}")
-    if args.training_noise_guide_mode == 'scheduled_blend':
+    print(f"Diffusion noise mode: {args.diffusion_noise_mode}")
+    if args.diffusion_noise_mode == 'gaussian_iid':
+        print(
+            "Training noise guide: inactive because "
+            "diffusion_noise_mode=gaussian_iid"
+        )
+    elif args.training_noise_guide_mode == 'scheduled_blend':
         print(
             "Training noise guide: "
             f"mode={args.training_noise_guide_mode} | "
@@ -5019,6 +5317,7 @@ def main():
     print(f"Causal-lag main lags/weights: {list(causal_lag_main_lags)} / {[round(v, 4) for v in causal_lag_main_lag_weights]}")
     print(f"Causal-lag main weight: {args.causal_lag_main_weight}")
     print(f"Selection score mode: {args.selection_score_mode}")
+    print(f"Export epoch policy: {args.export_epoch_policy}")
     print(
         "Selection composite weights: "
         f"soft={args.selection_soft_agreement_weight} / "
@@ -5089,12 +5388,19 @@ def main():
 
     # Step 2: Compute Patel score / kappa / tau with separated semantics
 
-    print("\nComputing Patel score/kappa/tau matrices...")
+    print("\nComputing raw Patel score/kappa/tau matrices...")
 
     patel_score_np, patel_kappa_np, patel_tau_np = compute_patel_components(data_2d.numpy())
     patel_score_matrix = torch.from_numpy(patel_score_np).float()
     patel_kappa_matrix = torch.from_numpy(patel_kappa_np).float()
     patel_tau_matrix = torch.from_numpy(patel_tau_np).float()
+    encoded_patel_score_np = None
+    encoded_patel_kappa_np = None
+    encoded_patel_tau_np = None
+    encoded_patel_score_matrix = None
+    encoded_patel_kappa_matrix = None
+    encoded_patel_tau_matrix = None
+    resolved_prior_encoder_checkpoint = None
     soft_support_np = None
     lag_direction_np = None
     direction_reliability_np = None
@@ -5104,9 +5410,53 @@ def main():
     direction_reliability_matrix = None
     asymmetric_score_matrix = None
 
-    print(f"Patel score range: [{patel_score_matrix.min():.4f}, {patel_score_matrix.max():.4f}]")
-    print(f"Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
-    print(f"Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
+    print(f"Raw Patel score range: [{patel_score_matrix.min():.4f}, {patel_score_matrix.max():.4f}]")
+    print(f"Raw Patel kappa range: [{patel_kappa_matrix.min():.4f}, {patel_kappa_matrix.max():.4f}]")
+    print(f"Raw Patel tau range:   [{patel_tau_matrix.min():.4f}, {patel_tau_matrix.max():.4f}]")
+
+    prior_patel_score_matrix = patel_score_matrix
+    prior_patel_kappa_matrix = patel_kappa_matrix
+    prior_patel_tau_matrix = patel_tau_matrix
+    if args.patel_input_source == 'encoded':
+        print("\nComputing encoded Patel score/kappa/tau matrices...")
+        (
+            encoded_patel_score_np,
+            encoded_patel_kappa_np,
+            encoded_patel_tau_np,
+            resolved_prior_encoder_checkpoint,
+        ) = compute_encoded_patel_components(
+            data_3d=data_3d,
+            checkpoint_path=args.prior_encoder_checkpoint,
+            device=args.device,
+        )
+        encoded_patel_score_matrix = torch.from_numpy(encoded_patel_score_np).float()
+        encoded_patel_kappa_matrix = torch.from_numpy(encoded_patel_kappa_np).float()
+        encoded_patel_tau_matrix = torch.from_numpy(encoded_patel_tau_np).float()
+        prior_patel_score_matrix = encoded_patel_score_matrix
+        prior_patel_kappa_matrix = encoded_patel_kappa_matrix
+        if args.encoded_patel_scope == 'support_and_direction':
+            prior_patel_tau_matrix = encoded_patel_tau_matrix
+        print(
+            "Encoded Patel checkpoint: "
+            f"{resolved_prior_encoder_checkpoint}"
+        )
+        print(
+            f"Encoded Patel score range: "
+            f"[{encoded_patel_score_matrix.min():.4f}, {encoded_patel_score_matrix.max():.4f}]"
+        )
+        print(
+            f"Encoded Patel kappa range: "
+            f"[{encoded_patel_kappa_matrix.min():.4f}, {encoded_patel_kappa_matrix.max():.4f}]"
+        )
+        print(
+            f"Encoded Patel tau range:   "
+            f"[{encoded_patel_tau_matrix.min():.4f}, {encoded_patel_tau_matrix.max():.4f}]"
+        )
+    print(
+        "Effective Patel prior source: "
+        f"support/score={args.patel_input_source} | "
+        f"direction={'encoded' if args.patel_input_source == 'encoded' and args.encoded_patel_scope == 'support_and_direction' else 'raw'}"
+    )
 
     if args.support_prior_algorithm == 'soft_patel' or args.direction_prior_algorithm == 'lag_gain':
         print("\nComputing soft support / lag-gain prior components...")
@@ -5139,15 +5489,15 @@ def main():
         )
 
     effective_kappa_matrix = (
-        soft_support_matrix if args.support_prior_algorithm == 'soft_patel' else patel_kappa_matrix
+        soft_support_matrix if args.support_prior_algorithm == 'soft_patel' else prior_patel_kappa_matrix
     )
     effective_tau_matrix = (
-        lag_direction_matrix if args.direction_prior_algorithm == 'lag_gain' else patel_tau_matrix
+        lag_direction_matrix if args.direction_prior_algorithm == 'lag_gain' else prior_patel_tau_matrix
     )
     effective_reliability_matrix = (
         direction_reliability_matrix if args.direction_prior_algorithm == 'lag_gain' else None
     )
-    effective_score_matrix = patel_score_matrix
+    effective_score_matrix = prior_patel_score_matrix
     if (
         args.support_prior_algorithm == 'soft_patel' and
         args.direction_prior_algorithm == 'lag_gain' and
@@ -5176,7 +5526,8 @@ def main():
         print(f"Support/direction factorization: enabled | direction_init={args.direction_init_mode} | "
               f"direction_parameterization={args.direction_parameterization} | "
               f"fixed_support_mask={args.fixed_support_mask_mode} | "
-              f"message_edge_mode={args.structure_message_edge_mode}")
+              f"message_edge_mode={args.structure_message_edge_mode} | "
+              f"message_self_loop_weight={args.message_self_loop_weight:g}")
     if args.kappa_logit_bias_scale != 0.0:
         effective_kappa_sym = torch.maximum(effective_kappa_matrix, effective_kappa_matrix.t())
         print(
@@ -5267,7 +5618,7 @@ def main():
         print(f"Fixed support mask: {support_label} | undirected_pairs={fixed_support_mask.sum().item() / 2:.0f}")
 
     if args.direction_init_mode == 'patel_tau':
-        direction_init_matrix = patel_tau_matrix.clone()
+        direction_init_matrix = prior_patel_tau_matrix.clone()
     elif args.direction_init_mode == 'lag_gain':
         if args.direction_prior_algorithm != 'lag_gain' or lag_direction_matrix is None:
             raise ValueError(
@@ -5275,9 +5626,9 @@ def main():
             )
         direction_init_matrix = lag_direction_matrix.clone()
     elif args.direction_init_mode == 'zeros':
-        direction_init_matrix = torch.zeros_like(patel_tau_matrix)
+        direction_init_matrix = torch.zeros_like(prior_patel_tau_matrix)
     else:
-        random_direction = torch.randn_like(patel_tau_matrix)
+        random_direction = torch.randn_like(prior_patel_tau_matrix)
         direction_init_matrix = random_direction - random_direction.t()
         direction_init_matrix.fill_diagonal_(0.0)
 
@@ -5292,6 +5643,29 @@ def main():
     os.makedirs(result_dir, exist_ok=True)
 
     print(f"\nResults will be saved to: {result_dir}")
+    if encoded_patel_score_np is not None:
+        np.save(os.path.join(result_dir, 'encoded_patel_score.npy'), encoded_patel_score_np)
+        np.save(os.path.join(result_dir, 'encoded_patel_kappa.npy'), encoded_patel_kappa_np)
+        np.save(os.path.join(result_dir, 'encoded_patel_tau.npy'), encoded_patel_tau_np)
+        pd.DataFrame(encoded_patel_score_np).to_csv(
+            os.path.join(result_dir, 'encoded_patel_score.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f',
+        )
+        pd.DataFrame(encoded_patel_kappa_np).to_csv(
+            os.path.join(result_dir, 'encoded_patel_kappa.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f',
+        )
+        pd.DataFrame(encoded_patel_tau_np).to_csv(
+            os.path.join(result_dir, 'encoded_patel_tau.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f',
+        )
+        print("Saved encoded Patel matrices for audit.")
     if soft_support_np is not None:
         np.save(os.path.join(result_dir, 'soft_support.npy'), soft_support_np)
         np.save(os.path.join(result_dir, 'lag_direction.npy'), lag_direction_np)
@@ -5360,6 +5734,7 @@ def main():
         directional_kappa_gate_quantile=args.directional_kappa_gate_quantile,
         directional_target_ratio=args.directional_target_ratio,
         main_loss_weight=args.main_loss_weight,
+        diffusion_noise_mode=args.diffusion_noise_mode,
         training_noise_guide_mode=args.training_noise_guide_mode,
         training_noise_guide_blend_target=args.training_noise_guide_blend_target,
         training_noise_guide_warmup_epochs=args.training_noise_guide_warmup_epochs,
@@ -5413,12 +5788,14 @@ def main():
             'uniform_timestep': not args.per_node_timestep,
             'noise_norm_mode': args.noise_norm_mode,
             'noise_zero_mean': not args.noise_with_mean,
+            'diffusion_noise_mode': args.diffusion_noise_mode,
             'init_logit_scale': args.structure_init_scale,
             'emb_dim': None if args.emb_dim <= 0 else args.emb_dim,
             'structure_parameterization': args.structure_parameterization,
             'direction_parameterization': args.direction_parameterization,
             'structure_message_graph_mode': args.structure_message_graph_mode,
             'structure_message_edge_mode': args.structure_message_edge_mode,
+            'message_self_loop_weight': args.message_self_loop_weight,
             'adj_activation': args.adj_activation,
             'kappa_logit_bias_scale': args.kappa_logit_bias_scale,
             'direction_logit_bias_scale': args.direction_logit_bias_scale,
@@ -5508,14 +5885,84 @@ def main():
 
     quality_history = getattr(model, 'quality_history', [])
     final_epoch_adj = getattr(model, 'last_epoch_adj_matrix', None)
-    best_epoch_adj_causal = getattr(model, 'best_epoch_adj_matrix_causal', to_causal_matrix_np(adj_matrix))
+    selector_epoch = int(best_epoch)
+    selector_epoch_adj = adj_matrix
+    selector_epoch_adj_causal = getattr(model, 'best_epoch_adj_matrix_causal', to_causal_matrix_np(adj_matrix))
     final_epoch_adj_causal = getattr(model, 'last_epoch_adj_matrix_causal', None)
+    if args.export_epoch_policy == 'final':
+        if final_epoch_adj is None or final_epoch_adj_causal is None:
+            raise RuntimeError(
+                "--export_epoch_policy final requested, but final epoch adjacency was not captured"
+            )
+        exported_epoch = int(args.epochs)
+        exported_adj = final_epoch_adj
+        exported_adj_causal = final_epoch_adj_causal
+        exported_selection_mode = "final"
+    else:
+        exported_epoch = selector_epoch
+        exported_adj = selector_epoch_adj
+        exported_adj_causal = selector_epoch_adj_causal
+        exported_selection_mode = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+
+    adj_matrix = exported_adj
+    best_epoch = exported_epoch
+
+    selector_audit_summary_for_export = getattr(model, 'selector_audit_summary', None)
+    if selector_audit_summary_for_export is not None:
+        selector_audit_summary_for_export['selector_audit_export_epoch_policy'] = str(args.export_epoch_policy)
+        selector_audit_summary_for_export['selector_audit_selector_epoch'] = int(selector_epoch)
+        selector_audit_summary_for_export['selector_audit_selector_selection_mode'] = str(
+            getattr(model, 'best_epoch_selection_mode', 'unknown')
+        )
+        selector_audit_summary_for_export['selector_audit_selector_primary_strict_f1'] = (
+            selector_audit_summary_for_export.get('selector_audit_exported_primary_strict_f1', 0.0)
+        )
+        selector_audit_summary_for_export['selector_audit_selector_signed_margin_median'] = (
+            selector_audit_summary_for_export.get('selector_audit_exported_signed_margin_median', 0.0)
+        )
+        selector_audit_summary_for_export['selector_audit_selector_failure_mode'] = (
+            selector_audit_summary_for_export.get('selector_audit_exported_failure_mode', 'unknown')
+        )
+        if args.export_epoch_policy == 'final':
+            selector_audit_summary_for_export['selector_audit_exported_epoch'] = int(exported_epoch)
+            selector_audit_summary_for_export['selector_audit_exported_primary_strict_f1'] = (
+                selector_audit_summary_for_export.get('selector_audit_final_primary_strict_f1', 0.0)
+            )
+            selector_audit_summary_for_export['selector_audit_exported_signed_margin_median'] = (
+                selector_audit_summary_for_export.get('selector_audit_final_signed_margin_median', 0.0)
+            )
+            selector_audit_summary_for_export['selector_audit_exported_gt_exported_signed_margin_median'] = (
+                selector_audit_summary_for_export.get(
+                    'selector_audit_final_gt_exported_signed_margin_median',
+                    0.0,
+                )
+            )
+            selector_audit_summary_for_export['selector_audit_exported_gt_gate_signed_margin_median'] = (
+                selector_audit_summary_for_export.get(
+                    'selector_audit_final_gt_gate_signed_margin_median',
+                    0.0,
+                )
+            )
+            selector_audit_summary_for_export['selector_audit_exported_gt_support_median'] = (
+                selector_audit_summary_for_export.get('selector_audit_final_gt_support_median', 0.0)
+            )
+            selector_audit_summary_for_export['selector_audit_exported_gt_support_p10'] = (
+                selector_audit_summary_for_export.get('selector_audit_final_gt_support_p10', 0.0)
+            )
+            selector_audit_summary_for_export['selector_audit_exported_failure_mode'] = (
+                selector_audit_summary_for_export.get('selector_audit_final_failure_mode', 'unknown')
+            )
+            selector_audit_summary_for_export['selector_audit_exported_vs_best_gt_gap_primary_strict_f1'] = (
+                float(selector_audit_summary_for_export.get('selector_audit_exported_primary_strict_f1', 0.0)) -
+                float(selector_audit_summary_for_export.get('selector_audit_best_gt_primary_strict_f1', 0.0))
+            )
+        model.selector_audit_summary = selector_audit_summary_for_export
 
     # Save adjacency matrix to results folder (both npy and csv)
 
     adj_save_path = os.path.join(result_dir, 'learned_adjacency.npy')
 
-    np.save(adj_save_path, adj_matrix)
+    np.save(adj_save_path, exported_adj)
 
     
 
@@ -5523,13 +5970,26 @@ def main():
 
     adj_csv_path = os.path.join(result_dir, 'learned_adjacency.csv')
 
-    pd.DataFrame(adj_matrix).to_csv(adj_csv_path, index=False, header=False, float_format='%.8f')
+    pd.DataFrame(exported_adj).to_csv(adj_csv_path, index=False, header=False, float_format='%.8f')
 
     adj_causal_save_path = os.path.join(result_dir, 'learned_adjacency_causal.npy')
     adj_causal_csv_path = os.path.join(result_dir, 'learned_adjacency_causal.csv')
-    np.save(adj_causal_save_path, best_epoch_adj_causal)
-    pd.DataFrame(best_epoch_adj_causal).to_csv(
+    np.save(adj_causal_save_path, exported_adj_causal)
+    pd.DataFrame(exported_adj_causal).to_csv(
         adj_causal_csv_path, index=False, header=False, float_format='%.8f'
+    )
+
+    selector_adj_save_path = os.path.join(result_dir, 'selector_epoch_adjacency.npy')
+    selector_adj_csv_path = os.path.join(result_dir, 'selector_epoch_adjacency.csv')
+    np.save(selector_adj_save_path, selector_epoch_adj)
+    pd.DataFrame(selector_epoch_adj).to_csv(
+        selector_adj_csv_path, index=False, header=False, float_format='%.8f'
+    )
+    selector_adj_causal_save_path = os.path.join(result_dir, 'selector_epoch_adjacency_causal.npy')
+    selector_adj_causal_csv_path = os.path.join(result_dir, 'selector_epoch_adjacency_causal.csv')
+    np.save(selector_adj_causal_save_path, selector_epoch_adj_causal)
+    pd.DataFrame(selector_epoch_adj_causal).to_csv(
+        selector_adj_causal_csv_path, index=False, header=False, float_format='%.8f'
     )
 
     if final_epoch_adj is not None:
@@ -5569,7 +6029,11 @@ def main():
 
     config['num_subjects'] = int(data_3d.shape[0])
     config['effective_time_points'] = int(data_3d.shape[-1])
+    config['use_temporal_encoder'] = bool(not args.disable_temporal_encoder)
     config['main_loss_weight'] = float(getattr(model, 'main_loss_weight', args.main_loss_weight))
+    config['diffusion_noise_mode'] = str(
+        getattr(model, 'diffusion_noise_mode', args.diffusion_noise_mode)
+    )
     config['training_noise_guide_mode'] = str(
         getattr(model, 'training_noise_guide_mode', args.training_noise_guide_mode)
     )
@@ -5599,9 +6063,27 @@ def main():
     config['noise_guide_pairs'] = int(k_pairs)
     config['selection_top_k'] = int(args.selection_top_k) if args.selection_top_k is not None else int(k_pairs)
     config['exported_epoch'] = int(best_epoch)
+    config['export_epoch_policy'] = str(args.export_epoch_policy)
+    config['selector_epoch'] = int(selector_epoch)
+    config['selector_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
+    config['exported_epoch_selection_mode'] = str(exported_selection_mode)
     config['best_proxy_score'] = float(getattr(model, 'best_epoch_score', -1.0))
     config['best_epoch_selection_mode'] = str(getattr(model, 'best_epoch_selection_mode', 'unknown'))
     config['support_prior_mode'] = str(args.support_prior_mode)
+    config['patel_input_source'] = str(args.patel_input_source)
+    config['encoded_patel_scope'] = str(args.encoded_patel_scope)
+    config['prior_encoder_checkpoint'] = (
+        str(resolved_prior_encoder_checkpoint)
+        if resolved_prior_encoder_checkpoint is not None
+        else (str(args.prior_encoder_checkpoint) if args.prior_encoder_checkpoint else '')
+    )
+    config['effective_patel_support_source'] = str(args.patel_input_source)
+    config['effective_patel_score_source'] = str(args.patel_input_source)
+    config['effective_patel_direction_source'] = (
+        'encoded'
+        if args.patel_input_source == 'encoded' and args.encoded_patel_scope == 'support_and_direction'
+        else 'raw'
+    )
     config['selection_score_mode'] = str(args.selection_score_mode)
     config['selection_agreement_mode'] = str(args.selection_agreement_mode)
     config['selection_soft_agreement_weight'] = float(args.selection_soft_agreement_weight)
@@ -5622,10 +6104,14 @@ def main():
     config['causal_adjacency_convention'] = CAUSAL_ADJ_CONVENTION
     config['learned_adjacency_file_semantics'] = 'raw_internal_convention'
     config['learned_adjacency_causal_file_semantics'] = 'causal_convention_for_eval'
+    config['learned_adjacency_epoch_policy'] = str(args.export_epoch_policy)
     config['requested_emb_dim'] = int(args.emb_dim)
     config['effective_emb_dim'] = int(getattr(model, 'emb_dim', num_nodes))
     config['structure_message_graph_mode'] = str(getattr(model, 'structure_message_graph_mode', args.structure_message_graph_mode))
     config['structure_message_edge_mode'] = str(getattr(model, 'structure_message_edge_mode', args.structure_message_edge_mode))
+    config['message_self_loop_weight'] = float(
+        getattr(model, 'message_self_loop_weight', args.message_self_loop_weight)
+    )
     config['direction_parameterization'] = str(getattr(model, 'direction_parameterization', args.direction_parameterization))
     config['adj_activation'] = str(getattr(model, 'adj_activation', args.adj_activation))
     config['kappa_logit_bias_scale'] = float(getattr(model, 'kappa_logit_bias_scale', args.kappa_logit_bias_scale))
@@ -5709,7 +6195,10 @@ def main():
         {
             'model_state_dict': model.state_dict(),
             'exported_epoch': int(best_epoch),
+            'export_epoch_policy': str(args.export_epoch_policy),
+            'selector_epoch': int(selector_epoch),
             'best_epoch_selection_mode': str(getattr(model, 'best_epoch_selection_mode', 'unknown')),
+            'exported_epoch_selection_mode': str(exported_selection_mode),
             'raw_adjacency_convention': RAW_ADJ_CONVENTION,
             'causal_adjacency_convention': CAUSAL_ADJ_CONVENTION,
         },
@@ -5787,6 +6276,31 @@ def main():
         header=False,
         float_format='%.6f'
     )
+    if (
+        encoded_patel_score_matrix is not None and
+        not os.path.exists(os.path.join(result_dir, 'encoded_patel_score.npy'))
+    ):
+        np.save(os.path.join(result_dir, 'encoded_patel_score.npy'), encoded_patel_score_matrix.numpy())
+        pd.DataFrame(encoded_patel_score_matrix.numpy()).to_csv(
+            os.path.join(result_dir, 'encoded_patel_score.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f'
+        )
+        np.save(os.path.join(result_dir, 'encoded_patel_kappa.npy'), encoded_patel_kappa_matrix.numpy())
+        pd.DataFrame(encoded_patel_kappa_matrix.numpy()).to_csv(
+            os.path.join(result_dir, 'encoded_patel_kappa.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f'
+        )
+        np.save(os.path.join(result_dir, 'encoded_patel_tau.npy'), encoded_patel_tau_matrix.numpy())
+        pd.DataFrame(encoded_patel_tau_matrix.numpy()).to_csv(
+            os.path.join(result_dir, 'encoded_patel_tau.csv'),
+            index=False,
+            header=False,
+            float_format='%.6f'
+        )
 
     
 
@@ -5798,14 +6312,20 @@ def main():
 
     print(f"Results saved to: {result_dir}")
 
-    print(f"  [Best Epoch: {best_epoch}/{args.epochs}]")
+    print(f"  [Exported Epoch: {best_epoch}/{args.epochs}]")
+    print(f"  [Export Policy: {args.export_epoch_policy}]")
+    print(f"  [Selector Epoch: {selector_epoch}/{args.epochs}]")
     print(f"  [Selection Mode: {getattr(model, 'best_epoch_selection_mode', 'unknown')}]")
 
     print(f"  - loss_curve.png          <- 查看此图判断收敛")
 
-    print(f"  - learned_adjacency.csv   <- best-epoch 原始邻接矩阵（raw convention）")
+    print(f"  - learned_adjacency.csv   <- exported 原始邻接矩阵（raw convention）")
 
-    print(f"  - learned_adjacency_causal.csv <- best-epoch 因果方向邻接矩阵（causal convention）")
+    print(f"  - learned_adjacency_causal.csv <- exported 因果方向邻接矩阵（causal convention）")
+
+    print(f"  - selector_epoch_adjacency.csv <- selector 选中轮次原始邻接矩阵（用于对照）")
+
+    print(f"  - selector_epoch_adjacency_causal.csv <- selector 选中轮次因果邻接矩阵（用于对照）")
 
     print(f"  - final_epoch_adjacency.csv <- 最后一轮原始邻接矩阵（用于对照）")
 
@@ -5820,6 +6340,8 @@ def main():
     print(f"  - pearson_matrix.csv")
 
     print(f"  - patel_score.csv / patel_kappa.csv / patel_tau.csv")
+    if encoded_patel_score_matrix is not None:
+        print(f"  - encoded_patel_score.csv / encoded_patel_kappa.csv / encoded_patel_tau.csv")
     if soft_support_np is not None:
         print(f"  - soft_support.npy / lag_direction.npy / direction_reliability.npy / asymmetric_score.npy")
 

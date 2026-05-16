@@ -163,6 +163,7 @@ class DDM(nn.Module):
             direction_parameterization: str = 'factorized',  # factorized = sender/receiver matrix; skew_matrix = direct skew contrast parameter
             structure_message_graph_mode: str = 'raw',  # raw uses internal [effect,cause], causal uses transpose
             structure_message_edge_mode: str = 'full',  # full uses support*direction; support_only removes direction; support_only_preserve_budget keeps pair budget matched
+            message_self_loop_weight: float = 0.0,  # fixed self-edge weight added only to the GraphConv message graph
             adj_activation: str = 'sigmoid',  # sigmoid = independent edges; sparsemax/entmax15 = competing parents
             adj_bias_init: Optional[float] = None,  # Sparsity bias, e.g. logit(0.025) ≈ -3.66
             init_logit_scale: float = 1.0,  # Target std of initial structure logits after rescaling
@@ -177,6 +178,7 @@ class DDM(nn.Module):
             noise_norm_mode: Optional[str] = None,
             # Fix 3: Zero-mean noise (drop neighbor mean bias)
             noise_zero_mean: bool = True,
+            diffusion_noise_mode: str = 'guided',
             # Fix 6: Loss function type
             loss_type: str = 'denoise_hybrid',
             cosine_weight: float = 0.1,
@@ -277,6 +279,16 @@ class DDM(nn.Module):
             self.noise_norm_mode = 'layernorm' if normalize_noise else 'global'
         # Fix 3: Zero-mean noise
         self.noise_zero_mean = noise_zero_mean
+        if diffusion_noise_mode not in {'guided', 'gaussian_iid'}:
+            raise ValueError(
+                "diffusion_noise_mode must be one of ['guided', 'gaussian_iid'], "
+                f"got {diffusion_noise_mode}"
+            )
+        self.diffusion_noise_mode = diffusion_noise_mode
+        if self.diffusion_noise_mode == 'gaussian_iid':
+            print("Diffusion noise mode: gaussian_iid (pure N(0,I), no guide/stat scaling)")
+        else:
+            print("Diffusion noise mode: guided")
         # Fix 6: Loss function selection
         self.loss_type = loss_type
         self.cosine_weight = cosine_weight
@@ -317,6 +329,11 @@ class DDM(nn.Module):
                 "structure_parameterization='support_direction'"
             )
         self.structure_message_edge_mode = structure_message_edge_mode
+        if message_self_loop_weight < 0.0:
+            raise ValueError(
+                f"message_self_loop_weight must be >= 0, got {message_self_loop_weight}"
+            )
+        self.message_self_loop_weight = float(message_self_loop_weight)
         if adj_activation not in {'sigmoid', 'sparsemax', 'entmax15'}:
             raise ValueError(
                 f"adj_activation must be one of ['sigmoid', 'sparsemax', 'entmax15'], got {adj_activation}"
@@ -377,6 +394,7 @@ class DDM(nn.Module):
                 f"({'cause->effect' if self.structure_message_graph_mode == 'causal' else 'raw internal convention'})"
             )
             print(f"Structure message edge mode: {self.structure_message_edge_mode}")
+            print(f"Message self-loop weight: {self.message_self_loop_weight:g}")
             print(f"Structure adjacency activation: {self.adj_activation}")
             if self.kappa_logit_bias_prior is not None and abs(self.kappa_logit_bias_scale) > 0.0:
                 print(
@@ -503,6 +521,17 @@ class DDM(nn.Module):
             f"Unsupported structure_message_edge_mode: {self.structure_message_edge_mode}"
         )
 
+    def _apply_message_self_loops(self, adj_weights: torch.Tensor) -> torch.Tensor:
+        """Add a fixed self edge only on the GraphConv message adjacency."""
+        if self.message_self_loop_weight <= 0.0:
+            return adj_weights
+        eye = torch.eye(
+            adj_weights.shape[0],
+            dtype=adj_weights.dtype,
+            device=adj_weights.device,
+        )
+        return adj_weights + self.message_self_loop_weight * eye
+
     def get_structure_adj(
         self,
         detach_direction_gate: bool = False,
@@ -556,8 +585,8 @@ class DDM(nn.Module):
                 detach_support_weights=detach_support_weights,
             )
         if self.structure_message_graph_mode == 'causal':
-            return adj_weights.transpose(0, 1)
-        return adj_weights
+            adj_weights = adj_weights.transpose(0, 1)
+        return self._apply_message_self_loops(adj_weights)
 
     def _get_structure_graph(
         self,
@@ -702,13 +731,37 @@ class DDM(nn.Module):
         is_batched = x.dim() == 3
         x_work = x if is_batched else x.unsqueeze(0)
 
-        global_mean = x_work.mean(dim=1, keepdim=True)
-        global_std = x_work.std(dim=1, keepdim=True) + 1e-6
-
         if eps is None:
             eps = torch.randn_like(x_work)
+        elif eps.shape == x.shape:
+            eps = eps if is_batched else eps.unsqueeze(0)
         elif eps.shape != x_work.shape:
-            raise ValueError(f"eps shape {eps.shape} does not match x shape {x_work.shape}")
+            raise ValueError(
+                f"eps shape {eps.shape} does not match x shape {x.shape} "
+                f"or batched shape {x_work.shape}"
+            )
+
+        if self.diffusion_noise_mode == 'gaussian_iid':
+            noise = eps if is_batched else eps.squeeze(0)
+            if not return_details:
+                return noise
+
+            base_mean = torch.zeros_like(x_work)
+            base_std = torch.ones_like(x_work)
+            global_mean = torch.zeros_like(x_work[:, :1, :])
+            global_std = torch.ones_like(x_work[:, :1, :])
+            details = {
+                "base_mean": base_mean if is_batched else base_mean.squeeze(0),
+                "base_std": base_std if is_batched else base_std.squeeze(0),
+                "global_mean": global_mean if is_batched else global_mean.squeeze(0),
+                "global_std": global_std if is_batched else global_std.squeeze(0),
+                "eps": eps if is_batched else eps.squeeze(0),
+                "noise_source": "gaussian_iid",
+            }
+            return noise, details
+
+        global_mean = x_work.mean(dim=1, keepdim=True)
+        global_std = x_work.std(dim=1, keepdim=True) + 1e-6
 
         effective_noise_guide_adj = (
             noise_guide_adj_override if noise_guide_adj_override is not None else self.noise_guide_adj

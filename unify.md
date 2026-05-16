@@ -3307,3 +3307,627 @@ failure mode：
 - `GraphExp/results/unify_replay_sim4_20260417_203516_l13_support_only_sim4.csv`
 - `GraphExp/results/unify_replay_sim4_20260417_203516_l13_support_only_sim4_aggregate.csv`
 - `GraphExp/results/unify_phase0_control_sim4_20260410_003901_rich_aggregate.csv`
+
+### [L14] `sim4 control` clean `main_detach_only` routing + GT 分解诊断
+
+- 日期：`2026-04-18`
+- 阶段：direction / support 功能失配定位实验 `L14`
+- 目的：
+  - 用真正干净的 routing 验证：如果只切断主去噪路径到 direction branch 的梯度，而不顺带改 `structure_regularizers` 和 `causal_lag_main`，`sim4` 的主瓶颈到底落在 `direction gate` 还是 `support`。
+  - 同时把 GT 诊断拆成三条：
+    - `GT gate margin`
+    - `GT support median / p10`
+    - `GT exported adj margin`
+
+代码改动：
+
+- 在 `GraphExp/main_structure_learning.py` 中新增：
+  - `gradient_routing_mode = main_detach_only`
+- 其语义是：
+  - `main` 只切掉 direction 梯度
+  - `structure_regularizers` 保持 joint
+  - `causal_lag_main` 保持 joint
+- 与 `warmup_then_orthogonal + detach_epoch=0` 的区别：
+  - 后者会顺带把更多路径改成 support-only / direction-only
+  - `main_detach_only` 则是单独隔离主去噪路径，实验更干净
+
+本轮同时把 GT 诊断接入：
+
+- `quality_history.csv`
+- `selector_audit_summary.csv`
+- `run_replay_saved_config.py` 的 replay summary / aggregate CSV
+
+配置：
+
+- `gradient_routing_mode = main_detach_only`
+- `detach_direction_from_main_after_epoch = 0`
+- `structure_message_edge_mode = full`
+
+结果汇总：
+
+| variant | best | exported | final | best exported-margin | exported exported-margin | final exported-margin | best gate-margin | exported gate-margin | final gate-margin | best support med | exported support med | final support med | final support p10 |
+|---------|-----:|---------:|------:|---------------------:|-------------------------:|----------------------:|-----------------:|---------------------:|------------------:|-----------------:|---------------------:|------------------:|------------------:|
+| `sim4_control` | 0.8623 | 0.8098 | 0.8295 | 0.00854 | 0.00934 | 0.00764 | - | - | - | - | - | - | - |
+| `L14_main_detach_only` | 0.8361 | 0.7836 | 0.7836 | 0.01268 | 0.01159 | 0.00589 | 0.80915 | 0.83598 | 0.99184 | 0.02592 | 0.02436 | 0.01265 | 0.00273 |
+
+第一层结论：
+
+- `gate` 没有在 late stage 变差，反而持续变强并趋于饱和。
+- 真正下降的是 GT 边上的 `support`。
+- `exported margin` 基本跟着 `support` 下降。
+
+因此，`L14` 把主瓶颈从“direction retention failure”进一步收缩为“support erosion”。
+
+补充：直接从最终 checkpoint 读取的 `control` / `L14` GT 分解
+
+我进一步直接从最终 checkpoint 按 GT 边读取了 `gate/support/exported` 分解，结果如下：
+
+#### `control final`（5-seed mean）
+
+- `gate margin median = 0.688839`
+- `support median = 0.015416`
+- `support p10 = 0.006280`
+- `exported margin median = 0.007644`
+
+#### `L14 final`（5-seed mean）
+
+- `gate margin median = 0.991841`
+- `support median = 0.012648`
+- `support p10 = 0.002729`
+- `exported margin median = 0.005891`
+
+这一步修正了一个容易误判的前提：
+
+- `control` 并不是“gate 还在 0.5 附近”
+- 更准确的对比是：
+  - `control` 已经中度极化
+  - `L14` 几乎完全饱和
+
+因此，当前最稳妥的判断不是“只有 L14 才出现 gate 极化”，而是：
+
+- `gate` 更极化时，GT 边上的 `support` 更容易缩水；
+- `support` 缩水后，`exported margin` 也一起缩水；
+- 当前更像是“极化 gate + 无有效 self path”共同伤害了 support 稳定性。
+
+### [L15] 方向更新：优先验证 message self path，而不是先上 direction stabilizer
+
+为什么 `no effective self path` 现在变得重要：
+
+- 在 `GraphExp/models/DDM.py` 中，full graph 结构上包含 self edge，但 `diag_mask` 会把 self edge 权重乘成 0。
+- 在 `GraphExp/models/mlp_gat.py` 中，`Denoising_Unet` 的 `GraphConv` 堆叠没有 local residual；每层是直接：
+  - `h_t = GraphConv(..., edge_weight=edge_weight)`
+
+推论：
+
+- 节点不会通过消息图获得任何显式 self path。
+- 如果某节点在当前极化 gate 下几乎拿不到入边消息，它在图传播里的有效信息来源会非常弱。
+- 当 `main_detach_only` 让 `gate` 不再受主去噪拉回后，`gate` 更容易饱和到单侧。
+- 这时 `support` 承担了几乎全部的补偿压力，可能被拉向更不稳定的轨迹。
+
+因此，下一步优先级应从“direction-only stabilizer”切换到“message self path / support stabilization”。
+
+对 `L15` 的实验设计判断：
+
+- 同意的主线：
+  - 下一步应该优先验证“给 message passing 增加 self path，能否在 gate 极化时稳定 support”
+- 但不建议第一刀就直接做：
+  - `h_t = GraphConv(h_t) + h_t`
+- 原因：
+  - 这是较强的、完全 ungated 的残差旁路；
+  - 当前 `GraphConv` 还是 `norm='none'`，直接相加会显著改尺度；
+  - 一旦 residual 过强，模型可能直接减弱对图消息的依赖，结果不易归因。
+
+更干净的优先方案：
+
+- `L15a = main_detach_only + message_self_loop_weight = alpha`
+
+要求：
+
+- 只在 message passing 图里给 self edge 一个固定小权重 `alpha`
+- 不改 export adjacency
+- 不改 selector audit 定义
+- 不改变 `support * gate` 的导出公式
+
+这样能更干净地回答：
+
+- 是否真的是“缺少 self path”导致 support erosion
+- self path 是否能在不污染导出图定义的情况下稳定 GT `support`
+
+若 `L15a` 有正信号，再做：
+
+- `L15b = main_detach_only + GraphConv local residual`
+
+用于判断：
+
+- 更强的 local residual 是否比小 self-loop 更有效
+- 以及它是否会带来“图消息被 residual 淡化”的副作用
+
+当前主判断：
+
+1. `direction gate` 不是当前 late failure 的主瓶颈。
+2. `support erosion` 才是最终 `exported margin` 和 `final F1` 下滑的直接原因。
+3. `main_detach_only` 已经把问题干净地暴露出来：direction 变对以后，support 反而更脆弱。
+4. 下一步优先级应从“direction stabilizer”切换到“message self path / support stabilization”。
+
+下一步建议：
+
+1. 实现 `L15a = main_detach_only + message_self_loop_weight`
+2. 沿用现有三条 GT 诊断：
+   - `GT gate margin`
+   - `GT support median/p10`
+   - `GT exported adj margin`
+3. 先做单 seed smoke test
+4. 再做正式 5-seed replay
+
+### [L15a-smoke] `sim4 seed11` `main_detach_only + message_self_loop_weight=0.01`
+
+- 日期：`2026-04-18`
+- 目的：
+  - 用最小 self path 检查 `support erosion` 是否会被缓解。
+- 配置：
+  - 基于 `sim4 control` replay
+  - `gradient_routing_mode = main_detach_only`
+  - `detach_direction_from_main_after_epoch = 0`
+  - `structure_message_edge_mode = full`
+  - `message_self_loop_weight = 0.01`
+- artifact：
+  - `GraphExp/results/run_20260418_161115`
+  - `GraphExp/results/unify_replay_sim4_20260418_161112_l15a_smoke_seed11_alpha001.csv`
+  - `GraphExp/results/unify_replay_sim4_20260418_161112_l15a_smoke_seed11_alpha001_aggregate.csv`
+
+结果（与 `L14 seed11` 对比）：
+
+- `best/exported/final F1`：
+  - `L15a-smoke = 0.8361 / 0.8197 / 0.8361`
+  - `L14 seed11 = 0.8197 / 0.8033 / 0.8033`
+- `best/exported/final gate margin`：
+  - `0.8760 / 0.8498 / 0.8166`
+  - 对比 `L14 seed11 = 0.9158 / 0.9286 / 0.9971`
+- `best/exported/final support median`：
+  - `0.00534 / 0.00654 / 0.00247`
+  - 对比 `L14 seed11 = 0.02291 / 0.02366 / 0.01135`
+- `best/exported/final exported adj margin`：
+  - `0.00314 / 0.00371 / 0.00247`
+  - 对比 `L14 seed11 = 0.01291 / 0.01273 / 0.00546`
+- `best/exported/final support p10`：
+  - `0.00247 / 0.00323 / 0.00247`
+  - 对比 `L14 seed11 final = 0.00247`
+- `failure_mode`：
+  - 仍然是 `symmetric_collapse`
+
+结论：
+
+- 这是一个**混合信号**，不是干净阳性。
+- 正信号在于：
+  - `final F1` 回到 `best`
+  - `final-best gap = 0`
+- 但更关键的 GT 分解没有支持“self loop 稳住了 support”这一强结论：
+  - `support median` 明显更低
+  - `exported adj margin` 也更低
+  - `gate` 反而比 `L14` 没那么饱和
+- 当前更像是：
+  - 小 self-loop 改变了 late dynamics / retention；
+  - 但尚未证明它真的缓解了 `support erosion`。
+- 因此：
+  - `L15a` 值得进入正式 5-seed replay；
+  - 但当前预期应表述为“检查 retention 改善是否可重复”，而不是预设“support 已被修好”。
+
+### [L15a-low / L15a-high] `sim4` 正式 5-seed replay：message self-loop 强度对比
+
+- 日期：`2026-04-18`
+- 目的：
+  - 正式比较：
+    - `L15a-low = message_self_loop_weight = 0.01`
+    - `L15a-high = message_self_loop_weight = 0.1`
+  - 判断 self path 只需要轻量兜底，还是必须足够强才会改善 late retention。
+- 固定配置：
+  - `gradient_routing_mode = main_detach_only`
+  - `detach_direction_from_main_after_epoch = 0`
+  - `structure_message_edge_mode = full`
+  - 其余与 `sim4 control` replay 一致
+- 汇总 artifact：
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_low_alpha001_sim4.csv`
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_low_alpha001_sim4_aggregate.csv`
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_high_alpha01_sim4.csv`
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_high_alpha01_sim4_aggregate.csv`
+
+结果汇总：
+
+| variant | best | exported | final | exported-best gap | final-best gap | best exported-margin | exported exported-margin | final exported-margin | final gate-margin | final support med | final support p10 |
+|---------|-----:|---------:|------:|------------------:|---------------:|---------------------:|-------------------------:|----------------------:|------------------:|------------------:|------------------:|
+| `sim4_control` | 0.8623 | 0.8098 | 0.8295 | -0.0525 | -0.0328 | 0.00854 | 0.00934 | 0.00764 | - | - | - |
+| `L14_main_detach_only` | 0.8361 | 0.7836 | 0.7836 | -0.0525 | -0.0525 | 0.01268 | 0.01159 | 0.00589 | 0.99184 | 0.01265 | 0.00273 |
+| `L15a-low (0.01)` | 0.8525 | 0.8295 | 0.8328 | -0.0230 | -0.0197 | 0.01048 | 0.00350 | 0.00284 | 0.81224 | 0.00392 | 0.00251 |
+| `L15a-high (0.1)` | 0.8525 | 0.8131 | 0.8361 | -0.0393 | -0.0164 | 0.00732 | 0.00505 | 0.00386 | 0.84306 | 0.00638 | 0.00324 |
+
+第一层结论：
+
+- 两组 self-loop 都明确改善了 `L14` 的 retention：
+  - `L15a-low`：
+    - `exported-best gap` 从 `-0.0525` 收窄到 `-0.0230`
+    - `final-best gap` 从 `-0.0525` 收窄到 `-0.0197`
+    - `final F1` 从 `0.7836` 回升到 `0.8328`
+  - `L15a-high`：
+    - `exported-best gap` 收窄到 `-0.0393`
+    - `final-best gap` 进一步收窄到 `-0.0164`
+    - `final F1` 回升到 `0.8361`
+- 因此：
+  - `message self path` 不是空洞假说；
+  - 它确实会影响 late retention / final F1。
+
+但更关键的 GT 分解仍然没有支持“support 被修好了”：
+
+- 相比 `L14`，两组的 `final exported margin` 都更低：
+  - `L15a-low = 0.00284`
+  - `L15a-high = 0.00386`
+  - `L14 = 0.00589`
+- `final support median` 也都低于 `L14`：
+  - `L15a-low = 0.00392`
+  - `L15a-high = 0.00638`
+  - `L14 = 0.01265`
+- 从先前直接读取 checkpoint 的 `control final` GT 分解看：
+  - `control final support median ≈ 0.01542`
+  - `control final exported margin median ≈ 0.00764`
+  - 所以 `L15a-low/high` 也都没有回到 control 的 support/exported 水平。
+
+因此，这两组结果更精确地说明：
+
+- self-loop **改善的是 retention dynamics**；
+- 但它**没有单独修复 support erosion 本身**。
+
+对 `0.01` vs `0.1` 的判断：
+
+- `0.01` 的优势：
+  - `exported F1` 最好：`0.8295`
+  - `exported-best gap` 收窄最多
+  - 更像“轻量兜底”
+- `0.1` 的优势：
+  - `final F1` 最好：`0.8361`
+  - `final-best gap` 最小
+  - `final support median / p10` 也高于 `0.01`
+- 但 `0.1` 仍未把 failure taxonomy 改写：
+  - `symmetric_collapse = 5/5`
+  - `strict_f1@eps=0.1 = 0`
+
+当前最稳妥的机制更新：
+
+1. `no effective self path` 确实是当前 story 的一部分，因为补 self-loop 后 late retention 明显改善。
+2. 但它不是“support erosion”的单刀修复项；support/exported margin 仍然偏低。
+3. `0.1` 并没有出现“强到压没图消息后反而全面变差”的现象，说明更强 self path 至少在当前范围内是可行的。
+4. 不过 `0.1` 也没有把系统带出低-margin / `symmetric_collapse` 区，因此它更像 retention aid，而不是 mechanism repair。
+
+对后续 `L15b` 的指向：
+
+- 若下一步继续沿 self-path 主线推进，`L15b = local residual` 依然有价值；
+- 但要把预期写清楚：
+  - 它更可能继续改善 final stability；
+  - 不应预设它会自动恢复 GT support/exported margin。
+
+### [L15a-low-cross-dataset] 把 `L15a-low` 迁移到 `sim3 / sim2 / fMRI`
+
+- 日期：`2026-04-18`
+- 候选定义：
+  - `gradient_routing_mode = main_detach_only`
+  - `detach_direction_from_main_after_epoch = 0`
+  - `structure_message_edge_mode = full`
+  - `message_self_loop_weight = 0.01`
+- 回放方式：
+  - 直接基于各数据集 incumbent `run_dir` 做 5-seed replay
+  - 其余参数沿各自保存配置
+
+汇总 artifact：
+
+- `sim3`：
+  - `GraphExp/results/unify_replay_sim3_20260418_221248_l15a_low_alpha001_sim3.csv`
+  - `GraphExp/results/unify_replay_sim3_20260418_221248_l15a_low_alpha001_sim3_aggregate.csv`
+- `sim2`：
+  - `GraphExp/results/unify_replay_sim2_20260418_221248_l15a_low_alpha001_sim2.csv`
+  - `GraphExp/results/unify_replay_sim2_20260418_221248_l15a_low_alpha001_sim2_aggregate.csv`
+- `fMRI`：
+  - `GraphExp/results/unify_replay_fMRI_20260418_221248_l15a_low_alpha001_fMRI.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260418_221248_l15a_low_alpha001_fMRI_aggregate.csv`
+
+结果摘要：
+
+| dataset | best | exported | final | exported-best gap | final-best gap | best failure | final failure |
+|---|---:|---:|---:|---:|---:|---|---|
+| `sim3` | 0.7889 | 0.7778 | 0.7889 | -0.0111 | 0.0000 | `mixed_or_partial` | `mixed_or_partial` |
+| `sim2` | 0.7636 | 0.7273 | 0.7273 | -0.0364 | -0.0364 | `mixed_or_partial` | `mixed_or_partial/weak_asymmetry` |
+| `fMRI` | 0.6800 | 0.6800 | 0.6800 | 0.0000 | 0.0000 | `mixed_or_partial` | `mixed_or_partial` |
+
+对 `sim3` 的判断：
+
+- 这是明确正信号。
+- 相比 `Phase 0 sim3 control` 5-seed：
+  - control `best/exported/final = 0.6889 / 0.6889 / 0.6889`
+  - `L15a-low = 0.7889 / 0.7778 / 0.7889`
+- 同时 failure taxonomy 也改善：
+  - control final `weak_asymmetry = 5/5`
+  - `L15a-low` final `mixed_or_partial = 5/5`
+- 因此：
+  - `L15a-low` 不是 `sim4` 专属 patch；
+  - 它在 `sim3` 上也有跨-seed 正迁移。
+
+对 `sim2` 的判断：
+
+- 当前结果更像中性偏负，不支持直接提升为统一候选。
+- 现象是：
+  - `exported` 维持在 `0.7273`
+  - `final` 也只在 `0.7273`
+  - 出现 `seed44` 的明显 final drop：`0.9091 -> 0.7273`
+- 这一条当时还是暂时判断；
+  - `sim2` 的同协议 5-seed incumbent control 已在后续 `[sim2-2x2]` 中补齐，
+  - 补齐后结论从“中性偏负”升级为“相对 incumbent 明确负迁移”。
+
+对 `fMRI` 的判断：
+
+- 当前结果明显不支持迁移。
+- 5-seed mean 只有：
+  - `best/exported/final = 0.68 / 0.68 / 0.68`
+- 与 incumbent 单 seed `1.0 / 1.0 / 1.0` 相比落差很大。
+- 虽然这里同样缺少当前协议下的 `fMRI` 5-seed control，
+  - 但即使保守解释，也应把 `L15a-low` 视为对 `fMRI` 不友好。
+
+当前跨数据集结论：
+
+1. `L15a-low` 在 `sim4` 上是新的强候选，在 `sim3` 上也有明确正迁移。
+2. `L15a-low` 目前不能被直接视为全数据集统一候选。
+3. 更准确的状态是：
+   - `sim3 / sim4`：正信号
+   - `sim2`：中性偏负
+   - `fMRI`：负信号
+4. 因而它更像一个对高难度 `sim3/sim4` retention story 有帮助的候选，而不是立即覆盖所有数据集的统一解。
+
+### [Prior-difficulty + 2x2] `sim3 / fMRI` 拆分验证：routing 与 self-loop 的主效应
+
+- 日期：`2026-04-19`
+- 目的：
+  - 验证 `L15a-low` 跨数据集结果到底来自：
+    - `main_detach_only`
+    - `message_self_loop_weight=0.01`
+    - 还是两者交互
+  - 同时验证 `fMRI` 的负迁移是否能用图规模 / distractor ratio 解释。
+
+新增 artifact：
+
+- prior-difficulty 表：
+  - `GraphExp/results/unify_prior_difficulty_table_20260419.csv`
+- 2x2 汇总表：
+  - `GraphExp/results/unify_2x2_sim3_fmri_20260419_summary.csv`
+- `sim3` 2x2 新跑部分：
+  - `GraphExp/results/unify_replay_sim3_20260419_175159_sim3_2x2_legacy_selfloop_alpha001.csv`
+  - `GraphExp/results/unify_replay_sim3_20260419_175159_sim3_2x2_legacy_selfloop_alpha001_aggregate.csv`
+  - `GraphExp/results/unify_replay_sim3_20260419_183403_sim3_2x2_detach_noself.csv`
+  - `GraphExp/results/unify_replay_sim3_20260419_183403_sim3_2x2_detach_noself_aggregate.csv`
+- `fMRI` 2x2 新跑部分：
+  - `GraphExp/results/unify_replay_fMRI_20260419_191634_fmri_2x2_legacy_noself.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260419_191634_fmri_2x2_legacy_noself_aggregate.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260419_195345_fmri_2x2_legacy_selfloop_alpha001.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260419_195345_fmri_2x2_legacy_selfloop_alpha001_aggregate.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260419_202712_fmri_2x2_detach_noself.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260419_202712_fmri_2x2_detach_noself_aggregate.csv`
+
+复用 artifact：
+
+- `sim3 control = legacy + no self-loop`
+  - `GraphExp/results/unify_phase0_control_sim3_20260410_003900_rich.csv`
+  - `GraphExp/results/unify_phase0_control_sim3_20260410_003900_rich_aggregate.csv`
+- `sim3 detach + self-loop`
+  - `GraphExp/results/unify_replay_sim3_20260418_221248_l15a_low_alpha001_sim3.csv`
+  - `GraphExp/results/unify_replay_sim3_20260418_221248_l15a_low_alpha001_sim3_aggregate.csv`
+- `fMRI detach + self-loop`
+  - `GraphExp/results/unify_replay_fMRI_20260418_221248_l15a_low_alpha001_fMRI.csv`
+  - `GraphExp/results/unify_replay_fMRI_20260418_221248_l15a_low_alpha001_fMRI_aggregate.csv`
+
+Prior-difficulty 表关键结果：
+
+| dataset | N | candidate pairs | GT edges | GT fraction | distractor / GT | avg neighbors | epoch1 agreement | epoch1 soft agreement | epoch1 GT margin |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `sim2` | 10 | 90 | 11 | 0.1222 | 7.18 | 2.20 | 0.5455 | 0.7072 | 0.01563 |
+| `sim3` | 15 | 210 | 18 | 0.0857 | 10.67 | 2.40 | 0.6111 | 0.6451 | 0.06500 |
+| `sim4` | 50 | 2450 | 61 | 0.0249 | 39.16 | 2.44 | 0.5164 | 0.5340 | 0.00092 |
+| `fMRI` | 5 | 20 | 5 | 0.2500 | 3.00 | 2.00 | 0.5000 | 0.6024 | -0.01577 |
+
+这个表支持两点：
+
+1. 对 synthetic trio，更好的难度轴不是 `T / N^2`，而是 `GT fraction / distractor per GT`：
+   - 平均邻居数基本维持在 `2.2-2.44`
+   - 但 distractor pool 从 `sim2=7.18/GT` 增到 `sim4=39.16/GT`
+2. `fMRI` 不能放进同一个图规模 / distractor 难度叙事：
+   - 它只有 `5` 个节点、`20` 个候选有向 pair、`GT fraction=0.25`
+   - 但 epoch1 GT margin 已经是负的 `-0.01577`
+   - 后续核实表明它同样是 synthetic benchmark；
+   - 因此这里更稳妥的表述不是“real-data mismatch”，而是：
+     - 小图 + 低 distractor 下，`main_detach_only` 不是必需修复；
+     - 当前 evidence 只支持“detach-family 对它不适用”，不支持再上升到新的机制轴。
+
+`sim3` 2x2 结果：
+
+| routing | self-loop | best | exported | final | exp-best gap | final-best gap | final gate margin | final support med | final exported margin | final strict@0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `legacy` | 0.00 | 0.6889 | 0.6889 | 0.6889 | 0.0000 | 0.0000 | - | - | - | 0.2215 |
+| `legacy` | 0.01 | 0.6889 | 0.6889 | 0.6889 | 0.0000 | 0.0000 | 0.1068 | 0.2239 | 0.0200 | 0.2386 |
+| `main_detach_only` | 0.00 | 0.7889 | 0.7778 | 0.7889 | -0.0111 | 0.0000 | 0.6256 | 0.2295 | 0.0929 | 0.6389 |
+| `main_detach_only` | 0.01 | 0.7889 | 0.7778 | 0.7889 | -0.0111 | 0.0000 | 0.6258 | 0.2296 | 0.0911 | 0.6272 |
+
+`sim3` 结论：
+
+- `sim3` 的正迁移主效应来自 `main_detach_only`，不是 self-loop：
+  - `legacy -> legacy+self-loop`：F1 不变，`0.6889 / 0.6889 / 0.6889`
+  - `legacy -> detach no-self`：`best/final` 提升到 `0.7889`
+  - `detach no-self -> detach+self-loop`：F1 基本不变
+- `main_detach_only` 明显提高 gate/exported margin：
+  - final gate margin 从 `legacy+self-loop=0.1068` 到 `detach=0.6256`
+  - final exported margin 从 `0.0200` 到 `0.0929`
+- 注意：`sim3 legacy no-self` 复用的是旧 control artifact，没有新加的 support/gate 分解字段；因此这里不把它用于分解结论，只用于 F1 对照。
+
+`fMRI` 2x2 结果：
+
+| routing | self-loop | best | exported | final | exp-best gap | final-best gap | final gate margin | final support med | final exported margin | final strict@0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `legacy` | 0.00 | 0.7200 | 0.7200 | 0.6800 | 0.0000 | -0.0400 | 0.1876 | 0.1940 | 0.0354 | 0.1143 |
+| `legacy` | 0.01 | 0.6800 | 0.6800 | 0.6800 | 0.0000 | 0.0000 | 0.1731 | 0.1618 | 0.0258 | 0.0000 |
+| `main_detach_only` | 0.00 | 0.6800 | 0.6800 | 0.6800 | 0.0000 | 0.0000 | 0.3411 | 0.1923 | 0.0608 | 0.3444 |
+| `main_detach_only` | 0.01 | 0.6800 | 0.6800 | 0.6800 | 0.0000 | 0.0000 | 0.3414 | 0.1570 | 0.0500 | 0.1238 |
+
+`fMRI` 结论：
+
+- `fMRI` 的负迁移主要不是 self-loop 单独造成的：
+  - `legacy+self-loop` 的 final F1 与 `legacy no-self` 同为 `0.6800`
+  - 但 best/exported 从 `0.7200` 降到 `0.6800`
+- `main_detach_only` 也没有改善部署指标：
+  - `detach no-self` 与 `detach+self-loop` 的 `best/exported/final` 都是 `0.6800 / 0.6800 / 0.6800`
+  - 相对 `legacy no-self`，best/exported 都低 `0.04`
+- `detach` 会让 gate/exported margin 变大，但这不转化为 primary F1：
+  - final gate margin：`legacy=0.1876`，`detach=0.3411`
+  - final exported margin：`legacy=0.0354`，`detach=0.0608`
+  - final primary F1：两者都是 `0.6800`
+- 因此，对 `fMRI` 来说，“更强方向极化 / 更厚 margin”不是充分条件；它可能把一部分方向推得更有信心，但不一定推到正确 top-k ranking。
+
+当前统一策略更新：
+
+1. `sim3/sim4` 可以先归入同一个 synthetic detach-family：
+   - `main_detach_only` 是共同有效项
+   - `self-loop` 在 `sim4` 改善 late retention，在 `sim3` 基本中性
+2. `sim2` 暂时不能归入这个 family：
+   - 当前 `L15a-low` 是中性偏负
+   - 需要补一个同协议 incumbent control 后再正式判定
+3. `fMRI` 不应直接使用 synthetic detach-family：
+   - 它不是 high-distractor synthetic regime
+   - `main_detach_only` 在 fMRI 上没有部署收益
+   - 当前更合理的方向是保留 joint / freeze-style incumbent，而不是把它强行并入 detach-family
+4. 因此下一阶段不应追求“一刀切固定 config”，而应追求：
+   - synthetic high-distractor regime：`main_detach_only` family
+   - low-distractor small synthetic regime：保留 incumbent / freeze-style routing
+   - 判据首先看 distractor regime；其他 proxy 只有在此之后再讨论。
+
+### [sim2-2x2] 用 `sim2` 自己的 incumbent base 补齐低-distractor regime 验证
+
+- 日期：`2026-04-20`
+- 目的：
+  - 补齐 `sim2` 的同协议 2×2，验证 `main_detach_only` 是否真的只对中高 distractor synthetic 图有效。
+- base run：
+  - `GraphExp/results/run_20260405_112520`
+  - 关键保存配置：
+    - `gradient_routing_mode = warmup_then_orthogonal`
+    - `detach_direction_from_main_after_epoch = 23`
+    - `selection_score_mode = legacy`
+    - `causal_lag_main_weight = 0.25`
+- 2×2 定义：
+  - incumbent routing + no self-loop
+  - incumbent routing + `message_self_loop_weight = 0.01`
+  - `main_detach_only + no self-loop`
+  - `main_detach_only + self-loop = 0.01`（复用已有 `L15a-low`）
+
+artifact：
+
+- incumbent no-self：
+  - `GraphExp/results/unify_replay_sim2_20260420_084058_sim2_2x2_incumbent_noself.csv`
+  - `GraphExp/results/unify_replay_sim2_20260420_084058_sim2_2x2_incumbent_noself_aggregate.csv`
+- incumbent self-loop：
+  - `GraphExp/results/unify_replay_sim2_20260420_090228_sim2_2x2_incumbent_selfloop_alpha001.csv`
+  - `GraphExp/results/unify_replay_sim2_20260420_090228_sim2_2x2_incumbent_selfloop_alpha001_aggregate.csv`
+- detach no-self：
+  - `GraphExp/results/unify_replay_sim2_20260420_092427_sim2_2x2_detach_noself.csv`
+  - `GraphExp/results/unify_replay_sim2_20260420_092427_sim2_2x2_detach_noself_aggregate.csv`
+- detach self-loop（复用）：
+  - `GraphExp/results/unify_replay_sim2_20260418_221248_l15a_low_alpha001_sim2.csv`
+  - `GraphExp/results/unify_replay_sim2_20260418_221248_l15a_low_alpha001_sim2_aggregate.csv`
+- 汇总表：
+  - `GraphExp/results/unify_sim2_l16_summary_20260420.csv`
+
+结果摘要：
+
+| variant | best | exported | final | exp-best gap | final-best gap | final support med | final exported margin | final strict@0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `incumbent + no-self` | 0.8545 | 0.7818 | 0.8182 | -0.0727 | -0.0364 | 0.06789 | 0.04901 | 0.1538 |
+| `incumbent + self=0.01` | 0.8727 | 0.8000 | 0.8545 | -0.0727 | -0.0182 | 0.05335 | 0.04397 | 0.1256 |
+| `main_detach_only + no-self` | 0.7636 | 0.7091 | 0.7273 | -0.0545 | -0.0364 | 0.06621 | 0.04910 | 0.2873 |
+| `main_detach_only + self=0.01` | 0.7636 | 0.7273 | 0.7273 | -0.0364 | -0.0364 | 0.05894 | 0.04068 | 0.2447 |
+
+结论：
+
+1. `sim2` 上的最优 family 不是 detach-family，而是它自己的 incumbent routing。
+2. `main_detach_only` 在 `sim2` 上是明确负迁移：
+   - 相对 incumbent no-self：
+     - best `0.8545 -> 0.7636`
+     - exported `0.7818 -> 0.7091`
+     - final `0.8182 -> 0.7273`
+3. `self-loop` 在 `sim2 incumbent` 下不是负面，反而轻度改善 retention：
+   - final `0.8182 -> 0.8545`
+   - final-best gap `-0.0364 -> -0.0182`
+4. 因此当前最清楚的 regime 结论是：
+   - `main_detach_only` 不是通用默认；
+   - 它更像只对 `sim3/sim4` 这类中高 distractor synthetic 图有帮助。
+
+### [L16] `sim4` 测试“前向去方向”是否可行：`support_only` vs `support_only_preserve_budget`
+
+- 日期：`2026-04-20`
+- 目的：
+  - 直接验证：在 `main_detach_only + self-loop=0.01` 的基础上，
+    - 如果把去噪 message graph 从 `support * gate` 改成只看 `support`，
+    - 是否还能维持 `sim4` 的 exported/final F1。
+- 固定配置：
+  - `gradient_routing_mode = main_detach_only`
+  - `detach_direction_from_main_after_epoch = 0`
+  - `message_self_loop_weight = 0.01`
+- 对照基线：
+  - `L15a-low = structure_message_edge_mode=full`
+
+artifact：
+
+- `support_only`：
+  - `GraphExp/results/unify_replay_sim4_20260420_l16_support_only_alpha001_sim4.csv`
+  - `GraphExp/results/unify_replay_sim4_20260420_l16_support_only_alpha001_sim4_aggregate.csv`
+- `support_only_preserve_budget`：
+  - `GraphExp/results/unify_replay_sim4_20260420_l16_support_only_preserve_budget_alpha001_sim4.csv`
+  - `GraphExp/results/unify_replay_sim4_20260420_l16_support_only_preserve_budget_alpha001_sim4_aggregate.csv`
+- 基线（复用）：
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_low_alpha001_sim4.csv`
+  - `GraphExp/results/unify_replay_sim4_20260418_200037_l15a_low_alpha001_sim4_aggregate.csv`
+
+结果摘要：
+
+| variant | best | exported | final | exp-best gap | final-best gap | final gate margin | final support med | final exported margin | final strict@0.1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `L15a-low / full` | 0.8525 | 0.8295 | 0.8328 | -0.0230 | -0.0197 | 0.8122 | 0.00392 | 0.00284 | 0.0000 |
+| `L16a / support_only` | 0.8459 | 0.7836 | 0.8000 | -0.0623 | -0.0459 | 0.9484 | 0.01215 | 0.00657 | 0.3144 |
+| `L16b / support_only_preserve_budget` | 0.8525 | 0.8033 | 0.8197 | -0.0492 | -0.0328 | 0.9349 | 0.02065 | 0.01151 | 0.4237 |
+
+结论：
+
+1. 前向去方向不是完全不可行：
+   - 两组 `L16` 都没有像早期担心的那样直接崩掉；
+   - `support_only_preserve_budget` 的 best 甚至回到 `0.8525`，与 `L15a-low` 持平。
+2. 但就部署指标看，`L15a-low / full` 仍然更强：
+   - exported：`0.8295` > `0.8033` > `0.7836`
+   - final：`0.8328` > `0.8197` > `0.8000`
+3. `L16` 的主要变化是把 support / exported margin 重新拉厚了：
+   - final support median：
+     - `L15a-low = 0.00392`
+     - `support_only = 0.01215`
+     - `support_only_preserve_budget = 0.02065`
+   - final exported margin：
+     - `L15a-low = 0.00284`
+     - `support_only = 0.00657`
+     - `support_only_preserve_budget = 0.01151`
+4. 因此 `L16` 说明：
+   - 去噪 forward 确实可以不依赖 direction gate；
+   - 这样会显著缓解 thin-support / thin-margin；
+   - 但会牺牲当前的 exported/final F1 retention。
+5. 当前最合理的解释是：
+   - `full + detach` 更偏向排名/部署指标最优；
+   - `support_only family` 更偏向“厚 support / 厚 margin”；
+   - 它们是两种不同 trade-off，而不是简单的一边倒优劣。
+
+当前阶段总结更新：
+
+1. `sim2` 2×2 已经把 regime-aware 结论钉牢：
+   - `main_detach_only` 明确不是通用默认；
+   - 小图 / 低-distractor synthetic 更适合保留 incumbent routing。
+2. `sim3/sim4` 仍然是 detach-family 的主要适用区。
+3. `sim4 L16` 证明了“前向去方向”在工程上是可行的，但目前不是部署指标最优解。
+4. 因而下一步若目标仍是 exported/final F1，
+   - 主线应继续围绕 `L15a-low` 或其轻微变体；
+   - 若目标转为“解决 thin-support / symmetric_collapse 标签失真”，
+   - 则 `support_only_preserve_budget` 是更值得继续展开的 branch。

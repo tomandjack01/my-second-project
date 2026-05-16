@@ -47,11 +47,15 @@ DEFAULTS: Dict[str, Any] = {
     "selection_primary_density_tiebreak_weight": 0.0,
     "selection_start_epoch": 6,
     "selection_top_k": None,
+    "export_epoch_policy": "selector",
     "selector_audit_strict_margin_eps_values": "0,3e-4,0.1",
     "structure_init_mode": "patel_score",
     "support_prior_mode": "patel_kappa",
     "support_prior_algorithm": "patel",
     "direction_prior_algorithm": "patel",
+    "patel_input_source": "raw",
+    "encoded_patel_scope": "support_only",
+    "prior_encoder_checkpoint": "",
     "structure_init_scale": 1.0,
     "emb_dim": 0,
     "structure_parameterization": "coupled",
@@ -60,6 +64,7 @@ DEFAULTS: Dict[str, Any] = {
     "direction_init_mode": "patel_tau",
     "structure_message_graph_mode": "raw",
     "structure_message_edge_mode": "full",
+    "message_self_loop_weight": 0.0,
     "adj_activation": "sigmoid",
     "kappa_logit_bias_scale": 0.0,
     "direction_logit_bias_scale": 0.0,
@@ -100,6 +105,7 @@ DEFAULTS: Dict[str, Any] = {
     "cosine_weight": 0.1,
     "mse_weight": 0.1,
     "noise_norm_mode": "global",
+    "diffusion_noise_mode": "guided",
     "training_noise_guide_mode": "fixed_patel",
     "training_noise_guide_blend_target": 0.5,
     "training_noise_guide_warmup_epochs": 5,
@@ -144,12 +150,16 @@ VALUE_KEYS: List[str] = [
     "selection_primary_density_tiebreak_weight",
     "selection_start_epoch",
     "selection_top_k",
+    "export_epoch_policy",
     "selector_audit_gt_path",
     "selector_audit_strict_margin_eps_values",
     "structure_init_mode",
     "support_prior_mode",
     "support_prior_algorithm",
     "direction_prior_algorithm",
+    "patel_input_source",
+    "encoded_patel_scope",
+    "prior_encoder_checkpoint",
     "structure_init_scale",
     "emb_dim",
     "structure_parameterization",
@@ -158,6 +168,7 @@ VALUE_KEYS: List[str] = [
     "direction_init_mode",
     "structure_message_graph_mode",
     "structure_message_edge_mode",
+    "message_self_loop_weight",
     "adj_activation",
     "kappa_logit_bias_scale",
     "direction_logit_bias_scale",
@@ -198,6 +209,7 @@ VALUE_KEYS: List[str] = [
     "cosine_weight",
     "mse_weight",
     "noise_norm_mode",
+    "diffusion_noise_mode",
     "training_noise_guide_mode",
     "training_noise_guide_blend_target",
     "training_noise_guide_warmup_epochs",
@@ -341,7 +353,7 @@ def build_command(cfg: Dict[str, Any], seed: int, device_override: Optional[str]
             value = device_override
         if key == "selection_top_k" and value is None:
             continue
-        if key == "pretrain_checkpoint" and not value:
+        if key in {"pretrain_checkpoint", "prior_encoder_checkpoint"} and not value:
             continue
         if key == "selector_audit_gt_path" and not value:
             continue
@@ -427,6 +439,7 @@ def aggregate_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "seed_list": ",".join(str(row["seed"]) for row in rows),
         "result_dirs": ";".join(str(row["result_dir"]) for row in rows),
         "override_spec": rows[0].get("override_spec", ""),
+        "diffusion_noise_mode": rows[0].get("diffusion_noise_mode", ""),
         "failure_mode_counts": dict(Counter(str(row["best_failure_mode"]) for row in rows)),
         "final_failure_mode_counts": dict(Counter(str(row["final_failure_mode"]) for row in rows)),
     }
@@ -522,6 +535,7 @@ def run_single_seed(
     best_epoch = int(to_float(selector, "selector_audit_best_gt_epoch"))
     exported_epoch = int(to_float(selector, "selector_audit_exported_epoch"))
     final_epoch = int(to_float(selector, "selector_audit_final_epoch"))
+    selector_epoch = int(to_float(selector, "selector_audit_selector_epoch")) if selector.get("selector_audit_selector_epoch") else exported_epoch
     best_quality = read_epoch_csv_row(quality_history_path, best_epoch)
     exported_quality = read_epoch_csv_row(quality_history_path, exported_epoch)
     final_quality = read_epoch_csv_row(quality_history_path, final_epoch)
@@ -537,6 +551,9 @@ def run_single_seed(
         "final_primary_strict_f1": to_float(selector, "selector_audit_final_primary_strict_f1"),
         "best_epoch": best_epoch,
         "exported_epoch": exported_epoch,
+        "selector_epoch": selector_epoch,
+        "export_epoch_policy": selector.get("selector_audit_export_epoch_policy", str(get_config_value(cfg, "export_epoch_policy"))),
+        "diffusion_noise_mode": str(get_config_value(cfg, "diffusion_noise_mode")),
         "final_epoch": final_epoch,
         "best_failure_mode": selector.get("selector_audit_best_gt_failure_mode", ""),
         "exported_failure_mode": selector.get("selector_audit_exported_failure_mode", ""),
