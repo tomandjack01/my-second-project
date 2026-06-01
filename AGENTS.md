@@ -282,29 +282,42 @@ Selection rule:
 - exclude 2-seed tuning probes from this formal index
 - treat these as the best currently found multi-seed configurations, not proof of global optimum
 
+Directional SHD / edge accuracy computation for this index:
+
+- load each run's final causal adjacency snapshot, preferring `final_epoch_adjacency_causal.npy/.csv`; if absent, fall back to `learned_adjacency_causal.npy/.csv`
+- load GT directed edges from `fMRI_dataset/h*.txt` and convert 1-based node ids to 0-based ids
+- predicted directed edge set has exactly `|GT|` edges
+- for every unordered pair `{i,j}`, score it by `abs(A[i,j] - A[j,i])`
+- choose the top `|GT|` unordered pairs by that score
+- orient each chosen pair by the sign of `A[i,j] - A[j,i]`; non-negative means `i -> j`, negative means `j -> i`
+- TP/FP/FN are computed by exact directed-edge set comparison against GT
+- directed SHD counts one operation for each reversal, addition, or deletion: first match predicted reversed edges to GT reversed edges as reversals, then add remaining FP plus remaining FN
+- edge accuracy is the fraction of all directed off-diagonal entries `(i,j), i != j` whose predicted present/absent label matches GT
+- values below are mean/std over the 5 seeds
+
 Mainline / non-ablation best found configurations:
 
-| dataset | aggregate/source file | representative config file | seeds | best | exported | final | final eps=0.1 | key override / family |
-|---|---|---|---|---:|---:|---:|---:|---|
-| fMRI | `GraphExp/results/unify_replay_fMRI_20260511_124620_fmri_F3_lag035_final_export_5seed_aggregate.csv` | `GraphExp/results/run_20260511_124622/config.npy` | `11,22,33,44,55` | 0.9600 | 0.9600 | 0.9600 | 0.4452 | `export_epoch_policy=final; causal_lag_main_weight=0.35` |
-| sim2 | `GraphExp/results/unify_replay_sim2_20260420_090228_sim2_2x2_incumbent_selfloop_alpha001_aggregate.csv` | `GraphExp/results/run_20260420_090231/config.npy` | `11,22,33,44,55` | 0.8727 | 0.8000 | 0.8545 | 0.1256 | `structure_message_edge_mode=full; message_self_loop_weight=0.01`; tied with strict audit row 22 |
-| sim3 | `GraphExp/results/unify_replay_sim3_20260420_sim3_dirend10_epochs100_aggregate.csv` | `GraphExp/results/run_20260420_152306/config.npy` | `11,22,33,44,55` | 0.9222 | 0.8444 | 0.9111 | 0.4100 | `epochs=100`; strict audit row 34 equivalent |
-| sim4 | `GraphExp/results/unify_replay_sim4_20260420_sim4_l15a_low_epochs100_aggregate.csv` | `GraphExp/results/run_20260420_175556/config.npy` | `11,22,33,44,55` | 0.8820 | 0.8492 | 0.8492 | 0.0000 | `epochs=100`; strict audit row 66 equivalent |
-| sim8 | `GraphExp/results/unify_replay_sim8_20260512_091903_sim8_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_091906/config.npy` | `11,22,33,44,55` | 0.8800 | 0.8400 | 0.8400 | 0.1500 | `top_k_edges=5; selection_top_k=5; pretrain_epochs=50; export_epoch_policy=final` |
-| sim10 | `GraphExp/results/unify_replay_sim10_20260512_095726_sim10_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_095729/config.npy` | `11,22,33,44,55` | 0.8400 | 0.8000 | 0.8000 | 0.1333 | `top_k_edges=5; selection_top_k=5; pretrain_epochs=50; export_epoch_policy=final` |
-| sim11 | `GraphExp/results/unify_replay_sim11_20260512_184811_sim11_D3_lag035_5seed_aggregate.csv` | `GraphExp/results/run_20260512_184814/config.npy` | `11,22,33,44,55` | 0.6370 | 0.5926 | 0.5926 | 0.0750 | `fixed_support_mask_mode=topk_kappa; top_k_edges=16; selection_top_k=11; causal_lag_main_weight=0.35; export_epoch_policy=final` |
-| sim12 | `GraphExp/results/unify_replay_sim12_20260512_111301_sim12_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_111304/config.npy` | `11,22,33,44,55` | 0.7818 | 0.7273 | 0.7273 | 0.2056 | `top_k_edges=11; selection_top_k=11; pretrain_epochs=50; export_epoch_policy=final` |
+| dataset | aggregate/source file | representative config file | seeds | best | exported | final | final eps=0.1 | final SHD | final edge acc | key override / family |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| fMRI | `GraphExp/results/unify_replay_fMRI_20260511_124620_fmri_F3_lag035_final_export_5seed_aggregate.csv` | `GraphExp/results/run_20260511_124622/config.npy` | `11,22,33,44,55` | 0.9600 | 0.9600 | 0.9600 | 0.4452 | 0.2000 +/- 0.4000 | 0.9800 +/- 0.0400 | `export_epoch_policy=final; causal_lag_main_weight=0.35` |
+| sim2 | `GraphExp/results/unify_replay_sim2_20260420_090228_sim2_2x2_incumbent_selfloop_alpha001_aggregate.csv` | `GraphExp/results/run_20260420_090231/config.npy` | `11,22,33,44,55` | 0.8727 | 0.8000 | 0.8545 | 0.1256 | 1.6000 +/- 0.4899 | 0.9644 +/- 0.0109 | `structure_message_edge_mode=full; message_self_loop_weight=0.01`; tied with strict audit row 22 |
+| sim3 | `GraphExp/results/unify_replay_sim3_20260420_sim3_dirend10_epochs100_aggregate.csv` | `GraphExp/results/run_20260420_152306/config.npy` | `11,22,33,44,55` | 0.9222 | 0.8444 | 0.9111 | 0.4100 | 1.6000 +/- 0.8000 | 0.9848 +/- 0.0076 | `epochs=100`; strict audit row 34 equivalent |
+| sim4 | `GraphExp/results/unify_replay_sim4_20260420_sim4_l15a_low_epochs100_aggregate.csv` | `GraphExp/results/run_20260420_175556/config.npy` | `11,22,33,44,55` | 0.8820 | 0.8492 | 0.8492 | 0.0000 | 9.2000 +/- 0.4000 | 0.9925 +/- 0.0003 | `epochs=100`; strict audit row 66 equivalent |
+| sim8 | `GraphExp/results/unify_replay_sim8_20260512_091903_sim8_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_091906/config.npy` | `11,22,33,44,55` | 0.8800 | 0.8400 | 0.8400 | 0.1500 | 0.8000 +/- 0.4000 | 0.9200 +/- 0.0400 | `top_k_edges=5; selection_top_k=5; pretrain_epochs=50; export_epoch_policy=final` |
+| sim10 | `GraphExp/results/unify_replay_sim10_20260512_095726_sim10_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_095729/config.npy` | `11,22,33,44,55` | 0.8400 | 0.8000 | 0.8000 | 0.1333 | 1.0000 +/- 0.0000 | 0.9000 +/- 0.0000 | `top_k_edges=5; selection_top_k=5; pretrain_epochs=50; export_epoch_policy=final` |
+| sim11 | `GraphExp/results/unify_replay_sim11_20260512_184811_sim11_D3_lag035_5seed_aggregate.csv` | `GraphExp/results/run_20260512_184814/config.npy` | `11,22,33,44,55` | 0.6370 | 0.5926 | 0.5926 | 0.0750 | 7.6000 +/- 1.7436 | 0.8978 +/- 0.0227 | `fixed_support_mask_mode=topk_kappa; top_k_edges=16; selection_top_k=11; causal_lag_main_weight=0.35; export_epoch_policy=final` |
+| sim12 | `GraphExp/results/unify_replay_sim12_20260512_111301_sim12_gt_5seed_repretrain_aggregate.csv` | `GraphExp/results/run_20260512_111304/config.npy` | `11,22,33,44,55` | 0.7818 | 0.7273 | 0.7273 | 0.2056 | 3.0000 +/- 0.8944 | 0.9333 +/- 0.0199 | `top_k_edges=11; selection_top_k=11; pretrain_epochs=50; export_epoch_policy=final` |
 
 If ablation branches are allowed in the search space, the best-by-final-F1 file changes for some datasets:
 
-| dataset | best including ablations | representative config file | best | exported | final | final eps=0.1 | note |
-|---|---|---|---:|---:|---:|---:|---|
-| fMRI | `GraphExp/results/unify_replay_fMRI_20260513_164419_fmri_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260513_164422/config.npy` | 0.9600 | 0.9600 | 0.9600 | 0.4643 | ties mainline final F1; ablation branch, not default recommendation |
-| sim3 | `GraphExp/results/unify_replay_sim3_20260513_sim3_ablation_gaussian_iid_5seed_combined_aggregate.csv` | `GraphExp/results/run_20260513_193512/config.npy` | 0.9556 | 0.9222 | 0.9222 | 0.5331 | gaussian IID ablation exceeds current mainline on this dataset |
-| sim8 | `GraphExp/results/unify_replay_sim8_20260514_022611_sim8_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260514_022614/config.npy` | 0.8800 | 0.8400 | 0.8400 | 0.2643 | ties mainline final F1; ablation branch |
-| sim10 | `GraphExp/results/unify_replay_sim10_20260514_032112_sim10_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260514_032115/config.npy` | 0.8800 | 0.8400 | 0.8400 | 0.1143 | disable-encoder ablation exceeds current mainline final F1 |
-| sim11 | `GraphExp/results/unify_replay_sim11_20260514_050543_sim11_ablation_gaussian_iid_5seed_aggregate.csv` | `GraphExp/results/run_20260514_050546/config.npy` | 0.6370 | 0.5926 | 0.5926 | 0.0800 | ties mainline final F1; ablation branch |
-| sim12 | `GraphExp/results/unify_replay_sim12_20260514_042044_sim12_ablation_gaussian_iid_5seed_aggregate.csv` | `GraphExp/results/run_20260514_042047/config.npy` | 0.8000 | 0.7455 | 0.7455 | 0.1749 | gaussian IID ablation exceeds current mainline final F1 |
+| dataset | best including ablations | representative config file | best | exported | final | final eps=0.1 | final SHD | final edge acc | note |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| fMRI | `GraphExp/results/unify_replay_fMRI_20260513_164419_fmri_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260513_164422/config.npy` | 0.9600 | 0.9600 | 0.9600 | 0.4643 | 0.2000 +/- 0.4000 | 0.9800 +/- 0.0400 | ties mainline final F1; ablation branch, not default recommendation |
+| sim3 | `GraphExp/results/unify_replay_sim3_20260513_sim3_ablation_gaussian_iid_5seed_combined_aggregate.csv` | `GraphExp/results/run_20260513_193512/config.npy` | 0.9556 | 0.9222 | 0.9222 | 0.5331 | 1.4000 +/- 1.0198 | 0.9867 +/- 0.0097 | gaussian IID ablation exceeds current mainline on this dataset |
+| sim8 | `GraphExp/results/unify_replay_sim8_20260514_022611_sim8_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260514_022614/config.npy` | 0.8800 | 0.8400 | 0.8400 | 0.2643 | 0.8000 +/- 0.4000 | 0.9200 +/- 0.0400 | ties mainline final F1; ablation branch |
+| sim10 | `GraphExp/results/unify_replay_sim10_20260514_032112_sim10_ablation_disable_encoder_5seed_aggregate.csv` | `GraphExp/results/run_20260514_032115/config.npy` | 0.8800 | 0.8400 | 0.8400 | 0.1143 | 0.8000 +/- 0.4000 | 0.9200 +/- 0.0400 | disable-encoder ablation exceeds current mainline final F1 |
+| sim11 | `GraphExp/results/unify_replay_sim11_20260514_050543_sim11_ablation_gaussian_iid_5seed_aggregate.csv` | `GraphExp/results/run_20260514_050546/config.npy` | 0.6370 | 0.5926 | 0.5926 | 0.0800 | 9.2000 +/- 1.1662 | 0.8756 +/- 0.0109 | ties mainline final F1 but worse SHD/edge accuracy; ablation branch |
+| sim12 | `GraphExp/results/unify_replay_sim12_20260514_042044_sim12_ablation_gaussian_iid_5seed_aggregate.csv` | `GraphExp/results/run_20260514_042047/config.npy` | 0.8000 | 0.7455 | 0.7455 | 0.1749 | 2.8000 +/- 0.7483 | 0.9378 +/- 0.0166 | gaussian IID ablation exceeds current mainline final F1 |
 
 Interpretation:
 
